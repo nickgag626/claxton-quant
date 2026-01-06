@@ -99,6 +99,7 @@ export const useTradingData = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
+  const [pnlHistory, setPnlHistory] = useState<{ time: string; pnl: number }[]>([]);
   const [strategyPositions, setStrategyPositions] = useState<Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>>(new Map());
   const lastEngineRun = useRef<number>(0);
 
@@ -142,10 +143,23 @@ export const useTradingData = () => {
       // Fetch balances for P&L
       const balances = await tradierApi.getBalances();
       if (balances) {
+        const currentPnl = balances.open_pl || 0;
         setRiskStatus(prev => ({
           ...prev,
-          dailyPnl: balances.open_pl || 0,
+          dailyPnl: currentPnl,
         }));
+        
+        // Track P&L history (max 100 points for the day)
+        const now = new Date();
+        const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+        setPnlHistory(prev => {
+          const newPoint = { time: timeLabel, pnl: currentPnl };
+          // Avoid duplicates for same minute
+          if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
+            return [...prev.slice(0, -1), newPoint];
+          }
+          return [...prev.slice(-99), newPoint];
+        });
       }
       
       // Fetch market clock
@@ -396,6 +410,7 @@ export const useTradingData = () => {
     isLoading,
     error,
     deltaHistory,
+    pnlHistory,
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,
