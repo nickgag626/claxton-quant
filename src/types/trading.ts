@@ -82,6 +82,12 @@ export interface RiskStatus {
   killSwitchReason?: string;
 }
 
+export interface TradeSafeguards {
+  maxBidAskSpreadPercent: number;  // 1-20%, default 5%
+  zeroDteCloseBufferMinutes: number;  // 15-60, default 30
+  fillPriceBufferPercent: number;  // 0-10%, default 2%
+}
+
 export interface Trade {
   id: string;
   strategyName: string;

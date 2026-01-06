@@ -18,6 +18,7 @@ const Index = () => {
     quotes,
     strategies,
     riskStatus,
+    safeguards,
     activity,
     marketState,
     isApiConnected,
@@ -28,6 +29,7 @@ const Index = () => {
     toggleBot,
     toggleKillSwitch,
     updateRiskSettings,
+    updateSafeguards,
     toggleStrategy,
     addStrategy,
     deleteStrategy,
@@ -78,11 +80,13 @@ const Index = () => {
             <ControlsPanel
               greeks={greeks}
               riskStatus={riskStatus}
+              safeguards={safeguards}
               isBotRunning={isBotRunning}
               onToggleBot={toggleBot}
               onToggleKillSwitch={toggleKillSwitch}
               onEmergencyClose={emergencyCloseAll}
               onUpdateRiskSettings={updateRiskSettings}
+              onUpdateSafeguards={updateSafeguards}
             />
           </div>
         </div>

@@ -9,7 +9,8 @@ import type {
   Strategy, 
   RiskStatus, 
   ActivityEvent,
-  MarketState 
+  MarketState,
+  TradeSafeguards 
 } from '@/types/trading';
 import type { DeltaDataPoint } from '@/components/dashboard/GreeksChart';
 
@@ -91,6 +92,11 @@ export const useTradingData = () => {
     tradeCount: 0,
     maxPositions: 5,
     killSwitchActive: false,
+  });
+  const [safeguards, setSafeguards] = useState<TradeSafeguards>({
+    maxBidAskSpreadPercent: 5,
+    zeroDteCloseBufferMinutes: 30,
+    fillPriceBufferPercent: 2,
   });
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [marketState, setMarketState] = useState<MarketState>('unknown');
@@ -253,6 +259,11 @@ export const useTradingData = () => {
       maxPositions: settings.maxPositions,
     }));
     addActivity('RISK', `Risk settings updated: Max Loss $${settings.maxDailyLoss}, Max Positions ${settings.maxPositions}`);
+  }, [addActivity]);
+
+  const updateSafeguards = useCallback((newSafeguards: TradeSafeguards) => {
+    setSafeguards(newSafeguards);
+    addActivity('RISK', `Safeguards updated: Spread ${newSafeguards.maxBidAskSpreadPercent}%, Close Buffer ${newSafeguards.zeroDteCloseBufferMinutes}min, Fill Buffer ${newSafeguards.fillPriceBufferPercent}%`);
   }, [addActivity]);
 
   const toggleStrategy = useCallback((strategyId: string) => {
@@ -448,6 +459,7 @@ export const useTradingData = () => {
     quotes,
     strategies,
     riskStatus,
+    safeguards,
     activity,
     marketState,
     isApiConnected,
@@ -460,6 +472,7 @@ export const useTradingData = () => {
     toggleBot,
     toggleKillSwitch,
     updateRiskSettings,
+    updateSafeguards,
     toggleStrategy,
     addStrategy,
     deleteStrategy,
