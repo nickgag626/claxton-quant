@@ -130,7 +130,26 @@ serve(async (req) => {
         const side = positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close';
         const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
         
-        console.log('Closing position:', positionSymbol, 'qty:', positionQuantity, 'side:', side);
+        // Check if this is an OCC option symbol (e.g., SPY260112C00700000)
+        const isOccOption = /^[A-Z]+\d{6}[CP]\d{8}$/.test(positionSymbol);
+        
+        console.log('Closing position:', positionSymbol, 'qty:', positionQuantity, 'side:', side, 'isOption:', isOccOption);
+        
+        const orderParams: Record<string, string> = {
+          class: isOccOption ? 'option' : 'equity',
+          symbol: isOccOption ? positionSymbol.replace(/\d{6}[CP]\d{8}$/, '') : positionSymbol,
+          side: side,
+          quantity: Math.abs(positionQuantity).toString(),
+          type: 'market',
+          duration: 'day',
+        };
+        
+        // For options, add the option_symbol parameter
+        if (isOccOption) {
+          orderParams.option_symbol = positionSymbol;
+        }
+        
+        console.log('Order params:', JSON.stringify(orderParams));
         
         response = await fetch(orderUrl, {
           method: 'POST',
@@ -139,19 +158,20 @@ serve(async (req) => {
             'Accept': 'application/json',
             'Content-Type': 'application/x-www-form-urlencoded',
           },
-          body: new URLSearchParams({
-            class: positionSymbol.includes(' ') ? 'option' : 'equity',
-            symbol: positionSymbol.split(' ')[0],
-            option_symbol: positionSymbol.includes(' ') ? positionSymbol : '',
-            side: side,
-            quantity: Math.abs(positionQuantity).toString(),
-            type: 'market',
-            duration: 'day',
-          }).toString(),
+          body: new URLSearchParams(orderParams).toString(),
         });
         
-        data = await response.json();
-        console.log('Close order response:', JSON.stringify(data));
+        // Handle potential non-JSON response
+        const responseText = await response.text();
+        console.log('Close order response:', responseText);
+        
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          // Tradier returned non-JSON (likely an error message)
+          console.error('Non-JSON response from Tradier:', responseText);
+          data = { error: responseText };
+        }
         break;
       }
 
