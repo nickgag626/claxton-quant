@@ -120,10 +120,16 @@ export const PositionsPanel = ({ positions, isApiConnected, onClosePosition }: P
                         </TableCell>
                         <TableCell className="py-1.5 text-center">
                           <Button
+                            type="button"
                             variant="ghost"
                             size="sm"
-                            className="h-6 w-6 p-0 hover:bg-panic-red/20 hover:text-panic-red"
-                            onClick={() => handleClose(pos.id)}
+                            className="h-6 w-6 p-0 hover:bg-panic-red/20 hover:text-panic-red pointer-events-auto relative z-10"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              console.log('Button clicked for position:', pos.id);
+                              handleClose(pos.id);
+                            }}
                             disabled={closingPositions.has(pos.id)}
                           >
                             <X className="h-3 w-3" />
