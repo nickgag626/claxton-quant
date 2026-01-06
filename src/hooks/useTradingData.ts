@@ -10,6 +10,7 @@ import type {
   ActivityEvent,
   MarketState 
 } from '@/types/trading';
+import type { DeltaDataPoint } from '@/components/dashboard/GreeksChart';
 
 // Default strategies (would come from database in production)
 const defaultStrategies: Strategy[] = [
@@ -97,6 +98,7 @@ export const useTradingData = () => {
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
   const lastEngineRun = useRef<number>(0);
 
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
@@ -162,6 +164,18 @@ export const useTradingData = () => {
           // Calculate portfolio greeks
           const portfolioGreeks = calculatePortfolioGreeks(positionsData, allOptionData);
           setGreeks(portfolioGreeks);
+          
+          // Track delta history (max 50 points for the day)
+          const now = new Date();
+          const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+          setDeltaHistory(prev => {
+            const newPoint = { time: timeLabel, delta: portfolioGreeks.delta };
+            // Avoid duplicates for same minute
+            if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
+              return [...prev.slice(0, -1), newPoint];
+            }
+            return [...prev.slice(-49), newPoint];
+          });
         }
       }
       
@@ -344,6 +358,7 @@ export const useTradingData = () => {
     lastUpdate,
     isLoading,
     error,
+    deltaHistory,
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,

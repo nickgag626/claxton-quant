@@ -7,6 +7,7 @@ import { ControlsPanel } from '@/components/dashboard/ControlsPanel';
 import { ActivityLog } from '@/components/dashboard/ActivityLog';
 import { StrategiesPanel } from '@/components/dashboard/StrategiesPanel';
 import { PnLChart } from '@/components/dashboard/PnLChart';
+import { GreeksChart } from '@/components/dashboard/GreeksChart';
 import { DataLagWarning } from '@/components/dashboard/DataLagWarning';
 
 const Index = () => {
@@ -21,6 +22,7 @@ const Index = () => {
     isApiConnected,
     isBotRunning,
     lastUpdate,
+    deltaHistory,
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,
@@ -67,6 +69,7 @@ const Index = () => {
               onClosePosition={closePosition}
             />
             <PnLChart dailyPnl={riskStatus.dailyPnl} />
+            <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />
           </div>
           <div>
             <ControlsPanel
