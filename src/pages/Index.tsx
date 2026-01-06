@@ -27,6 +27,7 @@ const Index = () => {
     pnlHistory,
     toggleBot,
     toggleKillSwitch,
+    updateRiskSettings,
     toggleStrategy,
     addStrategy,
     deleteStrategy,
@@ -81,6 +82,7 @@ const Index = () => {
               onToggleBot={toggleBot}
               onToggleKillSwitch={toggleKillSwitch}
               onEmergencyClose={emergencyCloseAll}
+              onUpdateRiskSettings={updateRiskSettings}
             />
           </div>
         </div>
