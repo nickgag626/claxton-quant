@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { tradierApi } from '@/services/tradierApi';
+import { strategyEngine } from '@/services/strategyEngine';
 import type { 
   Position, 
   Greeks, 
@@ -96,6 +97,7 @@ export const useTradingData = () => {
   const [lastUpdate, setLastUpdate] = useState(new Date());
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const lastEngineRun = useRef<number>(0);
 
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
     setActivity(prev => [
@@ -144,19 +146,6 @@ export const useTradingData = () => {
       setIsLoading(false);
     }
   }, []);
-
-  // Initial fetch and polling
-  useEffect(() => {
-    fetchData();
-    addActivity('SYSTEM', 'Dashboard connected - fetching market data');
-    
-    // Poll every 5 seconds when market is open
-    const interval = setInterval(() => {
-      fetchData();
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [fetchData, addActivity]);
 
   const toggleBot = useCallback(() => {
     const newState = !isBotRunning;
@@ -209,7 +198,6 @@ export const useTradingData = () => {
     
     if (result.success) {
       addActivity('TRADE', `Position closed: ${position.symbol} (Order #${result.orderId})`);
-      // Refresh positions
       fetchData();
       return true;
     } else {
@@ -223,11 +211,95 @@ export const useTradingData = () => {
     setIsBotRunning(false);
     
     for (const position of positions) {
-      await closePosition(position.id);
+      const result = await tradierApi.closePosition(position.symbol, position.quantity);
+      if (result.success) {
+        addActivity('TRADE', `Position closed: ${position.symbol}`);
+      } else {
+        addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
+      }
     }
     
+    fetchData();
     addActivity('EMERGENCY', 'Emergency close complete');
-  }, [positions, closePosition, addActivity]);
+  }, [positions, addActivity, fetchData]);
+
+  // Run strategy engine when bot is running
+  const runStrategyEngine = useCallback(async () => {
+    if (!isBotRunning || riskStatus.killSwitchActive) return;
+    
+    // Throttle to once per 30 seconds
+    const now = Date.now();
+    if (now - lastEngineRun.current < 30000) return;
+    lastEngineRun.current = now;
+
+    try {
+      addActivity('SYSTEM', 'Strategy engine scanning...');
+      
+      // Check for exit conditions first
+      const exitResult = await strategyEngine.checkExits(strategies, positions);
+      
+      for (const exitSignal of exitResult.exitSignals) {
+        addActivity('TRADE', `Exit signal: ${exitSignal.symbol} - ${exitSignal.reason}`);
+        const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity);
+        if (result.success) {
+          addActivity('TRADE', `Position closed: ${exitSignal.symbol}`);
+        }
+      }
+
+      // Then evaluate entry conditions
+      const entryResult = await strategyEngine.evaluateStrategies(strategies, positions);
+      
+      if (entryResult.signals.length > 0) {
+        for (const signal of entryResult.signals) {
+          addActivity('TRADE', `Entry signal: ${signal.strategyName} - ${signal.underlying} $${signal.credit.toFixed(2)} credit`);
+          
+          // Auto-execute the signal
+          const execResult = await strategyEngine.executeSignal(signal);
+          
+          if (execResult.success) {
+            addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId})`);
+            setRiskStatus(prev => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
+          } else {
+            addActivity('RISK', `Order failed: ${execResult.error}`);
+          }
+        }
+        
+        // Refresh positions after trades
+        await fetchData();
+      } else {
+        addActivity('SYSTEM', 'No entry signals found');
+      }
+    } catch (error) {
+      console.error('Strategy engine error:', error);
+      addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData]);
+
+  // Initial fetch and polling
+  useEffect(() => {
+    fetchData();
+    addActivity('SYSTEM', 'Dashboard connected - fetching market data');
+    
+    // Poll every 5 seconds when market is open
+    const interval = setInterval(() => {
+      fetchData();
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [fetchData, addActivity]);
+
+  // Run strategy engine when bot is running
+  useEffect(() => {
+    if (!isBotRunning) return;
+    
+    // Run immediately when bot starts
+    runStrategyEngine();
+    
+    // Then run every 30 seconds
+    const engineInterval = setInterval(runStrategyEngine, 30000);
+    
+    return () => clearInterval(engineInterval);
+  }, [isBotRunning, runStrategyEngine]);
 
   return {
     positions,
