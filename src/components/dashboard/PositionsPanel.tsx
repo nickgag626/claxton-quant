@@ -33,9 +33,19 @@ export const PositionsPanel = ({ positions, isApiConnected, onClosePosition }: P
   const [closingPositions, setClosingPositions] = useState<Set<string>>(new Set());
   
   const handleClose = async (positionId: string) => {
-    if (!onClosePosition) return;
+    console.log('handleClose called with positionId:', positionId);
+    console.log('onClosePosition exists:', !!onClosePosition);
+    if (!onClosePosition) {
+      console.log('onClosePosition is not defined, returning early');
+      return;
+    }
     setClosingPositions(prev => new Set(prev).add(positionId));
-    await onClosePosition(positionId);
+    try {
+      const result = await onClosePosition(positionId);
+      console.log('onClosePosition result:', result);
+    } catch (err) {
+      console.error('Error in onClosePosition:', err);
+    }
     setClosingPositions(prev => {
       const next = new Set(prev);
       next.delete(positionId);
