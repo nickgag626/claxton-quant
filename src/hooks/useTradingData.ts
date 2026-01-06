@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
 import { tradeJournal } from '@/services/tradeJournal';
-import type { 
+import { settingsService } from '@/services/settingsService';
+import type {
   Position, 
   Greeks, 
   Quote, 
@@ -85,7 +86,8 @@ export const useTradingData = () => {
   const [positions, setPositions] = useState<Position[]>([]);
   const [greeks, setGreeks] = useState<Greeks>({ delta: 0, gamma: 0, theta: 0, vega: 0 });
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
-  const [strategies, setStrategies] = useState<Strategy[]>(defaultStrategies);
+  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [riskStatus, setRiskStatus] = useState<RiskStatus>({
     dailyPnl: 0,
     maxDailyLoss: 1000,
@@ -252,44 +254,68 @@ export const useTradingData = () => {
     if (newStatus) setIsBotRunning(false);
   }, [riskStatus.killSwitchActive, addActivity]);
 
-  const updateRiskSettings = useCallback((settings: { maxDailyLoss: number; maxPositions: number }) => {
+  const updateRiskSettings = useCallback(async (settings: { maxDailyLoss: number; maxPositions: number }) => {
     setRiskStatus(prev => ({
       ...prev,
       maxDailyLoss: settings.maxDailyLoss,
       maxPositions: settings.maxPositions,
     }));
     addActivity('RISK', `Risk settings updated: Max Loss $${settings.maxDailyLoss}, Max Positions ${settings.maxPositions}`);
+    
+    // Persist to database
+    await settingsService.updateRiskSettings(settings.maxDailyLoss, settings.maxPositions);
   }, [addActivity]);
 
-  const updateSafeguards = useCallback((newSafeguards: TradeSafeguards) => {
+  const updateSafeguards = useCallback(async (newSafeguards: TradeSafeguards) => {
     setSafeguards(newSafeguards);
     addActivity('RISK', `Safeguards updated: Spread ${newSafeguards.maxBidAskSpreadPercent}%, Close Buffer ${newSafeguards.zeroDteCloseBufferMinutes}min, Fill Buffer ${newSafeguards.fillPriceBufferPercent}%`);
+    
+    // Persist to database
+    await settingsService.updateSafeguards(newSafeguards);
   }, [addActivity]);
 
-  const toggleStrategy = useCallback((strategyId: string) => {
+  const toggleStrategy = useCallback(async (strategyId: string) => {
+    const strategy = strategies.find(s => s.id === strategyId);
+    if (!strategy) return;
+    
+    const newEnabled = !strategy.enabled;
     setStrategies(prev => prev.map(s =>
-      s.id === strategyId ? { ...s, enabled: !s.enabled } : s
+      s.id === strategyId ? { ...s, enabled: newEnabled } : s
     ));
-  }, []);
+    
+    // Persist to database
+    await settingsService.updateStrategyEnabled(strategyId, newEnabled);
+  }, [strategies]);
 
-  const addStrategy = useCallback((strategy: Omit<Strategy, 'id'>) => {
-    const newStrategy: Strategy = {
-      ...strategy,
-      id: Date.now().toString(),
-    };
-    setStrategies(prev => [...prev, newStrategy]);
-    addActivity('SYSTEM', `Strategy "${strategy.name}" created`);
+  const addStrategy = useCallback(async (strategy: Omit<Strategy, 'id'>) => {
+    // Save to database first to get proper ID
+    const savedStrategy = await settingsService.addStrategy(strategy);
+    
+    if (savedStrategy) {
+      setStrategies(prev => [...prev, savedStrategy]);
+      addActivity('SYSTEM', `Strategy "${strategy.name}" created`);
+    } else {
+      // Fallback to local-only if DB fails
+      const newStrategy: Strategy = {
+        ...strategy,
+        id: Date.now().toString(),
+      };
+      setStrategies(prev => [...prev, newStrategy]);
+      addActivity('SYSTEM', `Strategy "${strategy.name}" created (local only)`);
+    }
   }, [addActivity]);
 
-  const deleteStrategy = useCallback((strategyId: string) => {
-    setStrategies(prev => {
-      const strategy = prev.find(s => s.id === strategyId);
-      if (strategy) {
-        addActivity('SYSTEM', `Strategy "${strategy.name}" deleted`);
-      }
-      return prev.filter(s => s.id !== strategyId);
-    });
-  }, [addActivity]);
+  const deleteStrategy = useCallback(async (strategyId: string) => {
+    const strategy = strategies.find(s => s.id === strategyId);
+    if (strategy) {
+      addActivity('SYSTEM', `Strategy "${strategy.name}" deleted`);
+    }
+    
+    setStrategies(prev => prev.filter(s => s.id !== strategyId));
+    
+    // Delete from database
+    await settingsService.deleteStrategy(strategyId);
+  }, [strategies, addActivity]);
 
   const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
     console.log('closePosition called with:', positionId);
@@ -426,6 +452,44 @@ export const useTradingData = () => {
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
   }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData]);
+
+  // Load saved settings and strategies on mount
+  useEffect(() => {
+    const loadSavedData = async () => {
+      try {
+        // Load strategies
+        const savedStrategies = await settingsService.getStrategies();
+        if (savedStrategies.length > 0) {
+          setStrategies(savedStrategies);
+          addActivity('SYSTEM', `Loaded ${savedStrategies.length} saved strategies`);
+        } else {
+          // Use defaults if no saved strategies
+          setStrategies(defaultStrategies);
+          addActivity('SYSTEM', 'Using default strategies (none saved)');
+        }
+        
+        // Load settings
+        const savedSettings = await settingsService.getSettings();
+        if (savedSettings) {
+          setRiskStatus(prev => ({
+            ...prev,
+            maxDailyLoss: savedSettings.riskStatus.maxDailyLoss || prev.maxDailyLoss,
+            maxPositions: savedSettings.riskStatus.maxPositions || prev.maxPositions,
+          }));
+          setSafeguards(savedSettings.safeguards);
+          addActivity('SYSTEM', 'Loaded saved risk settings');
+        }
+        
+        setSettingsLoaded(true);
+      } catch (error) {
+        console.error('Error loading saved data:', error);
+        setStrategies(defaultStrategies);
+        setSettingsLoaded(true);
+      }
+    };
+    
+    loadSavedData();
+  }, [addActivity]);
 
   // Initial fetch and polling
   useEffect(() => {
