@@ -14,6 +14,81 @@ export type Database = {
   }
   public: {
     Tables: {
+      settings: {
+        Row: {
+          created_at: string
+          fill_price_buffer_percent: number
+          id: string
+          max_bid_ask_spread_percent: number
+          max_daily_loss: number
+          max_positions: number
+          updated_at: string
+          zero_dte_close_buffer_minutes: number
+        }
+        Insert: {
+          created_at?: string
+          fill_price_buffer_percent?: number
+          id?: string
+          max_bid_ask_spread_percent?: number
+          max_daily_loss?: number
+          max_positions?: number
+          updated_at?: string
+          zero_dte_close_buffer_minutes?: number
+        }
+        Update: {
+          created_at?: string
+          fill_price_buffer_percent?: number
+          id?: string
+          max_bid_ask_spread_percent?: number
+          max_daily_loss?: number
+          max_positions?: number
+          updated_at?: string
+          zero_dte_close_buffer_minutes?: number
+        }
+        Relationships: []
+      }
+      strategies: {
+        Row: {
+          created_at: string
+          enabled: boolean
+          entry_conditions: Json
+          exit_conditions: Json
+          id: string
+          max_positions: number
+          name: string
+          position_size: number
+          type: string
+          underlying: string
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          enabled?: boolean
+          entry_conditions?: Json
+          exit_conditions?: Json
+          id?: string
+          max_positions?: number
+          name: string
+          position_size?: number
+          type: string
+          underlying: string
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          enabled?: boolean
+          entry_conditions?: Json
+          exit_conditions?: Json
+          id?: string
+          max_positions?: number
+          name?: string
+          position_size?: number
+          type?: string
+          underlying?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       trades: {
         Row: {
           created_at: string
