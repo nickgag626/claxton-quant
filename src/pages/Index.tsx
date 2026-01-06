@@ -24,6 +24,8 @@ const Index = () => {
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,
+    addStrategy,
+    deleteStrategy,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -76,7 +78,12 @@ const Index = () => {
           </div>
         </div>
         
-        <StrategiesPanel strategies={strategies} onToggleStrategy={toggleStrategy} />
+        <StrategiesPanel 
+          strategies={strategies} 
+          onToggleStrategy={toggleStrategy}
+          onAddStrategy={addStrategy}
+          onDeleteStrategy={deleteStrategy}
+        />
         
         <ActivityLog events={activity} />
       </div>
