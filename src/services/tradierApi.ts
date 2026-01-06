@@ -172,6 +172,25 @@ export const tradierApi = {
     }
   },
 
+  async closePosition(symbol: string, quantity: number): Promise<{ success: boolean; orderId?: string; error?: string }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('tradier-api', {
+        body: { action: 'close_position', positionSymbol: symbol, positionQuantity: quantity },
+      });
+
+      if (error) throw error;
+      
+      if (data?.order?.id) {
+        return { success: true, orderId: data.order.id };
+      }
+      
+      return { success: false, error: data?.errors?.error || 'Order failed' };
+    } catch (error) {
+      console.error('Error closing position:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
   async getOptionChain(symbol: string, expiration: string): Promise<any[]> {
     try {
       const { data, error } = await supabase.functions.invoke('tradier-api', {

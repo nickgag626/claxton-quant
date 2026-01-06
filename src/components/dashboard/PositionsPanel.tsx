@@ -1,12 +1,16 @@
 import { motion } from 'framer-motion';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Button } from '@/components/ui/button';
+import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Position } from '@/types/trading';
+import { useState } from 'react';
 
 interface PositionsPanelProps {
   positions: Position[];
   isApiConnected: boolean;
+  onClosePosition?: (positionId: string) => Promise<boolean>;
 }
 
 const computeDte = (expirationDate?: string): number | null => {
@@ -25,7 +29,20 @@ const computePnl = (position: Position): number => {
   return position.quantity < 0 ? cost - current : current - cost;
 };
 
-export const PositionsPanel = ({ positions, isApiConnected }: PositionsPanelProps) => {
+export const PositionsPanel = ({ positions, isApiConnected, onClosePosition }: PositionsPanelProps) => {
+  const [closingPositions, setClosingPositions] = useState<Set<string>>(new Set());
+  
+  const handleClose = async (positionId: string) => {
+    if (!onClosePosition) return;
+    setClosingPositions(prev => new Set(prev).add(positionId));
+    await onClosePosition(positionId);
+    setClosingPositions(prev => {
+      const next = new Set(prev);
+      next.delete(positionId);
+      return next;
+    });
+  };
+  
   const brokerPositions = positions;
   const strategyPositions = positions.filter(p => p.strategyName);
 
@@ -63,12 +80,13 @@ export const PositionsPanel = ({ positions, isApiConnected }: PositionsPanelProp
             <div className="overflow-auto max-h-48">
               <Table>
                 <TableHeader>
-                  <TableRow className="border-border hover:bg-transparent">
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">SYM</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">QTY</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">AVG</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">DTE</TableHead>
-                  </TableRow>
+                    <TableRow className="border-border hover:bg-transparent">
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">SYM</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">QTY</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">AVG</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">DTE</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-center w-12"></TableHead>
+                    </TableRow>
                 </TableHeader>
                 <TableBody>
                   {brokerPositions.map((pos) => {
@@ -89,6 +107,17 @@ export const PositionsPanel = ({ positions, isApiConnected }: PositionsPanelProp
                         </TableCell>
                         <TableCell className="font-mono text-xs text-right text-bloomberg-amber py-1.5">
                           {dte !== null ? dte : '--'}
+                        </TableCell>
+                        <TableCell className="py-1.5 text-center">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 w-6 p-0 hover:bg-panic-red/20 hover:text-panic-red"
+                            onClick={() => handleClose(pos.id)}
+                            disabled={closingPositions.has(pos.id)}
+                          >
+                            <X className="h-3 w-3" />
+                          </Button>
                         </TableCell>
                       </TableRow>
                     );

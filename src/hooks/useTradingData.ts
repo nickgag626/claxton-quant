@@ -200,6 +200,35 @@ export const useTradingData = () => {
     });
   }, [addActivity]);
 
+  const closePosition = useCallback(async (positionId: string) => {
+    const position = positions.find(p => p.id === positionId);
+    if (!position) return false;
+    
+    addActivity('TRADE', `Closing position: ${position.symbol}`);
+    const result = await tradierApi.closePosition(position.symbol, position.quantity);
+    
+    if (result.success) {
+      addActivity('TRADE', `Position closed: ${position.symbol} (Order #${result.orderId})`);
+      // Refresh positions
+      fetchData();
+      return true;
+    } else {
+      addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
+      return false;
+    }
+  }, [positions, addActivity, fetchData]);
+
+  const emergencyCloseAll = useCallback(async () => {
+    addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
+    setIsBotRunning(false);
+    
+    for (const position of positions) {
+      await closePosition(position.id);
+    }
+    
+    addActivity('EMERGENCY', 'Emergency close complete');
+  }, [positions, closePosition, addActivity]);
+
   return {
     positions,
     greeks,
@@ -218,6 +247,8 @@ export const useTradingData = () => {
     toggleStrategy,
     addStrategy,
     deleteStrategy,
+    closePosition,
+    emergencyCloseAll,
     refetch: fetchData,
   };
 };

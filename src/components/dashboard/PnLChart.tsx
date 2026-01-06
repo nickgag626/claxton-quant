@@ -1,39 +1,29 @@
 import { motion } from 'framer-motion';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts';
+import { useMemo } from 'react';
+
+interface PnLDataPoint {
+  time: string;
+  pnl: number;
+}
 
 interface PnLChartProps {
   dailyPnl: number;
+  pnlHistory?: PnLDataPoint[];
 }
 
-// Generate mock intraday P&L data
-const generateIntradayData = (currentPnl: number) => {
-  const data = [];
-  const startTime = 9.5; // 9:30 AM
-  const endTime = 16; // 4:00 PM
+export const PnLChart = ({ dailyPnl, pnlHistory }: PnLChartProps) => {
+  // Use provided history or show single current point
+  const data = useMemo(() => {
+    if (pnlHistory && pnlHistory.length > 0) {
+      return pnlHistory;
+    }
+    // If no history, show current P&L as single point
+    const now = new Date();
+    const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+    return [{ time: timeLabel, pnl: dailyPnl }];
+  }, [pnlHistory, dailyPnl]);
   
-  let runningPnl = 0;
-  
-  for (let hour = startTime; hour <= endTime; hour += 0.5) {
-    const volatility = Math.random() * 100 - 50;
-    runningPnl += volatility;
-    
-    const hourInt = Math.floor(hour);
-    const minutes = (hour % 1) * 60;
-    const timeLabel = `${hourInt}:${minutes === 0 ? '00' : '30'}`;
-    
-    data.push({
-      time: timeLabel,
-      pnl: runningPnl,
-    });
-  }
-  
-  // Normalize to match current P&L
-  const scaleFactor = currentPnl / (runningPnl || 1);
-  return data.map(d => ({ ...d, pnl: d.pnl * scaleFactor }));
-};
-
-export const PnLChart = ({ dailyPnl }: PnLChartProps) => {
-  const data = generateIntradayData(dailyPnl);
   const isPositive = dailyPnl >= 0;
   
   return (
