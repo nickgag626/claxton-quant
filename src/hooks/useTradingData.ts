@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { tradierApi } from '@/services/tradierApi';
+import { tradierApi, calculatePortfolioGreeks } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
 import type { 
   Position, 
@@ -134,6 +134,36 @@ export const useTradingData = () => {
       // Fetch market clock
       const clock = await tradierApi.getMarketClock();
       setMarketState(clock.state);
+      
+      // Calculate Greeks from option positions
+      if (positionsData.length > 0) {
+        // Get unique underlyings from option positions
+        const optionPositions = positionsData.filter(p => p.symbol.includes(' '));
+        
+        if (optionPositions.length > 0) {
+          // Extract underlying symbols and get nearest expiration for each
+          const underlyings = [...new Set(optionPositions.map(p => p.symbol.split(' ')[0]))];
+          
+          let allOptionData: any[] = [];
+          
+          for (const underlying of underlyings) {
+            try {
+              const expirations = await tradierApi.getOptionExpirations(underlying);
+              if (expirations.length > 0) {
+                // Get chain for nearest expiration to get greeks
+                const chain = await tradierApi.getOptionChain(underlying, expirations[0]);
+                allOptionData = [...allOptionData, ...chain];
+              }
+            } catch (err) {
+              console.error(`Error fetching chain for ${underlying}:`, err);
+            }
+          }
+          
+          // Calculate portfolio greeks
+          const portfolioGreeks = calculatePortfolioGreeks(positionsData, allOptionData);
+          setGreeks(portfolioGreeks);
+        }
+      }
       
       setIsApiConnected(true);
       setError(null);
