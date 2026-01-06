@@ -281,11 +281,21 @@ export const useTradingData = () => {
   }, [addActivity]);
 
   const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
+    console.log('closePosition called with:', positionId);
+    console.log('Current positions:', positions.map(p => ({ id: p.id, symbol: p.symbol })));
+    
     const position = positions.find(p => p.id === positionId);
-    if (!position) return false;
+    console.log('Found position:', position);
+    
+    if (!position) {
+      console.log('Position not found, returning false');
+      return false;
+    }
     
     addActivity('TRADE', `Closing position: ${position.symbol}`);
+    console.log('Calling tradierApi.closePosition with:', position.symbol, position.quantity);
     const result = await tradierApi.closePosition(position.symbol, position.quantity);
+    console.log('tradierApi.closePosition result:', result);
     
     if (result.success) {
       addActivity('TRADE', `Position closed: ${position.symbol} (Order #${result.orderId})`);
