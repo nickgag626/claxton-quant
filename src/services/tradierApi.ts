@@ -213,6 +213,27 @@ export const tradierApi = {
   },
 };
 
+// Parse OCC option symbol (e.g., SPY260112C00700000)
+export const parseOptionSymbol = (symbol: string): { underlying: string; expiration: string; type: 'call' | 'put'; strike: number } | null => {
+  // OCC format: SYMBOL + YYMMDD + C/P + 8-digit strike (multiplied by 1000)
+  const match = symbol.match(/^([A-Z]+)(\d{6})([CP])(\d{8})$/);
+  if (!match) return null;
+  
+  const [, underlying, dateStr, typeChar, strikeStr] = match;
+  const year = 2000 + parseInt(dateStr.slice(0, 2));
+  const month = parseInt(dateStr.slice(2, 4)) - 1;
+  const day = parseInt(dateStr.slice(4, 6));
+  const expiration = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const strike = parseInt(strikeStr) / 1000;
+  
+  return {
+    underlying,
+    expiration,
+    type: typeChar === 'C' ? 'call' : 'put',
+    strike,
+  };
+};
+
 // Helper to calculate portfolio Greeks from positions
 export const calculatePortfolioGreeks = (positions: Position[], optionData: any[]): Greeks => {
   let delta = 0;
@@ -222,9 +243,22 @@ export const calculatePortfolioGreeks = (positions: Position[], optionData: any[
 
   // Match positions with option data and sum Greeks
   positions.forEach(pos => {
-    const optionInfo = optionData.find(o => o.symbol === pos.symbol);
+    // First try direct symbol match
+    let optionInfo = optionData.find(o => o.symbol === pos.symbol);
+    
+    // If not found, try matching by parsed strike/type
+    if (!optionInfo) {
+      const parsed = parseOptionSymbol(pos.symbol);
+      if (parsed) {
+        optionInfo = optionData.find(o => 
+          o.strike === parsed.strike && 
+          o.option_type === parsed.type
+        );
+      }
+    }
+    
     if (optionInfo?.greeks) {
-      const multiplier = pos.quantity * 100; // Options are 100 shares
+      const multiplier = pos.quantity; // Already in contracts
       delta += (optionInfo.greeks.delta || 0) * multiplier;
       gamma += (optionInfo.greeks.gamma || 0) * multiplier;
       theta += (optionInfo.greeks.theta || 0) * multiplier;
