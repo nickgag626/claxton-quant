@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { tradierApi, calculatePortfolioGreeks } from '@/services/tradierApi';
+import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
 import type { 
   Position, 
@@ -139,25 +139,33 @@ export const useTradingData = () => {
       
       // Calculate Greeks from option positions
       if (positionsData.length > 0) {
-        // Get unique underlyings from option positions
-        const optionPositions = positionsData.filter(p => p.symbol.includes(' '));
+        // Parse option symbols to get underlyings and expirations
+        const optionPositions = positionsData
+          .map(p => ({ position: p, parsed: parseOptionSymbol(p.symbol) }))
+          .filter(item => item.parsed !== null);
         
         if (optionPositions.length > 0) {
-          // Extract underlying symbols and get nearest expiration for each
-          const underlyings = [...new Set(optionPositions.map(p => p.symbol.split(' ')[0]))];
+          // Group by underlying and expiration
+          const chainRequests = new Map<string, Set<string>>();
+          optionPositions.forEach(({ parsed }) => {
+            if (!parsed) return;
+            if (!chainRequests.has(parsed.underlying)) {
+              chainRequests.set(parsed.underlying, new Set());
+            }
+            chainRequests.get(parsed.underlying)!.add(parsed.expiration);
+          });
           
           let allOptionData: any[] = [];
           
-          for (const underlying of underlyings) {
-            try {
-              const expirations = await tradierApi.getOptionExpirations(underlying);
-              if (expirations.length > 0) {
-                // Get chain for nearest expiration to get greeks
-                const chain = await tradierApi.getOptionChain(underlying, expirations[0]);
+          // Fetch chains for each underlying/expiration pair
+          for (const [underlying, expirations] of chainRequests) {
+            for (const expiration of expirations) {
+              try {
+                const chain = await tradierApi.getOptionChain(underlying, expiration);
                 allOptionData = [...allOptionData, ...chain];
+              } catch (err) {
+                console.error(`Error fetching chain for ${underlying} ${expiration}:`, err);
               }
-            } catch (err) {
-              console.error(`Error fetching chain for ${underlying}:`, err);
             }
           }
           
