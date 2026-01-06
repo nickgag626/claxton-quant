@@ -1,7 +1,8 @@
 import { motion } from 'framer-motion';
-import { Play, Square, Lock, Unlock, AlertTriangle, Gauge } from 'lucide-react';
+import { Play, Square, Lock, Unlock, AlertTriangle, Gauge, Settings, Save } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import type { Greeks, RiskStatus } from '@/types/trading';
@@ -13,6 +14,7 @@ interface ControlsPanelProps {
   onToggleBot: () => void;
   onToggleKillSwitch: () => void;
   onEmergencyClose: () => void;
+  onUpdateRiskSettings?: (settings: { maxDailyLoss: number; maxPositions: number }) => void;
 }
 
 export const ControlsPanel = ({
@@ -22,11 +24,29 @@ export const ControlsPanel = ({
   onToggleBot,
   onToggleKillSwitch,
   onEmergencyClose,
+  onUpdateRiskSettings,
 }: ControlsPanelProps) => {
   const [confirmEmergency, setConfirmEmergency] = useState(false);
+  const [isEditingRisk, setIsEditingRisk] = useState(false);
+  const [editMaxLoss, setEditMaxLoss] = useState(riskStatus.maxDailyLoss.toString());
+  const [editMaxPositions, setEditMaxPositions] = useState(riskStatus.maxPositions.toString());
   
   const deltaDirection = greeks.delta > 10 ? 'Bullish' : greeks.delta < -10 ? 'Bearish' : 'Neutral';
   const deltaColor = greeks.delta > 10 ? 'text-trading-green' : greeks.delta < -10 ? 'text-panic-red' : 'text-muted-foreground';
+
+  const handleSaveRiskSettings = () => {
+    const maxLoss = Math.max(0, Math.min(1000000, Number(editMaxLoss) || 1000));
+    const maxPos = Math.max(1, Math.min(100, Number(editMaxPositions) || 5));
+    
+    onUpdateRiskSettings?.({ maxDailyLoss: maxLoss, maxPositions: maxPos });
+    setIsEditingRisk(false);
+  };
+
+  const handleStartEdit = () => {
+    setEditMaxLoss(riskStatus.maxDailyLoss.toString());
+    setEditMaxPositions(riskStatus.maxPositions.toString());
+    setIsEditingRisk(true);
+  };
 
   return (
     <motion.div
@@ -77,23 +97,90 @@ export const ControlsPanel = ({
 
       {/* Risk Limits Panel */}
       <div>
-        <div className="text-[10px] text-muted-foreground uppercase tracking-widest border-b border-border pb-1.5 mb-3 flex items-center gap-1.5">
-          <Gauge className="w-3 h-3" />
-          Risk Limits
+        <div className="text-[10px] text-muted-foreground uppercase tracking-widest border-b border-border pb-1.5 mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Gauge className="w-3 h-3" />
+            Risk Limits
+          </div>
+          {!isEditingRisk ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0 opacity-50 hover:opacity-100"
+              onClick={handleStartEdit}
+              disabled={isBotRunning}
+            >
+              <Settings className="w-3 h-3" />
+            </Button>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0 text-trading-green"
+              onClick={handleSaveRiskSettings}
+            >
+              <Save className="w-3 h-3" />
+            </Button>
+          )}
         </div>
         <div className="space-y-1.5 text-xs text-muted-foreground">
-          <div className="flex justify-between">
+          <div className="flex justify-between items-center">
             <span>Daily Loss Limit:</span>
-            <span className="font-mono text-foreground">${riskStatus.maxDailyLoss.toLocaleString()}</span>
+            {isEditingRisk ? (
+              <div className="flex items-center gap-1">
+                <span className="text-foreground">$</span>
+                <Input
+                  type="number"
+                  value={editMaxLoss}
+                  onChange={(e) => setEditMaxLoss(e.target.value)}
+                  className="h-6 w-20 text-xs font-mono text-right py-0 px-1"
+                  min={0}
+                  max={1000000}
+                />
+              </div>
+            ) : (
+              <span className="font-mono text-foreground">${riskStatus.maxDailyLoss.toLocaleString()}</span>
+            )}
           </div>
-          <div className="flex justify-between">
+          <div className="flex justify-between items-center">
             <span>Max Positions:</span>
-            <span className="font-mono text-foreground">{riskStatus.maxPositions}</span>
+            {isEditingRisk ? (
+              <Input
+                type="number"
+                value={editMaxPositions}
+                onChange={(e) => setEditMaxPositions(e.target.value)}
+                className="h-6 w-16 text-xs font-mono text-right py-0 px-1"
+                min={1}
+                max={100}
+              />
+            ) : (
+              <span className="font-mono text-foreground">{riskStatus.maxPositions}</span>
+            )}
           </div>
           <div className="flex justify-between">
             <span>Trades Today:</span>
             <span className="font-mono text-foreground">{riskStatus.tradeCount}</span>
           </div>
+          {isEditingRisk && (
+            <div className="pt-2 flex gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                className="flex-1 text-xs h-6"
+                onClick={() => setIsEditingRisk(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="default"
+                size="sm"
+                className="flex-1 text-xs h-6 bg-trading-green hover:bg-trading-green/90 text-black"
+                onClick={handleSaveRiskSettings}
+              >
+                Save
+              </Button>
+            </div>
+          )}
           {riskStatus.killSwitchActive && riskStatus.killSwitchReason && (
             <div className="mt-2 p-2 bg-panic-red/10 border border-panic-red/30 rounded text-panic-red text-[10px]">
               Kill Reason: {riskStatus.killSwitchReason}

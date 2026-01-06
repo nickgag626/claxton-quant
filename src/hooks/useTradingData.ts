@@ -246,6 +246,15 @@ export const useTradingData = () => {
     if (newStatus) setIsBotRunning(false);
   }, [riskStatus.killSwitchActive, addActivity]);
 
+  const updateRiskSettings = useCallback((settings: { maxDailyLoss: number; maxPositions: number }) => {
+    setRiskStatus(prev => ({
+      ...prev,
+      maxDailyLoss: settings.maxDailyLoss,
+      maxPositions: settings.maxPositions,
+    }));
+    addActivity('RISK', `Risk settings updated: Max Loss $${settings.maxDailyLoss}, Max Positions ${settings.maxPositions}`);
+  }, [addActivity]);
+
   const toggleStrategy = useCallback((strategyId: string) => {
     setStrategies(prev => prev.map(s =>
       s.id === strategyId ? { ...s, enabled: !s.enabled } : s
@@ -440,6 +449,7 @@ export const useTradingData = () => {
     pnlHistory,
     toggleBot,
     toggleKillSwitch,
+    updateRiskSettings,
     toggleStrategy,
     addStrategy,
     deleteStrategy,
