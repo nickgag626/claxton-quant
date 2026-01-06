@@ -10,7 +10,7 @@ import type {
   MarketState 
 } from '@/types/trading';
 
-// Mock strategies (would come from database in production)
+// Default strategies (would come from database in production)
 const defaultStrategies: Strategy[] = [
   {
     id: '1',
@@ -181,6 +181,25 @@ export const useTradingData = () => {
     ));
   }, []);
 
+  const addStrategy = useCallback((strategy: Omit<Strategy, 'id'>) => {
+    const newStrategy: Strategy = {
+      ...strategy,
+      id: Date.now().toString(),
+    };
+    setStrategies(prev => [...prev, newStrategy]);
+    addActivity('SYSTEM', `Strategy "${strategy.name}" created`);
+  }, [addActivity]);
+
+  const deleteStrategy = useCallback((strategyId: string) => {
+    setStrategies(prev => {
+      const strategy = prev.find(s => s.id === strategyId);
+      if (strategy) {
+        addActivity('SYSTEM', `Strategy "${strategy.name}" deleted`);
+      }
+      return prev.filter(s => s.id !== strategyId);
+    });
+  }, [addActivity]);
+
   return {
     positions,
     greeks,
@@ -197,6 +216,8 @@ export const useTradingData = () => {
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,
+    addStrategy,
+    deleteStrategy,
     refetch: fetchData,
   };
 };
