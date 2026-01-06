@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
+import { tradeJournal } from '@/services/tradeJournal';
 import type { 
   Position, 
   Greeks, 
@@ -270,7 +271,7 @@ export const useTradingData = () => {
     });
   }, [addActivity]);
 
-  const closePosition = useCallback(async (positionId: string) => {
+  const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
     const position = positions.find(p => p.id === positionId);
     if (!position) return false;
     
@@ -279,13 +280,39 @@ export const useTradingData = () => {
     
     if (result.success) {
       addActivity('TRADE', `Position closed: ${position.symbol} (Order #${result.orderId})`);
+      
+      // Save to trade journal
+      const parsed = parseOptionSymbol(position.symbol);
+      const stratInfo = strategyPositions.get(position.symbol);
+      
+      await tradeJournal.saveTrade({
+        symbol: position.symbol,
+        underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
+        strategy_name: stratInfo?.strategyName || position.strategyName,
+        quantity: position.quantity,
+        entry_time: position.entryTime.toISOString(),
+        exit_time: new Date().toISOString(),
+        entry_price: position.costBasis,
+        exit_price: position.currentValue,
+        entry_credit: stratInfo?.entryCredit || position.entryCredit,
+        pnl: (position.currentValue - position.costBasis) * Math.abs(position.quantity),
+        exit_reason: exitReason,
+      });
+      
+      // Remove from tracked strategy positions
+      setStrategyPositions(prev => {
+        const newMap = new Map(prev);
+        newMap.delete(position.symbol);
+        return newMap;
+      });
+      
       fetchData();
       return true;
     } else {
       addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
       return false;
     }
-  }, [positions, addActivity, fetchData]);
+  }, [positions, addActivity, fetchData, strategyPositions]);
 
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
