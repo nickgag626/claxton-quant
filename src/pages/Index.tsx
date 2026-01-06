@@ -26,14 +26,12 @@ const Index = () => {
     toggleStrategy,
     addStrategy,
     deleteStrategy,
+    closePosition,
+    emergencyCloseAll,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
   const nearestDte = positions.length > 0 ? 11 : null; // Mock value
-
-  const handleEmergencyClose = () => {
-    console.log('Emergency close triggered');
-  };
 
   return (
     <div className="min-h-screen bg-background p-4 md:p-6">
@@ -63,7 +61,11 @@ const Index = () => {
         
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 space-y-4">
-            <PositionsPanel positions={positions} isApiConnected={isApiConnected} />
+            <PositionsPanel 
+              positions={positions} 
+              isApiConnected={isApiConnected}
+              onClosePosition={closePosition}
+            />
             <PnLChart dailyPnl={riskStatus.dailyPnl} />
           </div>
           <div>
@@ -73,7 +75,7 @@ const Index = () => {
               isBotRunning={isBotRunning}
               onToggleBot={toggleBot}
               onToggleKillSwitch={toggleKillSwitch}
-              onEmergencyClose={handleEmergencyClose}
+              onEmergencyClose={emergencyCloseAll}
             />
           </div>
         </div>

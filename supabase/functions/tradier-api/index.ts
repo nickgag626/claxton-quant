@@ -6,10 +6,12 @@ const corsHeaders = {
 };
 
 interface TradierRequest {
-  action: 'quote' | 'positions' | 'balances' | 'expirations' | 'chain' | 'clock';
+  action: 'quote' | 'positions' | 'balances' | 'expirations' | 'chain' | 'clock' | 'close_position';
   symbols?: string[];
   symbol?: string;
   expiration?: string;
+  positionSymbol?: string;
+  positionQuantity?: number;
 }
 
 serve(async (req) => {
@@ -30,7 +32,7 @@ serve(async (req) => {
       );
     }
 
-    const { action, symbols, symbol, expiration }: TradierRequest = await req.json();
+    const { action, symbols, symbol, expiration, positionSymbol, positionQuantity }: TradierRequest = await req.json();
     
     // Use sandbox for paper trading - change to api.tradier.com for live
     const baseUrl = 'https://sandbox.tradier.com/v1';
@@ -113,6 +115,43 @@ serve(async (req) => {
         response = await fetch(url, { headers });
         data = await response.json();
         console.log('Clock response:', JSON.stringify(data));
+        break;
+      }
+
+      case 'close_position': {
+        if (!positionSymbol || positionQuantity === undefined) {
+          return new Response(
+            JSON.stringify({ error: 'Symbol and quantity required for close_position' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+        
+        // Determine order side (buy to close short, sell to close long)
+        const side = positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close';
+        const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
+        
+        console.log('Closing position:', positionSymbol, 'qty:', positionQuantity, 'side:', side);
+        
+        response = await fetch(orderUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiToken}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({
+            class: positionSymbol.includes(' ') ? 'option' : 'equity',
+            symbol: positionSymbol.split(' ')[0],
+            option_symbol: positionSymbol.includes(' ') ? positionSymbol : '',
+            side: side,
+            quantity: Math.abs(positionQuantity).toString(),
+            type: 'market',
+            duration: 'day',
+          }).toString(),
+        });
+        
+        data = await response.json();
+        console.log('Close order response:', JSON.stringify(data));
         break;
       }
 
