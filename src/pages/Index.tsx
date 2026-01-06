@@ -9,6 +9,7 @@ import { StrategiesPanel } from '@/components/dashboard/StrategiesPanel';
 import { PnLChart } from '@/components/dashboard/PnLChart';
 import { GreeksChart } from '@/components/dashboard/GreeksChart';
 import { DataLagWarning } from '@/components/dashboard/DataLagWarning';
+import { TradeJournal } from '@/components/dashboard/TradeJournal';
 
 const Index = () => {
   const {
@@ -90,6 +91,8 @@ const Index = () => {
           onAddStrategy={addStrategy}
           onDeleteStrategy={deleteStrategy}
         />
+        
+        <TradeJournal />
         
         <ActivityLog events={activity} />
       </div>
