@@ -99,6 +99,7 @@ export const useTradingData = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
+  const [strategyPositions, setStrategyPositions] = useState<Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>>(new Map());
   const lastEngineRun = useRef<number>(0);
 
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
@@ -120,9 +121,23 @@ export const useTradingData = () => {
       const quotesData = await tradierApi.getQuotes(['SPY', 'QQQ']);
       setQuotes(quotesData);
       
-      // Fetch positions
+      // Fetch positions and enrich with strategy info
       const positionsData = await tradierApi.getPositions();
-      setPositions(positionsData);
+      
+      // Enrich positions with strategy info from tracked positions
+      const enrichedPositions = positionsData.map(pos => {
+        const stratInfo = strategyPositions.get(pos.symbol);
+        if (stratInfo) {
+          return {
+            ...pos,
+            strategyName: stratInfo.strategyName,
+            underlying: stratInfo.underlying,
+            entryCredit: stratInfo.entryCredit,
+          };
+        }
+        return pos;
+      });
+      setPositions(enrichedPositions);
       
       // Fetch balances for P&L
       const balances = await tradierApi.getBalances();
@@ -197,7 +212,7 @@ export const useTradingData = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [strategyPositions]);
 
   const toggleBot = useCallback(() => {
     const newState = !isBotRunning;
@@ -311,6 +326,20 @@ export const useTradingData = () => {
           if (execResult.success) {
             addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId})`);
             setRiskStatus(prev => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
+            
+            // Track the strategy position for each leg
+            setStrategyPositions(prev => {
+              const newMap = new Map(prev);
+              signal.legs.forEach(leg => {
+                newMap.set(leg.symbol, {
+                  strategyName: signal.strategyName,
+                  underlying: signal.underlying,
+                  entryCredit: signal.credit,
+                  entryTime: new Date(),
+                });
+              });
+              return newMap;
+            });
           } else {
             addActivity('RISK', `Order failed: ${execResult.error}`);
           }
