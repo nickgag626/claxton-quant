@@ -23,6 +23,7 @@ const Index = () => {
     isBotRunning,
     lastUpdate,
     deltaHistory,
+    pnlHistory,
     toggleBot,
     toggleKillSwitch,
     toggleStrategy,
@@ -68,7 +69,7 @@ const Index = () => {
               isApiConnected={isApiConnected}
               onClosePosition={closePosition}
             />
-            <PnLChart dailyPnl={riskStatus.dailyPnl} />
+            <PnLChart dailyPnl={riskStatus.dailyPnl} pnlHistory={pnlHistory} />
             <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />
           </div>
           <div>
