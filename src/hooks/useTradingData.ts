@@ -427,9 +427,51 @@ export const useTradingData = () => {
       
       for (const exitSignal of exitResult.exitSignals) {
         addActivity('TRADE', `Exit signal: ${exitSignal.symbol} - ${exitSignal.reason}`);
+        
+        // Find the position to get full details for journal logging
+        const position = positions.find(p => p.symbol === exitSignal.symbol);
+        
         const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity);
         if (result.success) {
           addActivity('TRADE', `Position closed: ${exitSignal.symbol}`);
+          
+          // Log to trade journal (same as manual close)
+          if (position) {
+            const parsed = parseOptionSymbol(exitSignal.symbol);
+            const stratInfo = strategyPositions.get(exitSignal.symbol);
+            
+            const pnl = position.currentValue - position.costBasis;
+            const entryPrice = Math.abs(position.costBasis / position.quantity);
+            const exitPrice = Math.abs(position.currentValue / position.quantity);
+            
+            try {
+              await tradeJournal.saveTrade({
+                symbol: exitSignal.symbol,
+                underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
+                strategy_name: stratInfo?.strategyName || position.strategyName,
+                strategy_type: position.strategyType,
+                quantity: Math.abs(exitSignal.quantity),
+                entry_time: position.entryTime?.toISOString() || new Date().toISOString(),
+                exit_time: new Date().toISOString(),
+                entry_price: entryPrice,
+                exit_price: exitPrice,
+                entry_credit: stratInfo?.entryCredit || position.entryCredit,
+                pnl: pnl,
+                pnl_percent: entryPrice !== 0 ? (pnl / Math.abs(position.costBasis)) * 100 : 0,
+                exit_reason: exitSignal.reason,
+              });
+              addActivity('SYSTEM', `Trade logged: ${exitSignal.symbol} (${exitSignal.reason})`);
+            } catch (err) {
+              console.error('Failed to save bot trade to journal:', err);
+            }
+            
+            // Remove from tracked strategy positions
+            setStrategyPositions(prev => {
+              const newMap = new Map(prev);
+              newMap.delete(exitSignal.symbol);
+              return newMap;
+            });
+          }
         }
       }
 
