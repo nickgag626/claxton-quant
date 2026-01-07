@@ -150,27 +150,46 @@ export const useTradingData = () => {
       });
       setPositions(enrichedPositions);
       
-      // Fetch balances for P&L
+      // Fetch balances for open P&L
       const balances = await tradierApi.getBalances();
-      if (balances) {
-        const currentPnl = balances.open_pl || 0;
-        setRiskStatus(prev => ({
-          ...prev,
-          dailyPnl: currentPnl,
-        }));
+      const openPnl = balances?.open_pl || 0;
+      
+      // Fetch realized P&L from today's closed trades in the database
+      let realizedPnl = 0;
+      try {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const { data: todayTrades } = await supabase
+          .from('trades')
+          .select('pnl')
+          .gte('exit_time', today.toISOString());
         
-        // Track P&L history (max 100 points for the day)
-        const now = new Date();
-        const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
-        setPnlHistory(prev => {
-          const newPoint = { time: timeLabel, pnl: currentPnl };
-          // Avoid duplicates for same minute
-          if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
-            return [...prev.slice(0, -1), newPoint];
-          }
-          return [...prev.slice(-99), newPoint];
-        });
+        if (todayTrades) {
+          realizedPnl = todayTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+        }
+      } catch (err) {
+        console.error('Error fetching daily P&L:', err);
       }
+      
+      // Total daily P&L = realized (closed trades) + unrealized (open positions)
+      const totalDailyPnl = realizedPnl + openPnl;
+      
+      setRiskStatus(prev => ({
+        ...prev,
+        dailyPnl: totalDailyPnl,
+      }));
+      
+      // Track P&L history (max 100 points for the day)
+      const now = new Date();
+      const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+      setPnlHistory(prev => {
+        const newPoint = { time: timeLabel, pnl: totalDailyPnl };
+        // Avoid duplicates for same minute
+        if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
+          return [...prev.slice(0, -1), newPoint];
+        }
+        return [...prev.slice(-99), newPoint];
+      });
       
       // Fetch market clock
       const clock = await tradierApi.getMarketClock();
