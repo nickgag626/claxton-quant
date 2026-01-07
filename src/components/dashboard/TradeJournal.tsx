@@ -349,6 +349,21 @@ export const TradeJournal = () => {
     loadTrades();
   }, []);
 
+  // Keep the journal fresh while it's expanded (so manual closes show up immediately)
+  useEffect(() => {
+    if (!isExpanded) return;
+
+    // Load immediately when expanding
+    loadTrades();
+
+    // Then poll while expanded
+    const interval = window.setInterval(() => {
+      loadTrades();
+    }, 5000);
+
+    return () => window.clearInterval(interval);
+  }, [isExpanded]);
+
   const loadTrades = async () => {
     setIsLoading(true);
     const [tradesData, statsData] = await Promise.all([
