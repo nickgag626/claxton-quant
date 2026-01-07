@@ -2,7 +2,23 @@ import { supabase } from '@/integrations/supabase/client';
 import type { Strategy, RiskStatus, TradeSafeguards, EntryConditions, ExitConditions, StrategyType } from '@/types/trading';
 import type { Json } from '@/integrations/supabase/types';
 
+// Helper to map DB row to Strategy type
+const mapDbToStrategy = (s: any): Strategy => ({
+  id: s.id,
+  name: s.name,
+  type: s.type as StrategyType,
+  underlying: s.underlying,
+  enabled: s.enabled,
+  maxPositions: s.max_positions,
+  positionSize: s.position_size,
+  entryConditions: s.entry_conditions as unknown as EntryConditions,
+  exitConditions: s.exit_conditions as unknown as ExitConditions,
+});
+
 export const settingsService = {
+  // Expose the mapper for real-time sync
+  mapDbToStrategy,
+
   // Load strategies from database
   async getStrategies(): Promise<Strategy[]> {
     const { data, error } = await supabase
@@ -17,17 +33,7 @@ export const settingsService = {
 
     if (!data) return [];
 
-    return data.map(s => ({
-      id: s.id,
-      name: s.name,
-      type: s.type as StrategyType,
-      underlying: s.underlying,
-      enabled: s.enabled,
-      maxPositions: s.max_positions,
-      positionSize: s.position_size,
-      entryConditions: s.entry_conditions as unknown as EntryConditions,
-      exitConditions: s.exit_conditions as unknown as ExitConditions,
-    }));
+    return data.map(mapDbToStrategy);
   },
 
   // Save a new strategy
