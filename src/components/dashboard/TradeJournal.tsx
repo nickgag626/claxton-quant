@@ -4,9 +4,14 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup } from '@/services/tradeJournal';
 import { format } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers } from 'lucide-react';
+
+// Type guard to check if item is a TradeGroup
+const isTradeGroup = (item: TradeRecord | TradeGroup): item is TradeGroup => {
+  return 'groupId' in item && 'trades' in item;
+};
 
 interface TradeDetailsRowProps {
   trade: TradeRecord;
@@ -222,8 +227,109 @@ const TradeDetailsRow = ({
   );
 };
 
+// Component for displaying a trade group (multi-leg)
+interface TradeGroupRowProps {
+  group: TradeGroup;
+  isExpanded: boolean;
+  onToggle: () => void;
+}
+
+const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
+  return (
+    <>
+      <TableRow 
+        className={cn(
+          "border-border cursor-pointer transition-colors",
+          isExpanded ? "bg-primary/10" : "hover:bg-secondary/30"
+        )}
+        onClick={onToggle}
+      >
+        <TableCell className="py-1.5 w-8">
+          <div className="flex items-center gap-1">
+            <Layers className="h-3 w-3 text-primary" />
+            <ChevronRight 
+              className={cn(
+                "h-4 w-4 text-muted-foreground transition-transform",
+                isExpanded && "rotate-90"
+              )} 
+            />
+          </div>
+        </TableCell>
+        <TableCell className="font-mono text-xs text-foreground py-1.5">
+          {group.exitTime ? format(new Date(group.exitTime), 'MM/dd HH:mm') : '--'}
+        </TableCell>
+        <TableCell className="font-mono text-xs text-foreground py-1.5">
+          <span className="flex items-center gap-1">
+            {group.strategyName?.slice(0, 15) || group.strategyType || group.underlying}
+            <span className="text-[9px] text-primary bg-primary/20 px-1 rounded">
+              {group.trades.length}L
+            </span>
+          </span>
+        </TableCell>
+        <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
+          {group.underlying} spread
+        </TableCell>
+        <TableCell className={cn(
+          "font-mono text-xs text-right py-1.5 font-semibold",
+          group.totalPnl >= 0 ? "text-trading-green" : "text-panic-red"
+        )}>
+          {group.totalPnl >= 0 ? '+' : ''}${Number(group.totalPnl).toFixed(2)}
+        </TableCell>
+        <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
+          {group.exitReason || '--'}
+        </TableCell>
+      </TableRow>
+      {isExpanded && (
+        <motion.tr
+          initial={{ opacity: 0, height: 0 }}
+          animate={{ opacity: 1, height: 'auto' }}
+          exit={{ opacity: 0, height: 0 }}
+          className="bg-secondary/20 border-border"
+        >
+          <TableCell colSpan={6} className="p-0">
+            <div className="p-3 space-y-2 border-l-2 border-primary/50 ml-4">
+              <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-2">
+                Legs in this spread
+              </div>
+              {group.trades.map((leg, idx) => (
+                <div key={leg.id || idx} className="flex items-center justify-between text-xs bg-background/50 rounded px-2 py-1.5">
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground text-[10px] w-4">{idx + 1}.</span>
+                    <span className="font-mono">{leg.symbol}</span>
+                    <span className="text-muted-foreground">×{leg.quantity}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-muted-foreground">
+                      ${Number(leg.entry_price).toFixed(2)} → ${Number(leg.exit_price).toFixed(2)}
+                    </span>
+                    <span className={cn(
+                      "font-mono",
+                      leg.pnl >= 0 ? "text-trading-green" : "text-panic-red"
+                    )}>
+                      {leg.pnl >= 0 ? '+' : ''}${Number(leg.pnl).toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+              <div className="flex justify-between items-center pt-2 border-t border-border mt-2">
+                <span className="text-[10px] text-muted-foreground uppercase">Combined P&L</span>
+                <span className={cn(
+                  "font-mono font-semibold",
+                  group.totalPnl >= 0 ? "text-trading-green" : "text-panic-red"
+                )}>
+                  {group.totalPnl >= 0 ? '+' : ''}${Number(group.totalPnl).toFixed(2)}
+                </span>
+              </div>
+            </div>
+          </TableCell>
+        </motion.tr>
+      )}
+    </>
+  );
+};
+
 export const TradeJournal = () => {
-  const [trades, setTrades] = useState<TradeRecord[]>([]);
+  const [trades, setTrades] = useState<(TradeRecord | TradeGroup)[]>([]);
   const [stats, setStats] = useState({
     totalTrades: 0,
     winningTrades: 0,
@@ -246,7 +352,7 @@ export const TradeJournal = () => {
   const loadTrades = async () => {
     setIsLoading(true);
     const [tradesData, statsData] = await Promise.all([
-      tradeJournal.getTrades(),
+      tradeJournal.getGroupedTrades(),
       tradeJournal.getTradeStats(),
     ]);
     setTrades(tradesData);
@@ -360,57 +466,71 @@ export const TradeJournal = () => {
                 </TableHeader>
                 <TableBody>
                   <AnimatePresence>
-                    {trades.map((trade) => (
-                      <>
-                        <TableRow 
-                          key={trade.id} 
-                          className={cn(
-                            "border-border cursor-pointer transition-colors",
-                            expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30"
-                          )}
-                          onClick={() => toggleTradeExpanded(trade.id!)}
-                        >
-                          <TableCell className="py-1.5 w-8">
-                            <ChevronRight 
-                              className={cn(
-                                "h-4 w-4 text-muted-foreground transition-transform",
-                                expandedTradeId === trade.id && "rotate-90"
-                              )} 
-                            />
-                          </TableCell>
-                          <TableCell className="font-mono text-xs text-foreground py-1.5">
-                            {trade.exit_time ? format(new Date(trade.exit_time), 'MM/dd HH:mm') : '--'}
-                          </TableCell>
-                          <TableCell className="font-mono text-xs text-foreground py-1.5">
-                            {trade.strategy_name?.slice(0, 15) || trade.underlying}
-                          </TableCell>
-                          <TableCell className="font-mono text-xs text-foreground py-1.5">
-                            {trade.symbol.length > 18 ? trade.symbol.slice(0, 18) + '...' : trade.symbol}
-                          </TableCell>
-                          <TableCell className={cn(
-                            "font-mono text-xs text-right py-1.5",
-                            trade.pnl >= 0 ? "text-trading-green" : "text-panic-red"
-                          )}>
-                            {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
-                          </TableCell>
-                          <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
-                            {trade.exit_reason || '--'}
-                          </TableCell>
-                        </TableRow>
-                        {expandedTradeId === trade.id && (
-                          <TradeDetailsRow
-                            key={`${trade.id}-details`}
-                            trade={trade}
-                            isEditing={editingId === trade.id}
-                            editNotes={editNotes}
-                            onEditNotes={handleEditNotes}
-                            onSaveNotes={handleSaveNotes}
-                            onCancelEdit={() => setEditingId(null)}
-                            onNotesChange={setEditNotes}
+                    {trades.map((item) => {
+                      if (isTradeGroup(item)) {
+                        return (
+                          <TradeGroupRow
+                            key={item.groupId}
+                            group={item}
+                            isExpanded={expandedTradeId === item.groupId}
+                            onToggle={() => toggleTradeExpanded(item.groupId)}
                           />
-                        )}
-                      </>
-                    ))}
+                        );
+                      }
+                      
+                      const trade = item;
+                      return (
+                        <>
+                          <TableRow 
+                            key={trade.id} 
+                            className={cn(
+                              "border-border cursor-pointer transition-colors",
+                              expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30"
+                            )}
+                            onClick={() => toggleTradeExpanded(trade.id!)}
+                          >
+                            <TableCell className="py-1.5 w-8">
+                              <ChevronRight 
+                                className={cn(
+                                  "h-4 w-4 text-muted-foreground transition-transform",
+                                  expandedTradeId === trade.id && "rotate-90"
+                                )} 
+                              />
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-foreground py-1.5">
+                              {trade.exit_time ? format(new Date(trade.exit_time), 'MM/dd HH:mm') : '--'}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-foreground py-1.5">
+                              {trade.strategy_name?.slice(0, 15) || trade.underlying}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-foreground py-1.5">
+                              {trade.symbol.length > 18 ? trade.symbol.slice(0, 18) + '...' : trade.symbol}
+                            </TableCell>
+                            <TableCell className={cn(
+                              "font-mono text-xs text-right py-1.5",
+                              trade.pnl >= 0 ? "text-trading-green" : "text-panic-red"
+                            )}>
+                              {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
+                              {trade.exit_reason || '--'}
+                            </TableCell>
+                          </TableRow>
+                          {expandedTradeId === trade.id && (
+                            <TradeDetailsRow
+                              key={`${trade.id}-details`}
+                              trade={trade}
+                              isEditing={editingId === trade.id}
+                              editNotes={editNotes}
+                              onEditNotes={handleEditNotes}
+                              onSaveNotes={handleSaveNotes}
+                              onCancelEdit={() => setEditingId(null)}
+                              onNotesChange={setEditNotes}
+                            />
+                          )}
+                        </>
+                      );
+                    })}
                   </AnimatePresence>
                 </TableBody>
               </Table>

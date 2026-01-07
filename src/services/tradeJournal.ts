@@ -17,12 +17,24 @@ export interface TradeRecord {
   pnl_percent?: number;
   exit_reason?: string;
   notes?: string;
+  trade_group_id?: string;
+}
+
+export interface TradeGroup {
+  groupId: string;
+  trades: TradeRecord[];
+  totalPnl: number;
+  strategyName?: string;
+  strategyType?: string;
+  underlying: string;
+  exitTime?: string;
+  exitReason?: string;
 }
 
 export const tradeJournal = {
-  async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string }> {
+  async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string; id?: string }> {
     try {
-      const { error } = await supabase
+      const { data, error } = await supabase
         .from('trades')
         .insert({
           symbol: trade.symbol,
@@ -40,17 +52,57 @@ export const tradeJournal = {
           pnl_percent: trade.pnl_percent,
           exit_reason: trade.exit_reason,
           notes: trade.notes,
-        });
+          trade_group_id: trade.trade_group_id,
+        })
+        .select('id')
+        .single();
 
       if (error) throw error;
-      return { success: true };
+      return { success: true, id: data?.id };
     } catch (error) {
       console.error('Error saving trade:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   },
 
-  async getTrades(limit = 50): Promise<TradeRecord[]> {
+  // Save multiple trades as a group (for spreads, iron condors, etc.)
+  async saveTradeGroup(trades: Omit<TradeRecord, 'id' | 'trade_group_id'>[]): Promise<{ success: boolean; error?: string; groupId?: string }> {
+    if (trades.length === 0) return { success: false, error: 'No trades to save' };
+    
+    // Generate a group ID
+    const groupId = crypto.randomUUID();
+    
+    try {
+      const { error } = await supabase
+        .from('trades')
+        .insert(trades.map(trade => ({
+          symbol: trade.symbol,
+          underlying: trade.underlying,
+          strategy_name: trade.strategy_name,
+          strategy_type: trade.strategy_type,
+          quantity: trade.quantity,
+          entry_time: trade.entry_time,
+          exit_time: trade.exit_time || new Date().toISOString(),
+          entry_price: trade.entry_price,
+          exit_price: trade.exit_price,
+          entry_credit: trade.entry_credit,
+          exit_debit: trade.exit_debit,
+          pnl: trade.pnl,
+          pnl_percent: trade.pnl_percent,
+          exit_reason: trade.exit_reason,
+          notes: trade.notes,
+          trade_group_id: groupId,
+        })));
+
+      if (error) throw error;
+      return { success: true, groupId };
+    } catch (error) {
+      console.error('Error saving trade group:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
+  async getTrades(limit = 100): Promise<TradeRecord[]> {
     try {
       const { data, error } = await supabase
         .from('trades')
@@ -62,6 +114,66 @@ export const tradeJournal = {
       return data || [];
     } catch (error) {
       console.error('Error fetching trades:', error);
+      return [];
+    }
+  },
+
+  // Get trades grouped by trade_group_id
+  async getGroupedTrades(limit = 50): Promise<(TradeRecord | TradeGroup)[]> {
+    try {
+      const { data, error } = await supabase
+        .from('trades')
+        .select('*')
+        .order('exit_time', { ascending: false })
+        .limit(limit * 4); // Fetch more to account for legs
+
+      if (error) throw error;
+      
+      const trades = data || [];
+      const grouped = new Map<string, TradeRecord[]>();
+      const ungrouped: TradeRecord[] = [];
+
+      // Separate grouped and ungrouped trades
+      trades.forEach(trade => {
+        if (trade.trade_group_id) {
+          const existing = grouped.get(trade.trade_group_id) || [];
+          existing.push(trade);
+          grouped.set(trade.trade_group_id, existing);
+        } else {
+          ungrouped.push(trade);
+        }
+      });
+
+      // Build result array with groups and singles
+      const result: (TradeRecord | TradeGroup)[] = [];
+      const processedGroupIds = new Set<string>();
+
+      // Go through original order and insert groups/singles
+      trades.forEach(trade => {
+        if (trade.trade_group_id) {
+          if (!processedGroupIds.has(trade.trade_group_id)) {
+            const groupTrades = grouped.get(trade.trade_group_id)!;
+            const group: TradeGroup = {
+              groupId: trade.trade_group_id,
+              trades: groupTrades.sort((a, b) => a.symbol.localeCompare(b.symbol)),
+              totalPnl: groupTrades.reduce((sum, t) => sum + Number(t.pnl), 0),
+              strategyName: groupTrades[0].strategy_name,
+              strategyType: groupTrades[0].strategy_type,
+              underlying: groupTrades[0].underlying,
+              exitTime: groupTrades[0].exit_time,
+              exitReason: groupTrades[0].exit_reason,
+            };
+            result.push(group);
+            processedGroupIds.add(trade.trade_group_id);
+          }
+        } else {
+          result.push(trade);
+        }
+      });
+
+      return result.slice(0, limit);
+    } catch (error) {
+      console.error('Error fetching grouped trades:', error);
       return [];
     }
   },

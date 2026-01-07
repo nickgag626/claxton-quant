@@ -107,6 +107,7 @@ export type Database = {
           strategy_name: string | null
           strategy_type: string | null
           symbol: string
+          trade_group_id: string | null
           underlying: string
         }
         Insert: {
@@ -126,6 +127,7 @@ export type Database = {
           strategy_name?: string | null
           strategy_type?: string | null
           symbol: string
+          trade_group_id?: string | null
           underlying: string
         }
         Update: {
@@ -145,6 +147,7 @@ export type Database = {
           strategy_name?: string | null
           strategy_type?: string | null
           symbol?: string
+          trade_group_id?: string | null
           underlying?: string
         }
         Relationships: []
