@@ -11,6 +11,8 @@ import { GreeksChart } from '@/components/dashboard/GreeksChart';
 import { DataLagWarning } from '@/components/dashboard/DataLagWarning';
 import { TradeJournal } from '@/components/dashboard/TradeJournal';
 import { OptionsChain } from '@/components/dashboard/OptionsChain';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { BookOpen, Grid3X3, Activity } from 'lucide-react';
 
 const Index = () => {
   const {
@@ -99,11 +101,34 @@ const Index = () => {
           onDeleteStrategy={deleteStrategy}
         />
         
-        <TradeJournal />
-        
-        <OptionsChain />
-        
-        <ActivityLog events={activity} />
+        <Tabs defaultValue="journal" className="w-full">
+          <TabsList className="grid w-full grid-cols-3 max-w-md">
+            <TabsTrigger value="journal" className="flex items-center gap-2">
+              <BookOpen className="h-4 w-4" />
+              <span className="hidden sm:inline">Trade Journal</span>
+              <span className="sm:hidden">Journal</span>
+            </TabsTrigger>
+            <TabsTrigger value="chain" className="flex items-center gap-2">
+              <Grid3X3 className="h-4 w-4" />
+              <span className="hidden sm:inline">Options Chain</span>
+              <span className="sm:hidden">Chain</span>
+            </TabsTrigger>
+            <TabsTrigger value="activity" className="flex items-center gap-2">
+              <Activity className="h-4 w-4" />
+              <span className="hidden sm:inline">Activity Log</span>
+              <span className="sm:hidden">Activity</span>
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="journal" className="mt-4">
+            <TradeJournal />
+          </TabsContent>
+          <TabsContent value="chain" className="mt-4">
+            <OptionsChain />
+          </TabsContent>
+          <TabsContent value="activity" className="mt-4">
+            <ActivityLog events={activity} />
+          </TabsContent>
+        </Tabs>
       </div>
     </div>
   );
