@@ -341,19 +341,41 @@ export const useTradingData = () => {
       const parsed = parseOptionSymbol(position.symbol);
       const stratInfo = strategyPositions.get(position.symbol);
       
-      await tradeJournal.saveTrade({
+      // Calculate P&L properly: for options, costBasis is total cost, currentValue is current market value
+      // P&L = currentValue - costBasis (positive means profit)
+      const pnl = position.currentValue - position.costBasis;
+      const entryPrice = Math.abs(position.costBasis / position.quantity);
+      const exitPrice = Math.abs(position.currentValue / position.quantity);
+      
+      console.log('Saving trade to journal:', {
         symbol: position.symbol,
-        underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
-        strategy_name: stratInfo?.strategyName || position.strategyName,
+        underlying: parsed?.underlying || position.underlying,
+        pnl,
+        entryPrice,
+        exitPrice,
         quantity: position.quantity,
-        entry_time: position.entryTime.toISOString(),
-        exit_time: new Date().toISOString(),
-        entry_price: position.costBasis,
-        exit_price: position.currentValue,
-        entry_credit: stratInfo?.entryCredit || position.entryCredit,
-        pnl: (position.currentValue - position.costBasis) * Math.abs(position.quantity),
-        exit_reason: exitReason,
       });
+      
+      try {
+        await tradeJournal.saveTrade({
+          symbol: position.symbol,
+          underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
+          strategy_name: stratInfo?.strategyName || position.strategyName,
+          strategy_type: position.strategyType,
+          quantity: Math.abs(position.quantity),
+          entry_time: position.entryTime?.toISOString() || new Date().toISOString(),
+          exit_time: new Date().toISOString(),
+          entry_price: entryPrice,
+          exit_price: exitPrice,
+          entry_credit: stratInfo?.entryCredit || position.entryCredit,
+          pnl: pnl,
+          pnl_percent: entryPrice !== 0 ? (pnl / Math.abs(position.costBasis)) * 100 : 0,
+          exit_reason: exitReason,
+        });
+        console.log('Trade saved to journal successfully');
+      } catch (err) {
+        console.error('Failed to save trade to journal:', err);
+      }
       
       // Remove from tracked strategy positions
       setStrategyPositions(prev => {
