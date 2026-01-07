@@ -84,15 +84,49 @@ export const tradierApi = {
       
       const posArray = Array.isArray(positionsData) ? positionsData : [positionsData];
       
-      return posArray.map((p: TradierPosition) => ({
-        id: String(p.id),
-        symbol: p.symbol,
-        quantity: p.quantity,
-        costBasis: p.cost_basis,
-        currentValue: p.cost_basis, // Will be updated with live price
-        status: 'open' as const,
-        entryTime: new Date(p.date_acquired),
-      }));
+      // Get live quotes for all position symbols to calculate current value
+      const symbols = posArray.map((p: TradierPosition) => p.symbol);
+      let liveQuotes: Record<string, { last: number; bid: number; ask: number }> = {};
+      
+      if (symbols.length > 0) {
+        try {
+          const { data: quoteData } = await supabase.functions.invoke('tradier-api', {
+            body: { action: 'quote', symbols },
+          });
+          
+          const quotesArray = quoteData?.quotes?.quote;
+          if (quotesArray) {
+            const quotes = Array.isArray(quotesArray) ? quotesArray : [quotesArray];
+            quotes.forEach((q: any) => {
+              liveQuotes[q.symbol] = {
+                last: q.last || 0,
+                bid: q.bid || 0,
+                ask: q.ask || 0,
+              };
+            });
+          }
+        } catch (quoteError) {
+          console.error('Failed to fetch live quotes for positions:', quoteError);
+        }
+      }
+      
+      return posArray.map((p: TradierPosition) => {
+        const quote = liveQuotes[p.symbol];
+        // Use mid price if available, otherwise fall back to cost basis
+        const currentPrice = quote ? (quote.bid + quote.ask) / 2 || quote.last : 0;
+        // Current value = current price * quantity * 100 (options multiplier)
+        const currentValue = currentPrice * Math.abs(p.quantity) * 100;
+        
+        return {
+          id: String(p.id),
+          symbol: p.symbol,
+          quantity: p.quantity,
+          costBasis: p.cost_basis,
+          currentValue: currentValue || p.cost_basis, // Fall back to cost basis if no quote
+          status: 'open' as const,
+          entryTime: new Date(p.date_acquired),
+        };
+      });
     } catch (error) {
       console.error('Failed to fetch positions:', error);
       throw error;

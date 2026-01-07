@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { supabase } from '@/integrations/supabase/client';
 import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
 import { tradeJournal } from '@/services/tradeJournal';
@@ -511,6 +512,48 @@ export const useTradingData = () => {
     };
     
     loadSavedData();
+  }, [addActivity]);
+
+  // Real-time sync for strategies across devices/users
+  useEffect(() => {
+    const channel = supabase
+      .channel('strategies-sync')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'strategies',
+        },
+        async (payload) => {
+          console.log('Strategy change detected:', payload);
+          
+          if (payload.eventType === 'INSERT') {
+            const newStrategy = settingsService.mapDbToStrategy(payload.new as any);
+            setStrategies(prev => {
+              // Avoid duplicates
+              if (prev.some(s => s.id === newStrategy.id)) return prev;
+              return [...prev, newStrategy];
+            });
+            addActivity('SYSTEM', `Strategy "${newStrategy.name}" added (synced)`);
+          } else if (payload.eventType === 'UPDATE') {
+            const updatedStrategy = settingsService.mapDbToStrategy(payload.new as any);
+            setStrategies(prev => 
+              prev.map(s => s.id === updatedStrategy.id ? updatedStrategy : s)
+            );
+            addActivity('SYSTEM', `Strategy "${updatedStrategy.name}" updated (synced)`);
+          } else if (payload.eventType === 'DELETE') {
+            const deletedId = (payload.old as any).id;
+            setStrategies(prev => prev.filter(s => s.id !== deletedId));
+            addActivity('SYSTEM', 'Strategy deleted (synced)');
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, [addActivity]);
 
   // Initial fetch and polling
