@@ -94,9 +94,22 @@ serve(async (req) => {
           continue;
         }
 
-        // Check time window
+        // Check time window (convert to Eastern Time for market hours)
         const now = new Date();
-        const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+        // Get Eastern Time
+        const etOptions: Intl.DateTimeFormatOptions = { 
+          timeZone: 'America/New_York', 
+          hour: '2-digit', 
+          minute: '2-digit',
+          hour12: false 
+        };
+        const etFormatter = new Intl.DateTimeFormat('en-US', etOptions);
+        const etParts = etFormatter.formatToParts(now);
+        const etHour = etParts.find(p => p.type === 'hour')?.value || '00';
+        const etMinute = etParts.find(p => p.type === 'minute')?.value || '00';
+        const currentTime = `${etHour}:${etMinute}`;
+        
+        console.log(`Current ET time: ${currentTime}, strategy window: ${strategy.entryConditions.startTime || 'none'} - ${strategy.entryConditions.endTime || 'none'}`);
         
         if (strategy.entryConditions.startTime && currentTime < strategy.entryConditions.startTime) {
           console.log(`Skipping ${strategy.name}: before start time`);

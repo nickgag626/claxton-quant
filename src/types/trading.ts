@@ -8,6 +8,7 @@ export interface Position {
   currentValue: number;
   expirationDate?: string;
   strategyName?: string;
+  strategyType?: string;
   underlying?: string;
   entryCredit?: number;
   status: 'open' | 'pending_close' | 'closed';
