@@ -1,5 +1,5 @@
-import { motion } from 'framer-motion';
-import { AlertTriangle } from 'lucide-react';
+import { motion } from "framer-motion";
+import { AlertTriangle } from "lucide-react";
 
 export const DataLagWarning = () => {
   return (
@@ -10,7 +10,8 @@ export const DataLagWarning = () => {
     >
       <AlertTriangle className="w-4 h-4 text-bloomberg-amber shrink-0" />
       <p className="text-xs text-bloomberg-amber">
-        <span className="font-semibold">SIMULATED DATA:</span> Current prices are 15 minutes behind. Reality may vary.
+        <span className="font-semibold">Paper trading</span> Currently set to use Sandbox trading environment based on
+        actual market data.
       </p>
     </motion.div>
   );
