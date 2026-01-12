@@ -88,8 +88,24 @@ export interface DuplicateCandidate {
 export function hasVerifiedDirection(trade: Partial<TradeRecord>): boolean {
   // P&L requires: direction known + close filled
   const hasDirection = Boolean(trade.open_side && trade.close_side && trade.close_order_id);
-  const isFilled = trade.close_status === 'filled' || trade.close_status === undefined; // undefined = legacy data
+  const isFilled = trade.close_status === 'filled';
+  // Legacy data (undefined close_status) should NOT be included in verified - it must be explicitly filled
   return hasDirection && isFilled;
+}
+
+/**
+ * HARD RULE: Check if trade is fully finalized and can be included in stats
+ * A trade is finalized when:
+ * - close_status = 'filled'
+ * - needs_reconcile = false
+ * - pnl IS NOT NULL
+ */
+export function isFullyFinalized(trade: Partial<TradeRecord>): boolean {
+  return (
+    trade.close_status === 'filled' &&
+    trade.needs_reconcile === false &&
+    trade.pnl != null
+  );
 }
 
 /**
@@ -374,10 +390,11 @@ export const tradeJournal = {
         if (trade.trade_group_id) {
           if (!processedGroupIds.has(trade.trade_group_id)) {
             const groupTrades = grouped.get(trade.trade_group_id)!;
-            // Only sum verified P&L (not null)
-            const verifiedLegs = groupTrades.filter(t => t.pnl != null && !t.needs_reconcile);
-            const totalPnl = verifiedLegs.reduce((sum, t) => sum + Number(t.pnl), 0);
-            const hasUnverified = groupTrades.some(t => t.needs_reconcile);
+            // Only sum finalized P&L (close_status='filled' AND needs_reconcile=false AND pnl not null)
+            const finalizedLegs = groupTrades.filter(t => isFullyFinalized(t));
+            const totalPnl = finalizedLegs.reduce((sum, t) => sum + Number(t.pnl), 0);
+            // Group needs reconcile if ANY leg is not fully finalized
+            const hasUnfinalized = groupTrades.some(t => !isFullyFinalized(t));
             
             const group: TradeGroup = {
               groupId: trade.trade_group_id,
@@ -388,7 +405,7 @@ export const tradeJournal = {
               underlying: groupTrades[0].underlying,
               exitTime: groupTrades[0].exit_time,
               exitReason: groupTrades[0].exit_reason,
-              needsReconcile: hasUnverified,
+              needsReconcile: hasUnfinalized,
             };
             result.push(group);
             processedGroupIds.add(trade.trade_group_id);
@@ -406,30 +423,44 @@ export const tradeJournal = {
   },
 
   /**
-   * Get stats - ONLY includes VERIFIED trades (needs_reconcile = false AND pnl IS NOT NULL)
-   * Excludes trades with unknown direction from all totals
+   * Get stats - ONLY includes FULLY FINALIZED trades
+   * HARD FILTERS:
+   * - close_status = 'filled'
+   * - needs_reconcile = false
+   * - pnl IS NOT NULL
+   * Excludes: submitted, rejected, canceled, expired, or legacy (null) close_status
    */
   async getTradeStats(countByLeg: boolean = false): Promise<TradeStats> {
     try {
       const { data, error } = await supabase
         .from('trades')
-        .select('pnl, trade_group_id, needs_reconcile');
+        .select('pnl, trade_group_id, needs_reconcile, close_status');
 
       if (error) throw error;
 
       const trades = data || [];
       
-      // Separate verified and unverified
-      const verifiedTrades = trades.filter(t => !t.needs_reconcile && t.pnl != null);
-      const unverifiedCount = trades.filter(t => t.needs_reconcile || t.pnl == null).length;
+      // HARD FILTER: Only include trades where close_status='filled' AND needs_reconcile=false AND pnl IS NOT NULL
+      const finalizedTrades = trades.filter(t => 
+        t.close_status === 'filled' && 
+        t.needs_reconcile === false && 
+        t.pnl != null
+      );
       
-      const totalLegsVerified = verifiedTrades.length;
+      // Count non-finalized for display
+      const nonFinalizedCount = trades.filter(t => 
+        t.close_status !== 'filled' || 
+        t.needs_reconcile === true || 
+        t.pnl == null
+      ).length;
+      
+      const totalLegsFinalized = finalizedTrades.length;
       
       if (countByLeg) {
-        // Count individual verified legs only
-        const winners = verifiedTrades.filter(t => Number(t.pnl) > 0);
-        const losers = verifiedTrades.filter(t => Number(t.pnl) < 0);
-        const totalPnl = verifiedTrades.reduce((sum, t) => sum + Number(t.pnl), 0);
+        // Count individual finalized legs only
+        const winners = finalizedTrades.filter(t => Number(t.pnl) > 0);
+        const losers = finalizedTrades.filter(t => Number(t.pnl) < 0);
+        const totalPnl = finalizedTrades.reduce((sum, t) => sum + Number(t.pnl), 0);
         const avgWinner = winners.length > 0 
           ? winners.reduce((sum, t) => sum + Number(t.pnl), 0) / winners.length 
           : 0;
@@ -438,42 +469,47 @@ export const tradeJournal = {
           : 0;
 
         return {
-          totalTrades: totalLegsVerified,
-          totalLegs: totalLegsVerified,
+          totalTrades: totalLegsFinalized,
+          totalLegs: totalLegsFinalized,
           winningTrades: winners.length,
           losingTrades: losers.length,
           totalPnl,
-          winRate: totalLegsVerified > 0 ? (winners.length / totalLegsVerified) * 100 : 0,
+          winRate: totalLegsFinalized > 0 ? (winners.length / totalLegsFinalized) * 100 : 0,
           avgWinner,
           avgLoser,
-          needsReconcileCount: unverifiedCount,
-          verifiedCount: totalLegsVerified,
+          needsReconcileCount: nonFinalizedCount,
+          verifiedCount: totalLegsFinalized,
         };
       }
       
       // Group by trade_group_id (default - count strategies)
-      // Only include groups where ALL legs are verified
-      const grouped = new Map<string, { pnl: number; hasUnverified: boolean }>();
+      // Only include groups where ALL legs are finalized (filled + verified + pnl not null)
+      const grouped = new Map<string, { pnl: number; allFinalized: boolean; legCount: number; finalizedCount: number }>();
       let singleTradeIndex = 0;
       
       trades.forEach(t => {
         const groupKey = t.trade_group_id || `single_${singleTradeIndex++}`;
-        const existing = grouped.get(groupKey) || { pnl: 0, hasUnverified: false };
+        const existing = grouped.get(groupKey) || { pnl: 0, allFinalized: true, legCount: 0, finalizedCount: 0 };
         
-        if (t.needs_reconcile || t.pnl == null) {
-          existing.hasUnverified = true;
-        } else {
+        existing.legCount++;
+        
+        const isLegFinalized = t.close_status === 'filled' && t.needs_reconcile === false && t.pnl != null;
+        
+        if (isLegFinalized) {
           existing.pnl += Number(t.pnl);
+          existing.finalizedCount++;
+        } else {
+          existing.allFinalized = false;
         }
         
         grouped.set(groupKey, existing);
       });
 
-      // Only count fully verified groups
-      const verifiedGroups = Array.from(grouped.entries())
-        .filter(([_, g]) => !g.hasUnverified);
+      // Only count groups where ALL legs are finalized
+      const fullyFinalizedGroups = Array.from(grouped.entries())
+        .filter(([_, g]) => g.allFinalized && g.finalizedCount === g.legCount);
       
-      const groupPnls = verifiedGroups.map(([_, g]) => g.pnl);
+      const groupPnls = fullyFinalizedGroups.map(([_, g]) => g.pnl);
       const winners = groupPnls.filter(pnl => pnl > 0);
       const losers = groupPnls.filter(pnl => pnl < 0);
       
@@ -485,21 +521,21 @@ export const tradeJournal = {
         ? losers.reduce((sum, pnl) => sum + pnl, 0) / losers.length 
         : 0;
 
-      // Count unverified groups
-      const unverifiedGroups = Array.from(grouped.entries())
-        .filter(([_, g]) => g.hasUnverified).length;
+      // Count partial/unfinalized groups
+      const partialGroups = Array.from(grouped.entries())
+        .filter(([_, g]) => !g.allFinalized || g.finalizedCount !== g.legCount).length;
 
       return {
-        totalTrades: verifiedGroups.length,
-        totalLegs: totalLegsVerified,
+        totalTrades: fullyFinalizedGroups.length,
+        totalLegs: totalLegsFinalized,
         winningTrades: winners.length,
         losingTrades: losers.length,
         totalPnl,
-        winRate: verifiedGroups.length > 0 ? (winners.length / verifiedGroups.length) * 100 : 0,
+        winRate: fullyFinalizedGroups.length > 0 ? (winners.length / fullyFinalizedGroups.length) * 100 : 0,
         avgWinner,
         avgLoser,
-        needsReconcileCount: unverifiedGroups,
-        verifiedCount: verifiedGroups.length,
+        needsReconcileCount: partialGroups,
+        verifiedCount: fullyFinalizedGroups.length,
       };
     } catch (error) {
       console.error('Error fetching trade stats:', error);
@@ -536,10 +572,13 @@ export const tradeJournal = {
   // manualOverride has been REMOVED - direction must be inferred automatically from Tradier executions
 
   /**
-   * Recalculate P&L for trades with verified direction
-   * DOES NOT compute P&L if direction is unknown - marks needs_reconcile instead
+   * Recalculate P&L for trades with verified direction AND filled close_status
+   * DOES NOT compute P&L if:
+   * - direction is unknown
+   * - close_status is not 'filled'
+   * In these cases, marks needs_reconcile=true and pnl=NULL
    */
-  async recalculatePnl(): Promise<{ success: boolean; updated: number; skipped: number; errors: string[] }> {
+  async recalculatePnl(): Promise<{ success: boolean; updated: number; skipped: number; sanitized: number; errors: string[] }> {
     try {
       const { data: trades, error } = await supabase
         .from('trades')
@@ -549,11 +588,29 @@ export const tradeJournal = {
 
       let updated = 0;
       let skipped = 0;
+      let sanitized = 0;
       const errors: string[] = [];
 
       for (const row of trades || []) {
         const trade = castToTradeRecord(row);
-        // Check if we have verified direction
+        
+        // HARD RULE: If close_status is not 'filled', nullify P&L
+        if (trade.close_status !== 'filled') {
+          if (trade.pnl != null || trade.pnl_percent != null || !trade.needs_reconcile) {
+            await supabase.from('trades').update({ 
+              needs_reconcile: true,
+              pnl: null,
+              pnl_percent: null,
+              pnl_formula: null,
+            }).eq('id', trade.id);
+            sanitized++;
+          } else {
+            skipped++;
+          }
+          continue;
+        }
+        
+        // Check if we have verified direction (close_status='filled' already checked above)
         if (!hasVerifiedDirection(trade)) {
           // Mark as needs reconcile, set pnl to NULL
           if (!trade.needs_reconcile || trade.pnl != null) {
@@ -608,13 +665,14 @@ export const tradeJournal = {
         }
       }
 
-      return { success: true, updated, skipped, errors };
+      return { success: true, updated, skipped, sanitized, errors };
     } catch (error) {
       console.error('Error recalculating P&L:', error);
       return { 
         success: false, 
         updated: 0, 
         skipped: 0,
+        sanitized: 0,
         errors: [error instanceof Error ? error.message : 'Unknown error'] 
       };
     }
@@ -885,6 +943,51 @@ export const tradeJournal = {
     } catch (error) {
       console.error('Error fetching trades with pending close:', error);
       return [];
+    }
+  },
+
+  /**
+   * DB HYGIENE: Force pnl/pnl_percent to NULL for any non-filled trades
+   * This ensures stale values can't leak into stats
+   */
+  async sanitizeNonFilledTrades(): Promise<{ success: boolean; sanitized: number; error?: string }> {
+    try {
+      // Find trades where close_status != 'filled' but pnl is not null
+      const { data: trades, error: fetchError } = await supabase
+        .from('trades')
+        .select('id, close_status, pnl, pnl_percent')
+        .or('close_status.neq.filled,close_status.is.null');
+
+      if (fetchError) throw fetchError;
+
+      let sanitized = 0;
+      const toUpdate = (trades || []).filter(t => t.pnl != null || t.pnl_percent != null);
+
+      for (const trade of toUpdate) {
+        const { error: updateError } = await supabase
+          .from('trades')
+          .update({
+            pnl: null,
+            pnl_percent: null,
+            pnl_formula: null,
+            needs_reconcile: true,
+          })
+          .eq('id', trade.id);
+
+        if (!updateError) {
+          sanitized++;
+        }
+      }
+
+      console.log(`DB Hygiene: Sanitized ${sanitized} trades with non-filled close_status`);
+      return { success: true, sanitized };
+    } catch (error) {
+      console.error('Error sanitizing non-filled trades:', error);
+      return { 
+        success: false, 
+        sanitized: 0,
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
     }
   },
 };
