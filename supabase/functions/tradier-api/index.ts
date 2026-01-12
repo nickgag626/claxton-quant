@@ -161,6 +161,21 @@ function getCloseInstruction(
   };
 }
 
+// Helper to safely parse Tradier responses (handles HTML error pages)
+async function safeParseTradierResponse(resp: Response): Promise<any> {
+  const text = await resp.text();
+  if (text.trim().startsWith("<")) {
+    console.error("Tradier returned HTML instead of JSON:", text.slice(0, 500));
+    return { error: "Tradier API returned HTML error page", status: resp.status, html_preview: text.slice(0, 200) };
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    console.error("Failed to parse Tradier response:", text.slice(0, 500));
+    return { error: "Invalid JSON from Tradier", raw: text.slice(0, 200) };
+  }
+}
+
 serve(async (req) => {
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
@@ -168,7 +183,19 @@ serve(async (req) => {
   }
 
   try {
-    const body = (await req.json()) as TradierRequest;
+    // Safely parse request body
+    let body: TradierRequest;
+    try {
+      const rawText = await req.text();
+      console.log("RAW_REQUEST_BODY", { length: rawText.length, preview: rawText.slice(0, 200) });
+      body = JSON.parse(rawText) as TradierRequest;
+    } catch (parseError) {
+      console.error("Failed to parse request body as JSON:", parseError);
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON in request body" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     const action = body.action;
 
     // Handle ping immediately (no Tradier credentials needed)
@@ -226,7 +253,7 @@ serve(async (req) => {
         const url = `${baseUrl}/markets/quotes?symbols=${symbols.join(",")}`;
         console.log("Fetching quotes:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Quote response:", JSON.stringify(data));
         break;
       }
@@ -235,7 +262,7 @@ serve(async (req) => {
         const url = `${baseUrl}/accounts/${accountId}/positions`;
         console.log("Fetching positions:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Positions response:", JSON.stringify(data));
         break;
       }
@@ -244,7 +271,7 @@ serve(async (req) => {
         const url = `${baseUrl}/accounts/${accountId}/balances`;
         console.log("Fetching balances:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Balances response:", JSON.stringify(data));
         break;
       }
@@ -259,7 +286,7 @@ serve(async (req) => {
         const url = `${baseUrl}/markets/options/expirations?symbol=${symbol}`;
         console.log("Fetching expirations:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Expirations response:", JSON.stringify(data));
         break;
       }
@@ -277,7 +304,7 @@ serve(async (req) => {
         const url = `${baseUrl}/markets/options/chains?symbol=${symbol}&expiration=${expiration}&greeks=true`;
         console.log("Fetching chain:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Chain response received");
         break;
       }
@@ -286,7 +313,7 @@ serve(async (req) => {
         const url = `${baseUrl}/markets/clock`;
         console.log("Fetching market clock:", url);
         response = await fetch(url, { headers });
-        data = await response.json();
+        data = await safeParseTradierResponse(response);
         console.log("Clock response:", JSON.stringify(data));
         break;
       }
@@ -337,7 +364,7 @@ serve(async (req) => {
           // 0) Fetch exact position snapshot
           const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
           const posResp = await fetch(posUrl, { headers });
-          const posData = await posResp.json();
+          const posData = await safeParseTradierResponse(posResp);
           const positionsRaw = posData?.positions?.position;
           const posArray: TradierPosition[] = Array.isArray(positionsRaw)
             ? positionsRaw
@@ -364,7 +391,7 @@ serve(async (req) => {
           try {
             const qUrl = `${baseUrl}/markets/quotes?symbols=${encodeURIComponent(positionSymbol)}`;
             const qResp = await fetch(qUrl, { headers });
-            const qData = await qResp.json();
+            const qData = await safeParseTradierResponse(qResp);
             const q = qData?.quotes?.quote;
             quoteType = (Array.isArray(q) ? q[0]?.type : q?.type) as string | undefined;
           } catch (e) {
