@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
@@ -356,7 +356,7 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
   const pnlDisplay = group.needsReconcile ? null : group.totalPnl;
   
   return (
-    <>
+    <React.Fragment key={group.groupId}>
       <TableRow 
         className={cn(
           "border-border cursor-pointer transition-colors",
@@ -423,8 +423,10 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
               </div>
               {group.trades.map((leg, idx) => {
                 const legPnl = leg.pnl != null && !leg.needs_reconcile ? leg.pnl : null;
+                // Use stable key: prefer id, fallback to unique composite key
+                const legKey = leg.id || `${leg.symbol}-${leg.exit_time}-${leg.quantity}-${idx}`;
                 return (
-                  <div key={leg.id || idx} className={cn(
+                  <div key={legKey} className={cn(
                     "flex items-center justify-between text-xs bg-background/50 rounded px-2 py-1.5",
                     leg.needs_reconcile && "border border-bloomberg-amber/30"
                   )}>
@@ -480,7 +482,7 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
           </TableCell>
         </motion.tr>
       )}
-    </>
+    </React.Fragment>
   );
 };
 
@@ -499,7 +501,9 @@ export const TradeJournal = () => {
     verifiedCount: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const hasLoadedOnce = useRef(false);
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editNotes, setEditNotes] = useState('');
@@ -522,9 +526,9 @@ export const TradeJournal = () => {
 
   useEffect(() => {
     if (!isExpanded) return;
-    loadTrades();
+    loadTrades(false);
     const interval = window.setInterval(() => {
-      loadTrades();
+      loadTrades(true); // Mark as polling to avoid loading state
     }, 5000);
     return () => window.clearInterval(interval);
   }, [isExpanded]);
@@ -534,15 +538,29 @@ export const TradeJournal = () => {
     loadStats();
   }, [countByLeg]);
 
-  const loadTrades = async () => {
-    setIsLoading(true);
+  const loadTrades = async (isPolling = false) => {
+    // Only show loading state on initial load, not during background refresh
+    if (!hasLoadedOnce.current) {
+      setIsLoading(true);
+    } else if (isPolling) {
+      setIsRefreshing(true);
+    }
+    
     const [tradesData, statsData] = await Promise.all([
       tradeJournal.getGroupedTrades(),
       tradeJournal.getTradeStats(countByLeg),
     ]);
+    
+    // Update data without clearing first to prevent flicker
     setTrades(tradesData);
     setStats(statsData);
-    setIsLoading(false);
+    
+    if (!hasLoadedOnce.current) {
+      hasLoadedOnce.current = true;
+      setIsLoading(false);
+    } else if (isPolling) {
+      setIsRefreshing(false);
+    }
   };
 
   const loadStats = async () => {
@@ -861,7 +879,6 @@ export const TradeJournal = () => {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    <AnimatePresence>
                       {trades.map((item) => {
                         if (isTradeGroup(item)) {
                           return (
@@ -878,9 +895,8 @@ export const TradeJournal = () => {
                         const tradePnl = trade.pnl != null && !trade.needs_reconcile ? trade.pnl : null;
                         
                         return (
-                          <>
+                          <React.Fragment key={trade.id}>
                             <TableRow 
-                              key={trade.id} 
                               className={cn(
                                 "border-border cursor-pointer transition-colors",
                                 expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30",
@@ -920,22 +936,23 @@ export const TradeJournal = () => {
                                 {trade.exit_reason || '--'}
                               </TableCell>
                             </TableRow>
-                            {expandedTradeId === trade.id && (
-                              <TradeDetailsRow
-                                key={`${trade.id}-details`}
-                                trade={trade}
-                                isEditing={editingId === trade.id}
-                                editNotes={editNotes}
-                                onEditNotes={handleEditNotes}
-                                onSaveNotes={handleSaveNotes}
-                                onCancelEdit={() => setEditingId(null)}
-                                onNotesChange={setEditNotes}
-                              />
-                            )}
-                          </>
+                            <AnimatePresence>
+                              {expandedTradeId === trade.id && (
+                                <TradeDetailsRow
+                                  key={`${trade.id}-details`}
+                                  trade={trade}
+                                  isEditing={editingId === trade.id}
+                                  editNotes={editNotes}
+                                  onEditNotes={handleEditNotes}
+                                  onSaveNotes={handleSaveNotes}
+                                  onCancelEdit={() => setEditingId(null)}
+                                  onNotesChange={setEditNotes}
+                                />
+                              )}
+                            </AnimatePresence>
+                          </React.Fragment>
                         );
                       })}
-                    </AnimatePresence>
                   </TableBody>
                 </Table>
               </div>
