@@ -1,5 +1,12 @@
 import { useMemo, useState } from 'react';
-import { getCloseInstruction } from '@/lib/closeInstruction';
+import { getCloseInstruction, type CloseInstruction, type CloseInstructionError } from '@/lib/closeInstruction';
+
+function formatResult(out: CloseInstruction | CloseInstructionError): string {
+  if (out.ok === true) {
+    return `${out.closeSide} ${out.closeQty}`;
+  }
+  return `ERR: ${out.error}`;
+}
 
 const cases = [
   {
@@ -66,12 +73,12 @@ export default function CloseInstructionTest() {
                 out.closeSide === c.expected.closeSide &&
                 out.closeQty === c.expected.closeQty;
 
+              const display = formatResult(out);
+
               return (
                 <div key={c.name} className="flex items-center justify-between gap-4 text-sm">
                   <div className="font-mono">{c.name}</div>
-                  <div className="font-mono text-muted-foreground">
-                    {out.ok ? `${out.closeSide} ${out.closeQty}` : `ERR: ${out.error}`}
-                  </div>
+                  <div className="font-mono text-muted-foreground">{display}</div>
                   <div className="font-mono">{pass ? 'PASS' : 'FAIL'}</div>
                 </div>
               );
