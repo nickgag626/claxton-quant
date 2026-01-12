@@ -42,6 +42,9 @@ export interface Strategy {
   positionSize: number;
   entryConditions: EntryConditions;
   exitConditions: ExitConditions;
+  // New fields
+  trackedLegs?: TrackedLeg[];
+  sizing?: StrategySizing;
 }
 
 export type StrategyType = 
@@ -54,16 +57,60 @@ export type StrategyType =
   | 'iron_fly' 
   | 'custom';
 
+export type TrackedLegRole = 'short_put' | 'long_put' | 'short_call' | 'long_call' | 'custom';
+
+export interface TrackedLeg {
+  role: TrackedLegRole;
+  optionType: 'put' | 'call';
+  side: 'buy' | 'sell';
+  closeOnExit: boolean;
+}
+
+export interface StrategySizing {
+  mode: 'fixed' | 'risk';
+  fixedContracts?: number;
+  riskPerTrade?: number;
+  maxContracts?: number;
+}
+
+export interface MAFilterRule {
+  left: 'price' | 'sma20' | 'sma50' | 'sma200';
+  op: 'above' | 'below' | 'crosses_above' | 'crosses_below';
+  right: 'sma20' | 'sma50' | 'sma200';
+}
+
+export interface MAFilter {
+  enabled: boolean;
+  sma20?: boolean;
+  sma50?: boolean;
+  sma200?: boolean;
+  rules: MAFilterRule[];
+}
+
 export interface EntryConditions {
   minDte: number;
   maxDte: number;
-  maxDelta: number;
+  // Delta targeting (replaces maxDelta)
+  shortDeltaTarget: number;
+  longDeltaTarget?: number;
+  /** @deprecated Use shortDeltaTarget instead */
+  maxDelta?: number;
   minPremium?: number;
   minIvRank?: number;
   maxIvRank?: number;
   marketHoursOnly: boolean;
   startTime?: string;
   endTime?: string;
+  // Moving average filter
+  maFilter?: MAFilter;
+}
+
+export interface TrailingStopConfig {
+  enabled: boolean;
+  type: 'percent' | 'dollars';
+  amount: number;
+  activationProfit?: number;
+  basis: 'group' | 'tracked_legs' | 'short_legs';
 }
 
 export interface ExitConditions {
@@ -71,7 +118,9 @@ export interface ExitConditions {
   stopLossPercent: number;
   timeStopDte?: number;
   timeStopTime?: string;
+  /** @deprecated Use trailingStop object instead */
   trailingStopPercent?: number;
+  trailingStop?: TrailingStopConfig;
 }
 
 export interface RiskStatus {
