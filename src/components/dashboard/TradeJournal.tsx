@@ -7,10 +7,10 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection, isClosePending, isCloseRejected, CloseStatus } from '@/services/tradeJournal';
 import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
 import { format, subDays } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle, Loader2, Ban } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -63,7 +63,51 @@ const TradeDetailsRow = ({
   };
 
   const isVerified = hasVerifiedDirection(trade);
-  const pnlDisplay = trade.pnl != null ? trade.pnl : null;
+  const isPending = isClosePending(trade);
+  const isRejected = isCloseRejected(trade);
+  const pnlDisplay = trade.pnl != null && !isPending && !isRejected ? trade.pnl : null;
+
+  // Close status badge helper
+  const getCloseStatusBadge = () => {
+    if (isPending) {
+      return (
+        <div className="flex items-center gap-1 text-xs text-bloomberg-blue bg-bloomberg-blue/10 px-2 py-0.5 rounded">
+          <Loader2 className="h-3 w-3 animate-spin" />
+          <span>Pending close</span>
+        </div>
+      );
+    }
+    if (isRejected) {
+      return (
+        <div className="flex items-center gap-1 text-xs text-panic-red bg-panic-red/10 px-2 py-0.5 rounded">
+          <Ban className="h-3 w-3" />
+          <span>Close rejected: {trade.close_reject_reason || trade.close_status}</span>
+        </div>
+      );
+    }
+    if (trade.close_status === 'filled' && isVerified) {
+      return (
+        <div className="flex items-center gap-1 text-xs text-trading-green bg-trading-green/10 px-2 py-0.5 rounded">
+          <CheckCircle className="h-3 w-3" />
+          <span>Verified (Filled)</span>
+        </div>
+      );
+    }
+    if (isVerified) {
+      return (
+        <div className="flex items-center gap-1 text-xs text-trading-green bg-trading-green/10 px-2 py-0.5 rounded">
+          <CheckCircle className="h-3 w-3" />
+          <span>Verified</span>
+        </div>
+      );
+    }
+    return (
+      <div className="flex items-center gap-1 text-xs text-bloomberg-amber bg-bloomberg-amber/10 px-2 py-0.5 rounded">
+        <XCircle className="h-3 w-3" />
+        <span>Unverified - Excluded from totals</span>
+      </div>
+    );
+  };
 
   return (
     <motion.tr
@@ -74,8 +118,25 @@ const TradeDetailsRow = ({
     >
       <TableCell colSpan={6} className="p-0">
         <div className="p-4 space-y-4">
-          {/* Reconciliation Warning - No manual override, must use Reconcile from Tradier */}
-          {trade.needs_reconcile && (
+          {/* Close Status Warning - Pending or Rejected */}
+          {isPending && (
+            <div className="flex items-center gap-2 p-3 bg-bloomberg-blue/20 border border-bloomberg-blue/30 rounded">
+              <Loader2 className="h-4 w-4 text-bloomberg-blue animate-spin" />
+              <span className="text-xs text-bloomberg-blue font-medium">Close order pending – P&L not yet computed</span>
+              <span className="text-xs text-muted-foreground ml-2">Order ID: {trade.close_order_id}</span>
+            </div>
+          )}
+          
+          {isRejected && (
+            <div className="flex items-center gap-2 p-3 bg-panic-red/20 border border-panic-red/30 rounded">
+              <Ban className="h-4 w-4 text-panic-red" />
+              <span className="text-xs text-panic-red font-medium">Close order {trade.close_status}: {trade.close_reject_reason || 'Unknown reason'}</span>
+              <span className="text-xs text-muted-foreground ml-2">Trade still OPEN – no P&L booked</span>
+            </div>
+          )}
+          
+          {/* Reconciliation Warning - Direction unknown */}
+          {trade.needs_reconcile && !isPending && !isRejected && (
             <div className="flex items-center gap-2 p-3 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded">
               <AlertTriangle className="h-4 w-4 text-bloomberg-amber" />
               <span className="text-xs text-bloomberg-amber font-medium">Needs reconcile – direction unknown</span>
@@ -88,17 +149,7 @@ const TradeDetailsRow = ({
 
           {/* Verification Status Badge */}
           <div className="flex items-center gap-2">
-            {isVerified ? (
-              <div className="flex items-center gap-1 text-xs text-trading-green bg-trading-green/10 px-2 py-0.5 rounded">
-                <CheckCircle className="h-3 w-3" />
-                <span>Verified</span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-1 text-xs text-bloomberg-amber bg-bloomberg-amber/10 px-2 py-0.5 rounded">
-                <XCircle className="h-3 w-3" />
-                <span>Unverified - Excluded from totals</span>
-              </div>
-            )}
+            {getCloseStatusBadge()}
           </div>
 
           {/* Trade Details Grid */}
@@ -266,6 +317,18 @@ const TradeDetailsRow = ({
                   <span className="text-muted-foreground">Reconcile:</span>
                   <span className={cn("font-mono", trade.needs_reconcile ? "text-bloomberg-amber" : "text-trading-green")}>
                     {trade.needs_reconcile ? 'Yes' : 'No'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Close Status:</span>
+                  <span className={cn(
+                    "font-mono",
+                    trade.close_status === 'filled' ? "text-trading-green" :
+                    trade.close_status === 'submitted' ? "text-bloomberg-blue" :
+                    trade.close_status === 'rejected' || trade.close_status === 'canceled' || trade.close_status === 'expired' ? "text-panic-red" :
+                    "text-muted-foreground"
+                  )}>
+                    {trade.close_status || 'legacy'}
                   </span>
                 </div>
               </div>
@@ -892,7 +955,9 @@ export const TradeJournal = () => {
                         }
                         
                         const trade = item;
-                        const tradePnl = trade.pnl != null && !trade.needs_reconcile ? trade.pnl : null;
+                        const isPending = trade.close_status === 'submitted';
+                        const isRejected = trade.close_status === 'rejected' || trade.close_status === 'canceled' || trade.close_status === 'expired';
+                        const tradePnl = trade.pnl != null && !trade.needs_reconcile && !isPending && !isRejected ? trade.pnl : null;
                         
                         return (
                           <React.Fragment key={trade.id}>
@@ -900,13 +965,17 @@ export const TradeJournal = () => {
                               className={cn(
                                 "border-border cursor-pointer transition-colors",
                                 expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30",
-                                trade.needs_reconcile && "border-l-2 border-l-bloomberg-amber"
+                                isPending && "border-l-2 border-l-bloomberg-blue",
+                                isRejected && "border-l-2 border-l-panic-red",
+                                trade.needs_reconcile && !isPending && !isRejected && "border-l-2 border-l-bloomberg-amber"
                               )}
                               onClick={() => toggleTradeExpanded(trade.id!)}
                             >
                               <TableCell className="py-1.5 w-8">
                                 <div className="flex items-center gap-1">
-                                  {trade.needs_reconcile && (
+                                  {isPending && <Loader2 className="h-3 w-3 text-bloomberg-blue animate-spin" />}
+                                  {isRejected && <Ban className="h-3 w-3 text-panic-red" />}
+                                  {trade.needs_reconcile && !isPending && !isRejected && (
                                     <AlertTriangle className="h-3 w-3 text-bloomberg-amber" />
                                   )}
                                   <ChevronRight 

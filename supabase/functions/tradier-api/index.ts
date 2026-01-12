@@ -17,6 +17,7 @@ interface TradierRequest {
     | "clock"
     | "orders"
     | "order_detail"
+    | "order_status"
     | "close_position";
   symbols?: string[];
   symbol?: string;
@@ -351,6 +352,71 @@ serve(async (req) => {
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
         console.log("Order detail response:", JSON.stringify(data));
+        break;
+      }
+
+      case "order_status": {
+        // Fetch order status - returns normalized status for close lifecycle tracking
+        const orderId = body.orderId;
+        if (!orderId) {
+          return new Response(JSON.stringify({ error: "orderId required for order_status" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
+        console.log("Fetching order status:", url);
+        response = await fetch(url, { headers });
+        const orderData = await safeParseTradierResponse(response);
+        console.log("Order status response:", JSON.stringify(orderData));
+        
+        const order = orderData?.order;
+        if (!order) {
+          data = { error: "Order not found", orderId };
+          break;
+        }
+
+        // Normalize status for close lifecycle
+        const tradierStatus = String(order.status || '').toLowerCase();
+        let closeStatus: 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired' = 'submitted';
+        let rejectReason: string | undefined;
+        
+        if (tradierStatus === 'filled') {
+          closeStatus = 'filled';
+        } else if (tradierStatus === 'rejected') {
+          closeStatus = 'rejected';
+          rejectReason = order.reason_description || order.reject_reason || 'Order rejected';
+        } else if (tradierStatus === 'canceled' || tradierStatus === 'cancelled') {
+          closeStatus = 'canceled';
+          rejectReason = 'Order canceled';
+        } else if (tradierStatus === 'expired') {
+          closeStatus = 'expired';
+          rejectReason = 'Order expired';
+        } else if (tradierStatus === 'open' || tradierStatus === 'pending' || tradierStatus === 'partially_filled') {
+          closeStatus = 'submitted';
+        }
+
+        // Extract fill details if filled
+        let avgFillPrice: number | undefined;
+        let filledQty: number | undefined;
+        let closeSide: string | undefined;
+        
+        if (closeStatus === 'filled') {
+          avgFillPrice = normalizeNumber(order.avg_fill_price);
+          filledQty = normalizeNumber(order.exec_quantity) || normalizeNumber(order.quantity);
+          closeSide = order.side;
+        }
+
+        data = {
+          orderId,
+          tradierStatus,
+          closeStatus,
+          rejectReason,
+          avgFillPrice,
+          filledQty,
+          closeSide,
+          rawOrder: order,
+        };
         break;
       }
 

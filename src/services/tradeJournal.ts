@@ -1,5 +1,7 @@
 import { supabase } from '@/integrations/supabase/client';
 
+export type CloseStatus = 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired';
+
 export interface TradeRecord {
   id?: string;
   symbol: string;
@@ -13,7 +15,7 @@ export interface TradeRecord {
   exit_price: number;
   entry_credit?: number;
   exit_debit?: number;
-  pnl: number | null; // NULL if direction unknown
+  pnl: number | null; // NULL if direction unknown or close not filled
   pnl_percent?: number | null;
   exit_reason?: string;
   notes?: string;
@@ -27,6 +29,21 @@ export interface TradeRecord {
   multiplier?: number;
   pnl_formula?: string;
   needs_reconcile?: boolean;
+  // Close lifecycle columns
+  close_status?: CloseStatus;
+  close_submitted_at?: string;
+  close_filled_at?: string;
+  close_reject_reason?: string;
+  close_avg_fill_price?: number;
+  close_filled_qty?: number;
+}
+
+// Helper to cast DB row to TradeRecord (handles string → CloseStatus)
+function castToTradeRecord(row: any): TradeRecord {
+  return {
+    ...row,
+    close_status: row.close_status as CloseStatus | undefined,
+  };
 }
 
 export interface TradeGroup {
@@ -66,10 +83,27 @@ export interface DuplicateCandidate {
 
 /**
  * HARD RULE: Check if trade has required fields for P&L calculation
- * Returns true if direction is KNOWN
+ * Returns true if direction is KNOWN AND close is FILLED
  */
 export function hasVerifiedDirection(trade: Partial<TradeRecord>): boolean {
-  return Boolean(trade.open_side && trade.close_side && trade.close_order_id);
+  // P&L requires: direction known + close filled
+  const hasDirection = Boolean(trade.open_side && trade.close_side && trade.close_order_id);
+  const isFilled = trade.close_status === 'filled' || trade.close_status === undefined; // undefined = legacy data
+  return hasDirection && isFilled;
+}
+
+/**
+ * Check if close is pending (submitted but not yet filled/rejected)
+ */
+export function isClosePending(trade: Partial<TradeRecord>): boolean {
+  return trade.close_status === 'submitted';
+}
+
+/**
+ * Check if close was rejected or failed
+ */
+export function isCloseRejected(trade: Partial<TradeRecord>): boolean {
+  return trade.close_status === 'rejected' || trade.close_status === 'canceled' || trade.close_status === 'expired';
 }
 
 /**
@@ -305,7 +339,7 @@ export const tradeJournal = {
         .limit(limit);
 
       if (error) throw error;
-      return data || [];
+      return (data || []).map(castToTradeRecord);
     } catch (error) {
       console.error('Error fetching trades:', error);
       return [];
@@ -322,7 +356,7 @@ export const tradeJournal = {
 
       if (error) throw error;
       
-      const trades = data || [];
+      const trades = (data || []).map(castToTradeRecord);
       const grouped = new Map<string, TradeRecord[]>();
 
       trades.forEach(trade => {
@@ -517,7 +551,8 @@ export const tradeJournal = {
       let skipped = 0;
       const errors: string[] = [];
 
-      for (const trade of trades || []) {
+      for (const row of trades || []) {
+        const trade = castToTradeRecord(row);
         // Check if we have verified direction
         if (!hasVerifiedDirection(trade)) {
           // Mark as needs reconcile, set pnl to NULL
@@ -665,9 +700,190 @@ export const tradeJournal = {
         .order('exit_time', { ascending: false });
 
       if (error) throw error;
-      return data || [];
+      return (data || []).map(castToTradeRecord);
     } catch (error) {
       console.error('Error fetching trades needing reconciliation:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Save a pending close (when order is submitted but not yet filled)
+   */
+  async savePendingClose(tradeData: {
+    symbol: string;
+    underlying: string;
+    close_order_id: string;
+    close_side: string;
+    quantity: number;
+    entry_price: number;
+    entry_time: string;
+    open_side?: string;
+    open_order_id?: string;
+    strategy_name?: string;
+    strategy_type?: string;
+    exit_reason?: string;
+    trade_group_id?: string;
+  }): Promise<{ success: boolean; error?: string; id?: string }> {
+    try {
+      // Check if already exists
+      const { data: existing } = await supabase
+        .from('trades')
+        .select('id')
+        .eq('symbol', tradeData.symbol)
+        .eq('close_order_id', tradeData.close_order_id)
+        .maybeSingle();
+
+      if (existing) {
+        console.log('Pending close already exists:', tradeData.symbol, tradeData.close_order_id);
+        return { success: true, id: existing.id };
+      }
+
+      const { data, error } = await supabase
+        .from('trades')
+        .insert({
+          symbol: tradeData.symbol,
+          underlying: tradeData.underlying,
+          strategy_name: tradeData.strategy_name,
+          strategy_type: tradeData.strategy_type,
+          quantity: tradeData.quantity,
+          entry_time: tradeData.entry_time,
+          entry_price: tradeData.entry_price,
+          exit_price: 0, // Unknown until filled
+          exit_time: null, // Not set until filled
+          pnl: null, // Not computed until filled
+          pnl_percent: null,
+          exit_reason: tradeData.exit_reason,
+          trade_group_id: tradeData.trade_group_id,
+          open_side: tradeData.open_side,
+          close_side: tradeData.close_side,
+          open_order_id: tradeData.open_order_id,
+          close_order_id: tradeData.close_order_id,
+          needs_reconcile: true,
+          close_status: 'submitted',
+          close_submitted_at: new Date().toISOString(),
+          multiplier: 100,
+          fees: 0,
+        })
+        .select('id')
+        .single();
+
+      if (error) {
+        if (error.code === '23505') {
+          return { success: true }; // Duplicate, ok
+        }
+        throw error;
+      }
+      return { success: true, id: data?.id };
+    } catch (error) {
+      console.error('Error saving pending close:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
+  /**
+   * Update close status after verifying with Tradier
+   */
+  async updateCloseStatus(
+    closeOrderId: string,
+    status: CloseStatus,
+    details?: {
+      avgFillPrice?: number;
+      filledQty?: number;
+      rejectReason?: string;
+      open_side?: string;
+      fees?: number;
+    }
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const { data: trades, error: fetchError } = await supabase
+        .from('trades')
+        .select('*')
+        .eq('close_order_id', closeOrderId);
+
+      if (fetchError) throw fetchError;
+      if (!trades || trades.length === 0) {
+        return { success: false, error: 'Trade not found for close_order_id' };
+      }
+
+      for (const row of trades) {
+        const trade = castToTradeRecord(row);
+        const updates: Record<string, any> = { close_status: status };
+
+        if (status === 'filled') {
+          updates.close_filled_at = new Date().toISOString();
+          updates.exit_time = new Date().toISOString();
+          
+          if (details?.avgFillPrice != null) {
+            updates.close_avg_fill_price = details.avgFillPrice;
+            updates.exit_price = details.avgFillPrice;
+          }
+          if (details?.filledQty != null) {
+            updates.close_filled_qty = details.filledQty;
+            updates.quantity = details.filledQty;
+          }
+          if (details?.open_side) {
+            updates.open_side = details.open_side;
+          }
+          if (details?.fees != null) {
+            updates.fees = details.fees;
+          }
+
+          // Compute P&L if we have all required data
+          const openSide = details?.open_side || trade.open_side;
+          const openPrice = trade.entry_price;
+          const closePrice = details?.avgFillPrice ?? trade.exit_price;
+          const qty = details?.filledQty ?? trade.quantity;
+          const fees = details?.fees ?? trade.fees ?? 0;
+
+          if (openSide && openPrice && closePrice && qty) {
+            const pnlCalc = calculatePnl(openSide, openPrice, closePrice, qty, 100, fees);
+            if (pnlCalc) {
+              updates.pnl = pnlCalc.pnl;
+              updates.pnl_percent = pnlCalc.pnlPercent;
+              updates.pnl_formula = pnlCalc.formula;
+              updates.needs_reconcile = false;
+            }
+          }
+        } else if (status === 'rejected' || status === 'canceled' || status === 'expired') {
+          updates.close_reject_reason = details?.rejectReason || status;
+          // Do NOT set exit_time, exit_price, pnl - trade is still open
+          updates.pnl = null;
+          updates.needs_reconcile = true;
+        }
+
+        const { error: updateError } = await supabase
+          .from('trades')
+          .update(updates)
+          .eq('id', trade.id);
+
+        if (updateError) {
+          console.error('Error updating close status:', updateError);
+        }
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('Error updating close status:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
+  /**
+   * Get trades with pending closes that need status check
+   */
+  async getTradesWithPendingClose(): Promise<TradeRecord[]> {
+    try {
+      const { data, error } = await supabase
+        .from('trades')
+        .select('*')
+        .eq('close_status', 'submitted')
+        .order('close_submitted_at', { ascending: true });
+
+      if (error) throw error;
+      return (data || []).map(castToTradeRecord);
+    } catch (error) {
+      console.error('Error fetching trades with pending close:', error);
       return [];
     }
   },
