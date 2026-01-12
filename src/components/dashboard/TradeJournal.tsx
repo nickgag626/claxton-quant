@@ -7,8 +7,9 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
 import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate } from '@/services/tradeJournal';
-import { format } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw } from 'lucide-react';
+import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
+import { format, subDays } from 'date-fns';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -442,6 +443,9 @@ export const TradeJournal = () => {
   const [showDuplicatesDialog, setShowDuplicatesDialog] = useState(false);
   const [selectedDuplicates, setSelectedDuplicates] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
+  
+  // Reconciliation state
+  const [isReconciling, setIsReconciling] = useState(false);
 
   useEffect(() => {
     loadTrades();
@@ -573,6 +577,52 @@ export const TradeJournal = () => {
     });
   };
 
+  const handleReconcileFromTradier = async () => {
+    setIsReconciling(true);
+    try {
+      // Reconcile last 7 days
+      const endDate = format(new Date(), 'yyyy-MM-dd');
+      const startDate = format(subDays(new Date(), 7), 'yyyy-MM-dd');
+      
+      toast.info(`Fetching Tradier orders from ${startDate} to ${endDate}...`);
+      
+      // First, try to import any missing trades
+      const importResult = await importMissingTrades(startDate, endDate);
+      if (importResult.imported > 0) {
+        toast.success(`Imported ${importResult.imported} missing trades from Tradier`);
+      }
+      
+      // Then reconcile existing trades that need it
+      const reconcileResult = await reconcileFromTradierFills(startDate, endDate);
+      
+      if (reconcileResult.success) {
+        if (reconcileResult.reconciled > 0) {
+          toast.success(`Reconciled ${reconcileResult.reconciled} trades with Tradier fills`);
+        } else {
+          toast.info('No trades needed reconciliation');
+        }
+        
+        if (reconcileResult.mismatches.length > 0) {
+          console.warn('Reconciliation mismatches:', reconcileResult.mismatches);
+          toast.warning(`${reconcileResult.mismatches.length} trades could not be matched - check console`);
+        }
+        
+        if (reconcileResult.errors.length > 0) {
+          console.error('Reconciliation errors:', reconcileResult.errors);
+        }
+        
+        loadTrades();
+      } else {
+        toast.error('Reconciliation failed - check console for details');
+      }
+    } catch (error) {
+      console.error('Error in reconciliation:', error);
+      toast.error('Error reconciling from Tradier');
+    } finally {
+      setIsReconciling(false);
+    }
+  };
+
   return (
     <>
       <motion.div
@@ -676,6 +726,23 @@ export const TradeJournal = () => {
                     <Search className="h-3 w-3 mr-1" />
                   )}
                   Detect Duplicates
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleReconcileFromTradier();
+                  }}
+                  disabled={isReconciling}
+                >
+                  {isReconciling ? (
+                    <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+                  ) : (
+                    <Download className="h-3 w-3 mr-1" />
+                  )}
+                  Reconcile from Tradier
                 </Button>
               </div>
 
