@@ -18,6 +18,10 @@ interface ControlsPanelProps {
   onEmergencyClose: () => void;
   onUpdateRiskSettings?: (settings: { maxDailyLoss: number; maxPositions: number }) => void;
   onUpdateSafeguards?: (safeguards: TradeSafeguards) => void;
+  closeDebugOptions?: { dryRun: boolean; debug: boolean };
+  onCloseDebugOptionsChange?: (opts: { dryRun: boolean; debug: boolean }) => void;
+  lastCloseDebug?: any;
+  onCopyCloseDebug?: () => void;
 }
 
 export const ControlsPanel = ({
@@ -30,6 +34,10 @@ export const ControlsPanel = ({
   onEmergencyClose,
   onUpdateRiskSettings,
   onUpdateSafeguards,
+  closeDebugOptions,
+  onCloseDebugOptionsChange,
+  lastCloseDebug,
+  onCopyCloseDebug,
 }: ControlsPanelProps) => {
   const [confirmEmergency, setConfirmEmergency] = useState(false);
   const [isEditingRisk, setIsEditingRisk] = useState(false);
@@ -345,9 +353,9 @@ export const ControlsPanel = ({
             size="sm"
             className={cn(
               "w-full font-mono text-xs",
-              isBotRunning 
-                ? "bg-secondary hover:bg-secondary/80" 
-                : "bg-trading-green hover:bg-trading-green/90 text-black"
+              isBotRunning
+                ? "bg-secondary hover:bg-secondary/80"
+                : "bg-trading-green hover:bg-trading-green/90 text-black",
             )}
           >
             {isBotRunning ? (
@@ -362,14 +370,15 @@ export const ControlsPanel = ({
               </>
             )}
           </Button>
-          
+
           <Button
             onClick={onToggleKillSwitch}
             variant="secondary"
             size="sm"
             className={cn(
               "w-full font-mono text-xs",
-              riskStatus.killSwitchActive && "bg-panic-red/20 border-panic-red text-panic-red hover:bg-panic-red/30"
+              riskStatus.killSwitchActive &&
+                "bg-panic-red/20 border-panic-red text-panic-red hover:bg-panic-red/30",
             )}
           >
             {riskStatus.killSwitchActive ? (
@@ -385,25 +394,81 @@ export const ControlsPanel = ({
             )}
           </Button>
         </div>
-        
+
         {riskStatus.killSwitchActive && (
           <div className="mt-2 text-[10px] text-bloomberg-amber flex items-center gap-1">
             <AlertTriangle className="w-3 h-3" />
             Kill switch blocks start
           </div>
         )}
-        
+
+        {/* Close Debug Panel */}
+        {closeDebugOptions && onCloseDebugOptionsChange && (
+          <div className="mt-4 pt-4 border-t border-border">
+            <div className="text-[10px] text-muted-foreground uppercase tracking-widest mb-2">
+              Close Debug
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Checkbox
+                  checked={closeDebugOptions.dryRun}
+                  onCheckedChange={(v) =>
+                    onCloseDebugOptionsChange({
+                      ...closeDebugOptions,
+                      dryRun: v === true,
+                    })
+                  }
+                />
+                Dry Run
+              </label>
+
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Checkbox
+                  checked={closeDebugOptions.debug}
+                  onCheckedChange={(v) =>
+                    onCloseDebugOptionsChange({
+                      ...closeDebugOptions,
+                      debug: v === true,
+                    })
+                  }
+                />
+                Debug
+              </label>
+            </div>
+
+            <div className="mt-2 flex items-center justify-end">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="font-mono text-xs"
+                onClick={onCopyCloseDebug}
+                disabled={!lastCloseDebug}
+              >
+                Copy Debug JSON
+              </Button>
+            </div>
+
+            {lastCloseDebug && (
+              <pre className="mt-2 max-h-56 overflow-auto rounded border border-border bg-secondary/30 p-2 text-[10px] text-foreground whitespace-pre-wrap break-words">
+{JSON.stringify(lastCloseDebug, null, 2)}
+              </pre>
+            )}
+          </div>
+        )}
+
         {/* Emergency Close */}
         <div className="mt-4 pt-4 border-t border-border">
           <div className="flex items-center gap-2 mb-2">
-            <Checkbox 
+            <Checkbox
               id="confirm-emergency"
               checked={confirmEmergency}
               onCheckedChange={(checked) => setConfirmEmergency(checked === true)}
               className="border-muted-foreground data-[state=checked]:bg-panic-red data-[state=checked]:border-panic-red"
             />
-            <label 
-              htmlFor="confirm-emergency" 
+            <label
+              htmlFor="confirm-emergency"
               className="text-[10px] text-muted-foreground uppercase tracking-wide cursor-pointer"
             >
               Confirm Close All
