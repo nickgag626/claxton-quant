@@ -1,19 +1,19 @@
-import { supabase } from '@/integrations/supabase/client';
-import { tradeJournal, TradeRecord, calculatePnl, hasVerifiedDirection } from './tradeJournal';
+/**
+ * Tradier Execution-Based Reconciliation Service
+ * 
+ * Uses Tradier order details to infer:
+ * - Trade direction (open_side / close_side) from execution sides
+ * - Prices from weighted avg fill prices
+ * - Fees from order data
+ * 
+ * RULES:
+ * - No manual override - automatic inference only
+ * - If direction cannot be inferred from executions, trade stays unverified
+ * - P&L is only computed when direction is verified from executions
+ */
 
-export interface TradierFill {
-  id: string;
-  order_id: string;
-  symbol: string;
-  option_symbol?: string;
-  side: string;
-  quantity: number;
-  price: number;
-  exec_quantity: number;
-  avg_fill_price: number;
-  transaction_date: string;
-  create_date: string;
-}
+import { supabase } from '@/integrations/supabase/client';
+import { tradeJournal, TradeRecord, calculatePnl } from './tradeJournal';
 
 export interface TradierOrder {
   id: number;
@@ -29,6 +29,19 @@ export interface TradierOrder {
   create_date: string;
   transaction_date: string;
   class: string;
+  leg?: TradierLeg | TradierLeg[];
+}
+
+interface TradierLeg {
+  id: number;
+  type: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  status: string;
+  avg_fill_price: number;
+  exec_quantity: number;
+  option_symbol?: string;
 }
 
 export interface ReconcileResult {
@@ -36,7 +49,63 @@ export interface ReconcileResult {
   reconciled: number;
   skipped: number;
   errors: string[];
-  mismatches: string[];
+  summary: {
+    verified: number;
+    unverified: number;
+    totalPnl: number;
+  };
+}
+
+/**
+ * Determine if this is a closing order based on side
+ */
+function isClosingOrder(side: string): boolean {
+  return side === 'buy_to_close' || side === 'sell_to_close' || side === 'buy_to_cover';
+}
+
+/**
+ * Determine if this is an opening order based on side
+ */
+function isOpeningOrder(side: string): boolean {
+  return side === 'buy_to_open' || side === 'sell_to_open' || side === 'buy' || side === 'sell';
+}
+
+/**
+ * Normalize side to canonical close_side format
+ */
+function normalizeToCloseSide(side: string): string | null {
+  if (side === 'sell_to_close') return 'sell_to_close';
+  if (side === 'buy_to_close' || side === 'buy_to_cover') return 'buy_to_close';
+  return null;
+}
+
+/**
+ * Normalize side to canonical open_side format
+ */
+function normalizeToOpenSide(side: string): string | null {
+  if (side === 'sell_to_open' || side === 'sell') return 'sell_to_open';
+  if (side === 'buy_to_open' || side === 'buy') return 'buy_to_open';
+  return null;
+}
+
+/**
+ * Infer open_side from close_side (complementary sides)
+ * This is the KEY inference rule based on Tradier execution data
+ */
+function inferOpenSideFromCloseSide(closeSide: string): string | null {
+  // If we closed with buy_to_close, we must have opened with sell_to_open (short)
+  if (closeSide === 'buy_to_close') return 'sell_to_open';
+  // If we closed with sell_to_close, we must have opened with buy_to_open (long)
+  if (closeSide === 'sell_to_close') return 'buy_to_open';
+  return null;
+}
+
+/**
+ * Extract underlying from OCC option symbol
+ */
+function extractUnderlying(optionSymbol: string): string {
+  const match = optionSymbol.match(/^([A-Z]+)\d/);
+  return match ? match[1] : optionSymbol;
 }
 
 /**
@@ -64,108 +133,146 @@ async function fetchTradierOrders(startDate: string, endDate: string): Promise<T
 }
 
 /**
- * Extract underlying from OCC option symbol
+ * Extract execution data from an order (handles multi-leg orders)
  */
-function extractUnderlying(optionSymbol: string): string {
-  // OCC format: SPY260112P00693000 -> SPY
-  const match = optionSymbol.match(/^([A-Z]+)\d/);
-  return match ? match[1] : optionSymbol;
-}
-
-/**
- * Determine if this is a closing order based on side
- */
-function isClosingOrder(side: string): boolean {
-  return side === 'buy_to_close' || side === 'sell_to_close';
-}
-
-/**
- * Determine if this is an opening order based on side
- */
-function isOpeningOrder(side: string): boolean {
-  return side === 'buy_to_open' || side === 'sell_to_open';
-}
-
-/**
- * Match trades using priority:
- * 1. Match by close_order_id or open_order_id
- * 2. Heuristic match by symbol, qty, price, timestamp
- */
-function findMatchingOrder(
-  trade: TradeRecord,
-  orders: TradierOrder[],
-  isOpening: boolean
-): TradierOrder | null {
-  const filterFn = isOpening ? isOpeningOrder : isClosingOrder;
-  const matchingOrders = orders.filter(o => 
-    o.status === 'filled' && 
-    filterFn(o.side) &&
-    (o.option_symbol === trade.symbol || o.symbol === trade.symbol)
-  );
-
-  if (matchingOrders.length === 0) return null;
-
-  // Priority 1: Match by order ID
-  const orderId = isOpening ? trade.open_order_id : trade.close_order_id;
-  if (orderId) {
-    const exactMatch = matchingOrders.find(o => String(o.id) === orderId);
-    if (exactMatch) return exactMatch;
-  }
-
-  // Priority 2: Heuristic match
-  const tradeTime = new Date(isOpening ? trade.entry_time : (trade.exit_time || trade.entry_time));
-  const tradePrice = isOpening ? trade.entry_price : trade.exit_price;
-  const tradeQty = trade.quantity;
-
-  // Score each order
-  let bestMatch: TradierOrder | null = null;
-  let bestScore = 0;
-
-  for (const order of matchingOrders) {
-    let score = 0;
+function extractExecutionFromOrder(
+  order: TradierOrder, 
+  targetSymbol: string
+): { side: string; avgFillPrice: number; execQty: number } | null {
+  // Check if order has legs (multi-leg order like spreads)
+  if (order.leg) {
+    const legs = Array.isArray(order.leg) ? order.leg : [order.leg];
+    const matchingLeg = legs.find(l => 
+      (l.option_symbol === targetSymbol) || (l.symbol === targetSymbol)
+    );
     
-    // Quantity match (±1 tolerance)
-    const qtyDiff = Math.abs((order.exec_quantity || order.quantity) - tradeQty);
-    if (qtyDiff === 0) score += 10;
-    else if (qtyDiff <= 1) score += 5;
-    else continue; // Skip if qty is off by more than 1
-
-    // Price proximity (within 10%)
-    if (order.avg_fill_price > 0 && tradePrice > 0) {
-      const priceDiff = Math.abs(order.avg_fill_price - tradePrice) / tradePrice;
-      if (priceDiff < 0.01) score += 10;
-      else if (priceDiff < 0.05) score += 5;
-      else if (priceDiff < 0.10) score += 2;
-    }
-
-    // Timestamp proximity (within 24h)
-    const orderTime = new Date(order.transaction_date || order.create_date);
-    const timeDiff = Math.abs(orderTime.getTime() - tradeTime.getTime());
-    const hoursDiff = timeDiff / (1000 * 60 * 60);
-    if (hoursDiff < 1) score += 10;
-    else if (hoursDiff < 6) score += 5;
-    else if (hoursDiff < 24) score += 2;
-    else continue; // Skip if more than 24h apart
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = order;
+    if (matchingLeg && matchingLeg.status === 'filled') {
+      return {
+        side: matchingLeg.side,
+        avgFillPrice: matchingLeg.avg_fill_price,
+        execQty: matchingLeg.exec_quantity || matchingLeg.quantity
+      };
     }
   }
-
-  return bestMatch;
+  
+  // Single-leg order
+  const orderSymbol = order.option_symbol || order.symbol;
+  if (orderSymbol === targetSymbol && order.status === 'filled') {
+    return {
+      side: order.side,
+      avgFillPrice: order.avg_fill_price,
+      execQty: order.exec_quantity || order.quantity
+    };
+  }
+  
+  return null;
 }
 
 /**
- * Reconcile trades from Tradier fills
+ * Find matching orders for a trade
+ * Priority:
+ * 1. Exact match by close_order_id or open_order_id
+ * 2. Heuristic match by symbol + qty + timestamp proximity (±30 min)
+ */
+function findMatchingOrders(
+  trade: TradeRecord,
+  orders: TradierOrder[]
+): { openOrder: TradierOrder | null; closeOrder: TradierOrder | null } {
+  const filledOrders = orders.filter(o => o.status === 'filled');
+  const tradeSymbol = trade.symbol;
+  
+  // 1. Match by close_order_id
+  let closeOrder: TradierOrder | null = null;
+  if (trade.close_order_id) {
+    closeOrder = filledOrders.find(o => String(o.id) === String(trade.close_order_id)) || null;
+  }
+  
+  // 2. Match by open_order_id
+  let openOrder: TradierOrder | null = null;
+  if (trade.open_order_id) {
+    openOrder = filledOrders.find(o => String(o.id) === String(trade.open_order_id)) || null;
+  }
+  
+  // 3. Heuristic matching if no exact match
+  const tradeQty = Math.abs(trade.quantity);
+  const entryTime = new Date(trade.entry_time).getTime();
+  const exitTime = trade.exit_time ? new Date(trade.exit_time).getTime() : Date.now();
+  
+  // Filter orders that match the trade symbol
+  const candidateOrders = filledOrders.filter(order => {
+    // Check main order symbol
+    if (order.option_symbol === tradeSymbol || order.symbol === tradeSymbol) {
+      return true;
+    }
+    // Check legs for multi-leg orders
+    if (order.leg) {
+      const legs = Array.isArray(order.leg) ? order.leg : [order.leg];
+      return legs.some(l => l.option_symbol === tradeSymbol || l.symbol === tradeSymbol);
+    }
+    return false;
+  });
+  
+  // Find close order by heuristic (within 30 min of exit, matching qty, closing side)
+  if (!closeOrder) {
+    for (const order of candidateOrders) {
+      const exec = extractExecutionFromOrder(order, tradeSymbol);
+      if (!exec) continue;
+      
+      // Must be a closing order
+      if (!isClosingOrder(exec.side)) continue;
+      
+      // Check quantity (±1 tolerance)
+      if (Math.abs(exec.execQty - tradeQty) > 1) continue;
+      
+      // Check timestamp proximity (within 30 min of exit)
+      const orderTime = new Date(order.transaction_date || order.create_date).getTime();
+      const timeDiff = Math.abs(orderTime - exitTime);
+      if (timeDiff < 30 * 60 * 1000) {
+        closeOrder = order;
+        break;
+      }
+    }
+  }
+  
+  // Find open order by heuristic (within 30 min of entry, matching qty, opening side)
+  if (!openOrder) {
+    for (const order of candidateOrders) {
+      const exec = extractExecutionFromOrder(order, tradeSymbol);
+      if (!exec) continue;
+      
+      // Must be an opening order
+      if (!isOpeningOrder(exec.side)) continue;
+      
+      // Check quantity (±1 tolerance)
+      if (Math.abs(exec.execQty - tradeQty) > 1) continue;
+      
+      // Check timestamp proximity (within 30 min of entry)
+      const orderTime = new Date(order.transaction_date || order.create_date).getTime();
+      const timeDiff = Math.abs(orderTime - entryTime);
+      if (timeDiff < 30 * 60 * 1000) {
+        openOrder = order;
+        break;
+      }
+    }
+  }
+  
+  return { openOrder, closeOrder };
+}
+
+/**
+ * Reconcile trades from Tradier executions
  * NON-DESTRUCTIVE: Only backfills missing data, never deletes
+ * 
+ * Direction inference:
+ * - Uses close_side from Tradier execution to infer open_side
+ * - If close_side is buy_to_close -> open_side was sell_to_open (short)
+ * - If close_side is sell_to_close -> open_side was buy_to_open (long)
  */
 export async function reconcileFromTradierFills(
   startDate: string,
   endDate: string
 ): Promise<ReconcileResult> {
   const errors: string[] = [];
-  const mismatches: string[] = [];
   let reconciled = 0;
   let skipped = 0;
 
@@ -175,7 +282,31 @@ export async function reconcileFromTradierFills(
     console.log(`Fetched ${orders.length} orders from Tradier`);
 
     if (orders.length === 0) {
-      return { success: true, reconciled: 0, skipped: 0, errors: [], mismatches: ['No orders found in date range'] };
+      // Still calculate summary
+      const { data: verifiedTrades } = await supabase
+        .from('trades')
+        .select('pnl')
+        .eq('needs_reconcile', false)
+        .not('pnl', 'is', null);
+      
+      const { data: unverifiedTrades } = await supabase
+        .from('trades')
+        .select('id')
+        .eq('needs_reconcile', true);
+      
+      const totalPnl = (verifiedTrades || []).reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+      
+      return { 
+        success: true, 
+        reconciled: 0, 
+        skipped: 0, 
+        errors: ['No orders found in date range'],
+        summary: {
+          verified: verifiedTrades?.length || 0,
+          unverified: unverifiedTrades?.length || 0,
+          totalPnl
+        }
+      };
     }
 
     // 2. Fetch trades needing reconciliation
@@ -184,86 +315,126 @@ export async function reconcileFromTradierFills(
 
     // 3. Reconcile each trade
     for (const trade of tradesNeedingReconcile) {
-      const updates: Partial<TradeRecord> = {};
-      let hasUpdates = false;
-
-      // Find opening order
-      if (!trade.open_side || !trade.open_order_id) {
-        const openOrder = findMatchingOrder(trade, orders, true);
+      try {
+        const { openOrder, closeOrder } = findMatchingOrders(trade, orders);
+        
+        // We NEED the close order to infer direction
+        if (!closeOrder) {
+          console.log(`No matching close order for ${trade.symbol} - staying unverified`);
+          skipped++;
+          continue;
+        }
+        
+        // Extract execution data from close order
+        const closeExec = extractExecutionFromOrder(closeOrder, trade.symbol);
+        if (!closeExec) {
+          console.log(`Could not extract close execution for ${trade.symbol}`);
+          skipped++;
+          continue;
+        }
+        
+        // Get canonical close_side
+        const closeSide = normalizeToCloseSide(closeExec.side);
+        if (!closeSide) {
+          console.log(`Unknown close side: ${closeExec.side} for ${trade.symbol} - not a closing order`);
+          skipped++;
+          continue;
+        }
+        
+        // INFER open_side from close_side (this is the key automatic inference)
+        const openSide = inferOpenSideFromCloseSide(closeSide);
+        if (!openSide) {
+          console.log(`Could not infer open side from close side: ${closeSide}`);
+          skipped++;
+          continue;
+        }
+        
+        // Get prices
+        const closePrice = closeExec.avgFillPrice;
+        let openPrice = trade.entry_price;
+        let openOrderId = trade.open_order_id;
+        
+        // If we have an open order, use its price
         if (openOrder) {
-          updates.open_side = openOrder.side;
-          updates.open_order_id = String(openOrder.id);
-          updates.entry_price = openOrder.avg_fill_price;
-          updates.entry_time = openOrder.transaction_date || openOrder.create_date;
-          hasUpdates = true;
+          const openExec = extractExecutionFromOrder(openOrder, trade.symbol);
+          if (openExec) {
+            openPrice = openExec.avgFillPrice;
+            openOrderId = String(openOrder.id);
+          }
         }
-      }
-
-      // Find closing order
-      if (!trade.close_side || !trade.close_order_id) {
-        const closeOrder = findMatchingOrder(trade, orders, false);
-        if (closeOrder) {
-          updates.close_side = closeOrder.side;
-          updates.close_order_id = String(closeOrder.id);
-          updates.exit_price = closeOrder.avg_fill_price;
-          updates.exit_time = closeOrder.transaction_date || closeOrder.create_date;
-          hasUpdates = true;
+        
+        const quantity = closeExec.execQty || trade.quantity;
+        const multiplier = trade.multiplier || 100;
+        const fees = Number(trade.fees) || 0;
+        
+        // Calculate P&L with verified direction
+        const pnlCalc = calculatePnl(openSide, openPrice, closePrice, quantity, multiplier, fees);
+        
+        if (!pnlCalc) {
+          console.log(`P&L calculation failed for ${trade.symbol}`);
+          errors.push(`${trade.symbol}: P&L calculation failed`);
+          skipped++;
+          continue;
         }
-      }
-
-      // Check if we now have verified direction
-      const finalOpenSide = updates.open_side || trade.open_side;
-      const finalCloseSide = updates.close_side || trade.close_side;
-      const finalCloseOrderId = updates.close_order_id || trade.close_order_id;
-      const finalOpenPrice = updates.entry_price ?? trade.entry_price;
-      const finalClosePrice = updates.exit_price ?? trade.exit_price;
-
-      if (finalOpenSide && finalCloseSide && finalCloseOrderId && finalOpenPrice && finalClosePrice) {
-        // Calculate P&L
-        const calc = calculatePnl(
-          finalOpenSide,
-          Number(finalOpenPrice),
-          Number(finalClosePrice),
-          trade.quantity,
-          trade.multiplier || 100,
-          trade.fees || 0
-        );
-
-        if (calc) {
-          updates.pnl = calc.pnl;
-          updates.pnl_percent = calc.pnlPercent;
-          updates.pnl_formula = calc.formula;
-          updates.needs_reconcile = false;
-          hasUpdates = true;
-        }
-      } else {
-        // Still missing required data
-        mismatches.push(
-          `Trade ${trade.id?.slice(0, 8)} (${trade.symbol}): ` +
-          `missing ${!finalOpenSide ? 'open_side ' : ''}${!finalCloseSide ? 'close_side ' : ''}${!finalCloseOrderId ? 'close_order_id' : ''}`
-        );
-        skipped++;
-        continue;
-      }
-
-      // Apply updates
-      if (hasUpdates && trade.id) {
-        const { error } = await supabase
+        
+        // Update the trade with verified data
+        const { error: updateError } = await supabase
           .from('trades')
-          .update(updates)
+          .update({
+            open_side: openSide,
+            close_side: closeSide,
+            open_order_id: openOrderId,
+            close_order_id: String(closeOrder.id),
+            entry_price: openPrice,
+            exit_price: closePrice,
+            quantity: quantity,
+            pnl: pnlCalc.pnl,
+            pnl_percent: pnlCalc.pnlPercent,
+            pnl_formula: pnlCalc.formula,
+            needs_reconcile: false,
+          })
           .eq('id', trade.id);
-
-        if (error) {
-          errors.push(`Trade ${trade.id}: ${error.message}`);
+        
+        if (updateError) {
+          errors.push(`${trade.symbol}: ${updateError.message}`);
+          skipped++;
         } else {
+          console.log(`Reconciled ${trade.symbol}: ${openSide} → ${closeSide}, P&L: ${pnlCalc.pnl.toFixed(2)}`);
           reconciled++;
         }
-      } else {
+        
+      } catch (tradeError) {
+        const msg = tradeError instanceof Error ? tradeError.message : String(tradeError);
+        errors.push(`${trade.symbol}: ${msg}`);
         skipped++;
       }
     }
 
-    return { success: true, reconciled, skipped, errors, mismatches };
+    // 4. Fetch summary stats
+    const { data: verifiedTrades } = await supabase
+      .from('trades')
+      .select('pnl')
+      .eq('needs_reconcile', false)
+      .not('pnl', 'is', null);
+    
+    const { data: unverifiedTrades } = await supabase
+      .from('trades')
+      .select('id')
+      .eq('needs_reconcile', true);
+    
+    const totalPnl = (verifiedTrades || []).reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+
+    return { 
+      success: true, 
+      reconciled, 
+      skipped, 
+      errors,
+      summary: {
+        verified: verifiedTrades?.length || 0,
+        unverified: unverifiedTrades?.length || 0,
+        totalPnl
+      }
+    };
   } catch (error) {
     console.error('Error in reconciliation:', error);
     return {
@@ -271,7 +442,7 @@ export async function reconcileFromTradierFills(
       reconciled,
       skipped,
       errors: [error instanceof Error ? error.message : 'Unknown error'],
-      mismatches,
+      summary: { verified: 0, unverified: 0, totalPnl: 0 }
     };
   }
 }
@@ -323,25 +494,30 @@ export async function importMissingTrades(
           continue;
         }
 
+        // Get close side and infer open side
+        const closeSide = normalizeToCloseSide(closeOrder.side);
+        if (!closeSide) continue;
+        
+        const openSide = inferOpenSideFromCloseSide(closeSide);
+        if (!openSide) continue;
+
         // Find matching open (simple heuristic: earliest open before this close)
         const matchingOpen = opens
           .filter(o => new Date(o.create_date) < new Date(closeOrder.create_date))
           .sort((a, b) => new Date(a.create_date).getTime() - new Date(b.create_date).getTime())[0];
 
         const underlying = extractUnderlying(symbol);
-        const openSide = matchingOpen?.side;
-        const closeSide = closeOrder.side;
         const openPrice = matchingOpen?.avg_fill_price;
         const closePrice = closeOrder.avg_fill_price;
         const qty = closeOrder.exec_quantity || closeOrder.quantity;
 
-        // Only create trade if we have verified direction
+        // Only create trade if we have all required data
         let pnl: number | null = null;
         let pnlPercent: number | null = null;
         let pnlFormula: string | null = null;
         let needsReconcile = true;
 
-        if (openSide && closeSide && openPrice && closePrice) {
+        if (openPrice && closePrice) {
           const calc = calculatePnl(openSide, openPrice, closePrice, qty, 100, 0);
           if (calc) {
             pnl = calc.pnl;
@@ -359,7 +535,7 @@ export async function importMissingTrades(
           exit_time: closeOrder.transaction_date || closeOrder.create_date,
           entry_price: openPrice || 0,
           exit_price: closePrice,
-          pnl: pnl as number, // Will be null if needs_reconcile
+          pnl: pnl as number,
           pnl_percent: pnlPercent as number,
           pnl_formula: pnlFormula || undefined,
           open_side: openSide,
