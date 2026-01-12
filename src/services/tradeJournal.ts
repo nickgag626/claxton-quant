@@ -13,8 +13,8 @@ export interface TradeRecord {
   exit_price: number;
   entry_credit?: number;
   exit_debit?: number;
-  pnl: number;
-  pnl_percent?: number;
+  pnl: number | null; // NULL if direction unknown
+  pnl_percent?: number | null;
   exit_reason?: string;
   notes?: string;
   trade_group_id?: string;
@@ -38,17 +38,21 @@ export interface TradeGroup {
   underlying: string;
   exitTime?: string;
   exitReason?: string;
+  needsReconcile?: boolean; // True if any leg needs reconcile
 }
 
 export interface TradeStats {
-  totalTrades: number;      // Number of trade groups (strategies)
-  totalLegs: number;        // Number of individual legs
-  winningTrades: number;    // Groups with pnl > 0
-  losingTrades: number;     // Groups with pnl < 0
-  totalPnl: number;         // Sum of all realized P&L
-  winRate: number;          // % of winning groups
+  totalTrades: number;      // Number of VERIFIED trade groups (excludes needs_reconcile)
+  totalLegs: number;        // Number of VERIFIED individual legs
+  winningTrades: number;    // Groups with pnl > 0 (verified only)
+  losingTrades: number;     // Groups with pnl < 0 (verified only)
+  totalPnl: number;         // Sum of VERIFIED P&L only
+  winRate: number;          // % of winning groups (verified only)
   avgWinner: number;
   avgLoser: number;
+  // Reconciliation stats
+  needsReconcileCount: number;
+  verifiedCount: number;
 }
 
 export interface DuplicateCandidate {
@@ -61,9 +65,22 @@ export interface DuplicateCandidate {
 }
 
 /**
- * Calculate P&L based on fills-derived entry/exit prices
- * open_side = 'sell_to_open': pnl = (open_price - close_price) * qty * multiplier - fees
- * open_side = 'buy_to_open': pnl = (close_price - open_price) * qty * multiplier - fees
+ * HARD RULE: Check if trade has required fields for P&L calculation
+ * Returns true if direction is KNOWN
+ */
+export function hasVerifiedDirection(trade: Partial<TradeRecord>): boolean {
+  return Boolean(trade.open_side && trade.close_side && trade.close_order_id);
+}
+
+/**
+ * CANONICAL P&L CALCULATION (options only)
+ * Only computes P&L when ALL required fields exist:
+ * - open_side (sell_to_open or buy_to_open)
+ * - open_price, close_price
+ * - quantity, multiplier
+ * 
+ * NEVER infers direction from price movement.
+ * NEVER uses cost_basis for realized P&L.
  */
 export function calculatePnl(
   openSide: string,
@@ -72,7 +89,12 @@ export function calculatePnl(
   quantity: number,
   multiplier: number = 100,
   fees: number = 0
-): { pnl: number; pnlPercent: number; formula: string } {
+): { pnl: number; pnlPercent: number; formula: string } | null {
+  // Validate inputs - never compute with missing data
+  if (!openSide || openPrice == null || closePrice == null || !quantity) {
+    return null;
+  }
+
   let pnl: number;
   let formula: string;
   
@@ -80,10 +102,13 @@ export function calculatePnl(
     // Credit trade: profit when close price < open price
     pnl = (openPrice - closePrice) * quantity * multiplier - fees;
     formula = `(${openPrice.toFixed(4)} - ${closePrice.toFixed(4)}) × ${quantity} × ${multiplier} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
-  } else {
+  } else if (openSide === 'buy_to_open' || openSide === 'buy') {
     // Debit trade: profit when close price > open price
     pnl = (closePrice - openPrice) * quantity * multiplier - fees;
     formula = `(${closePrice.toFixed(4)} - ${openPrice.toFixed(4)}) × ${quantity} × ${multiplier} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
+  } else {
+    // Unknown direction - NEVER guess
+    return null;
   }
   
   const cost = openPrice * quantity * multiplier;
@@ -95,16 +120,36 @@ export function calculatePnl(
 export const tradeJournal = {
   /**
    * Save a single trade with proper deduplication by close_order_id
+   * HARD RULE: If direction unknown, pnl = NULL and needs_reconcile = true
    */
   async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string; id?: string; duplicate?: boolean }> {
     try {
-      // Calculate P&L from fills if we have the data
-      let pnl = trade.pnl;
-      let pnlPercent = trade.pnl_percent;
-      let pnlFormula = trade.pnl_formula;
-      let needsReconcile = false;
+      // Check idempotency: if (symbol, close_order_id) exists, skip insert
+      if (trade.close_order_id) {
+        const { data: existing } = await supabase
+          .from('trades')
+          .select('id')
+          .eq('symbol', trade.symbol)
+          .eq('close_order_id', trade.close_order_id)
+          .maybeSingle();
+        
+        if (existing) {
+          console.log('Trade already exists (idempotent check):', trade.symbol, trade.close_order_id);
+          return { success: true, duplicate: true, id: existing.id };
+        }
+      }
+
+      // Determine if we can compute P&L
+      const canComputePnl = hasVerifiedDirection(trade) && 
+                            trade.entry_price != null && 
+                            trade.exit_price != null;
       
-      if (trade.open_side && trade.entry_price && trade.exit_price) {
+      let pnl: number | null = null;
+      let pnlPercent: number | null = null;
+      let pnlFormula: string | null = null;
+      let needsReconcile = true;
+      
+      if (canComputePnl && trade.open_side) {
         const calc = calculatePnl(
           trade.open_side,
           trade.entry_price,
@@ -113,12 +158,13 @@ export const tradeJournal = {
           trade.multiplier || 100,
           trade.fees || 0
         );
-        pnl = calc.pnl;
-        pnlPercent = calc.pnlPercent;
-        pnlFormula = calc.formula;
-      } else {
-        // Missing critical fields - mark for reconciliation
-        needsReconcile = true;
+        
+        if (calc) {
+          pnl = calc.pnl;
+          pnlPercent = calc.pnlPercent;
+          pnlFormula = calc.formula;
+          needsReconcile = false;
+        }
       }
 
       const { data, error } = await supabase
@@ -135,7 +181,7 @@ export const tradeJournal = {
           exit_price: trade.exit_price,
           entry_credit: trade.entry_credit,
           exit_debit: trade.exit_debit,
-          pnl,
+          pnl, // NULL if direction unknown
           pnl_percent: pnlPercent,
           exit_reason: trade.exit_reason,
           notes: trade.notes,
@@ -155,7 +201,7 @@ export const tradeJournal = {
       if (error) {
         // Check for unique constraint violation (duplicate close_order_id)
         if (error.code === '23505') {
-          console.warn('Duplicate trade detected (same close_order_id), skipping:', trade.symbol, trade.close_order_id);
+          console.warn('Duplicate trade detected (DB constraint):', trade.symbol, trade.close_order_id);
           return { success: true, duplicate: true };
         }
         throw error;
@@ -177,12 +223,16 @@ export const tradeJournal = {
     
     try {
       const tradesWithPnl = trades.map(trade => {
-        let pnl = trade.pnl;
-        let pnlPercent = trade.pnl_percent;
-        let pnlFormula = trade.pnl_formula;
-        let needsReconcile = false;
+        const canComputePnl = hasVerifiedDirection(trade) && 
+                              trade.entry_price != null && 
+                              trade.exit_price != null;
         
-        if (trade.open_side && trade.entry_price && trade.exit_price) {
+        let pnl: number | null = null;
+        let pnlPercent: number | null = null;
+        let pnlFormula: string | null = null;
+        let needsReconcile = true;
+        
+        if (canComputePnl && trade.open_side) {
           const calc = calculatePnl(
             trade.open_side,
             trade.entry_price,
@@ -191,11 +241,13 @@ export const tradeJournal = {
             trade.multiplier || 100,
             trade.fees || 0
           );
-          pnl = calc.pnl;
-          pnlPercent = calc.pnlPercent;
-          pnlFormula = calc.formula;
-        } else {
-          needsReconcile = true;
+          
+          if (calc) {
+            pnl = calc.pnl;
+            pnlPercent = calc.pnlPercent;
+            pnlFormula = calc.formula;
+            needsReconcile = false;
+          }
         }
         
         return {
@@ -288,15 +340,21 @@ export const tradeJournal = {
         if (trade.trade_group_id) {
           if (!processedGroupIds.has(trade.trade_group_id)) {
             const groupTrades = grouped.get(trade.trade_group_id)!;
+            // Only sum verified P&L (not null)
+            const verifiedLegs = groupTrades.filter(t => t.pnl != null && !t.needs_reconcile);
+            const totalPnl = verifiedLegs.reduce((sum, t) => sum + Number(t.pnl), 0);
+            const hasUnverified = groupTrades.some(t => t.needs_reconcile);
+            
             const group: TradeGroup = {
               groupId: trade.trade_group_id,
               trades: groupTrades.sort((a, b) => a.symbol.localeCompare(b.symbol)),
-              totalPnl: groupTrades.reduce((sum, t) => sum + Number(t.pnl), 0),
+              totalPnl,
               strategyName: groupTrades[0].strategy_name,
               strategyType: groupTrades[0].strategy_type,
               underlying: groupTrades[0].underlying,
               exitTime: groupTrades[0].exit_time,
               exitReason: groupTrades[0].exit_reason,
+              needsReconcile: hasUnverified,
             };
             result.push(group);
             processedGroupIds.add(trade.trade_group_id);
@@ -314,24 +372,30 @@ export const tradeJournal = {
   },
 
   /**
-   * Get stats - can toggle between counting by strategy group vs by individual leg
+   * Get stats - ONLY includes VERIFIED trades (needs_reconcile = false AND pnl IS NOT NULL)
+   * Excludes trades with unknown direction from all totals
    */
   async getTradeStats(countByLeg: boolean = false): Promise<TradeStats> {
     try {
       const { data, error } = await supabase
         .from('trades')
-        .select('pnl, trade_group_id');
+        .select('pnl, trade_group_id, needs_reconcile');
 
       if (error) throw error;
 
       const trades = data || [];
-      const totalLegs = trades.length;
+      
+      // Separate verified and unverified
+      const verifiedTrades = trades.filter(t => !t.needs_reconcile && t.pnl != null);
+      const unverifiedCount = trades.filter(t => t.needs_reconcile || t.pnl == null).length;
+      
+      const totalLegsVerified = verifiedTrades.length;
       
       if (countByLeg) {
-        // Count individual legs
-        const winners = trades.filter(t => Number(t.pnl) > 0);
-        const losers = trades.filter(t => Number(t.pnl) < 0);
-        const totalPnl = trades.reduce((sum, t) => sum + Number(t.pnl), 0);
+        // Count individual verified legs only
+        const winners = verifiedTrades.filter(t => Number(t.pnl) > 0);
+        const losers = verifiedTrades.filter(t => Number(t.pnl) < 0);
+        const totalPnl = verifiedTrades.reduce((sum, t) => sum + Number(t.pnl), 0);
         const avgWinner = winners.length > 0 
           ? winners.reduce((sum, t) => sum + Number(t.pnl), 0) / winners.length 
           : 0;
@@ -340,28 +404,42 @@ export const tradeJournal = {
           : 0;
 
         return {
-          totalTrades: totalLegs,
-          totalLegs,
+          totalTrades: totalLegsVerified,
+          totalLegs: totalLegsVerified,
           winningTrades: winners.length,
           losingTrades: losers.length,
           totalPnl,
-          winRate: totalLegs > 0 ? (winners.length / totalLegs) * 100 : 0,
+          winRate: totalLegsVerified > 0 ? (winners.length / totalLegsVerified) * 100 : 0,
           avgWinner,
           avgLoser,
+          needsReconcileCount: unverifiedCount,
+          verifiedCount: totalLegsVerified,
         };
       }
       
       // Group by trade_group_id (default - count strategies)
-      const grouped = new Map<string, number>();
+      // Only include groups where ALL legs are verified
+      const grouped = new Map<string, { pnl: number; hasUnverified: boolean }>();
       let singleTradeIndex = 0;
       
       trades.forEach(t => {
         const groupKey = t.trade_group_id || `single_${singleTradeIndex++}`;
-        const currentPnl = grouped.get(groupKey) || 0;
-        grouped.set(groupKey, currentPnl + Number(t.pnl));
+        const existing = grouped.get(groupKey) || { pnl: 0, hasUnverified: false };
+        
+        if (t.needs_reconcile || t.pnl == null) {
+          existing.hasUnverified = true;
+        } else {
+          existing.pnl += Number(t.pnl);
+        }
+        
+        grouped.set(groupKey, existing);
       });
 
-      const groupPnls = Array.from(grouped.values());
+      // Only count fully verified groups
+      const verifiedGroups = Array.from(grouped.entries())
+        .filter(([_, g]) => !g.hasUnverified);
+      
+      const groupPnls = verifiedGroups.map(([_, g]) => g.pnl);
       const winners = groupPnls.filter(pnl => pnl > 0);
       const losers = groupPnls.filter(pnl => pnl < 0);
       
@@ -373,15 +451,21 @@ export const tradeJournal = {
         ? losers.reduce((sum, pnl) => sum + pnl, 0) / losers.length 
         : 0;
 
+      // Count unverified groups
+      const unverifiedGroups = Array.from(grouped.entries())
+        .filter(([_, g]) => g.hasUnverified).length;
+
       return {
-        totalTrades: groupPnls.length,
-        totalLegs,
+        totalTrades: verifiedGroups.length,
+        totalLegs: totalLegsVerified,
         winningTrades: winners.length,
         losingTrades: losers.length,
         totalPnl,
-        winRate: groupPnls.length > 0 ? (winners.length / groupPnls.length) * 100 : 0,
+        winRate: verifiedGroups.length > 0 ? (winners.length / verifiedGroups.length) * 100 : 0,
         avgWinner,
         avgLoser,
+        needsReconcileCount: unverifiedGroups,
+        verifiedCount: verifiedGroups.length,
       };
     } catch (error) {
       console.error('Error fetching trade stats:', error);
@@ -394,6 +478,8 @@ export const tradeJournal = {
         winRate: 0,
         avgWinner: 0,
         avgLoser: 0,
+        needsReconcileCount: 0,
+        verifiedCount: 0,
       };
     }
   },
@@ -414,9 +500,64 @@ export const tradeJournal = {
   },
 
   /**
-   * Recalculate P&L for all trades using stored open_side, prices, qty
+   * Manual override: Set direction and recalculate P&L
+   * Use for trades that cannot be auto-reconciled
    */
-  async recalculatePnl(): Promise<{ success: boolean; updated: number; errors: string[] }> {
+  async manualOverride(
+    tradeId: string,
+    openSide: string,
+    closeSide: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      // Fetch the trade first
+      const { data: trade, error: fetchError } = await supabase
+        .from('trades')
+        .select('*')
+        .eq('id', tradeId)
+        .single();
+      
+      if (fetchError) throw fetchError;
+      if (!trade) return { success: false, error: 'Trade not found' };
+
+      // Calculate P&L with the manual override
+      const calc = calculatePnl(
+        openSide,
+        Number(trade.entry_price),
+        Number(trade.exit_price),
+        Number(trade.quantity),
+        Number(trade.multiplier) || 100,
+        Number(trade.fees) || 0
+      );
+
+      if (!calc) {
+        return { success: false, error: 'Cannot calculate P&L - missing prices' };
+      }
+
+      const { error: updateError } = await supabase
+        .from('trades')
+        .update({
+          open_side: openSide,
+          close_side: closeSide,
+          pnl: calc.pnl,
+          pnl_percent: calc.pnlPercent,
+          pnl_formula: calc.formula,
+          needs_reconcile: false,
+        })
+        .eq('id', tradeId);
+
+      if (updateError) throw updateError;
+      return { success: true };
+    } catch (error) {
+      console.error('Error in manual override:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
+  /**
+   * Recalculate P&L for trades with verified direction
+   * DOES NOT compute P&L if direction is unknown - marks needs_reconcile instead
+   */
+  async recalculatePnl(): Promise<{ success: boolean; updated: number; skipped: number; errors: string[] }> {
     try {
       const { data: trades, error } = await supabase
         .from('trades')
@@ -425,12 +566,24 @@ export const tradeJournal = {
       if (error) throw error;
 
       let updated = 0;
+      let skipped = 0;
       const errors: string[] = [];
 
       for (const trade of trades || []) {
-        if (!trade.open_side) {
-          errors.push(`Trade ${trade.id?.slice(0, 8)} (${trade.symbol}): missing open_side - marked needs_reconcile`);
-          await supabase.from('trades').update({ needs_reconcile: true }).eq('id', trade.id);
+        // Check if we have verified direction
+        if (!hasVerifiedDirection(trade)) {
+          // Mark as needs reconcile, set pnl to NULL
+          if (!trade.needs_reconcile || trade.pnl != null) {
+            await supabase.from('trades').update({ 
+              needs_reconcile: true,
+              pnl: null,
+              pnl_percent: null,
+              pnl_formula: null,
+            }).eq('id', trade.id);
+            skipped++;
+          } else {
+            skipped++;
+          }
           continue;
         }
 
@@ -442,6 +595,18 @@ export const tradeJournal = {
           Number(trade.multiplier) || 100,
           Number(trade.fees) || 0
         );
+
+        if (!calc) {
+          errors.push(`Trade ${trade.id?.slice(0, 8)} (${trade.symbol}): P&L calculation failed`);
+          await supabase.from('trades').update({ 
+            needs_reconcile: true,
+            pnl: null,
+            pnl_percent: null,
+            pnl_formula: null,
+          }).eq('id', trade.id);
+          skipped++;
+          continue;
+        }
 
         const { error: updateError } = await supabase
           .from('trades')
@@ -460,12 +625,13 @@ export const tradeJournal = {
         }
       }
 
-      return { success: true, updated, errors };
+      return { success: true, updated, skipped, errors };
     } catch (error) {
       console.error('Error recalculating P&L:', error);
       return { 
         success: false, 
         updated: 0, 
+        skipped: 0,
         errors: [error instanceof Error ? error.message : 'Unknown error'] 
       };
     }
@@ -496,7 +662,7 @@ export const tradeJournal = {
               symbol: trade.symbol,
               close_order_id: trade.close_order_id,
               exit_time: trade.exit_time,
-              pnl: Number(trade.pnl),
+              pnl: Number(trade.pnl || 0),
               reason: `Duplicate close_order_id (first: ${seenByOrderId.get(key)?.slice(0, 8)})`,
             });
           } else {
@@ -540,7 +706,7 @@ export const tradeJournal = {
   },
 
   /**
-   * Get trades that need reconciliation (missing open_side, close_order_id, etc.)
+   * Get trades that need reconciliation (missing verified direction)
    */
   async getTradesNeedingReconciliation(): Promise<TradeRecord[]> {
     try {
