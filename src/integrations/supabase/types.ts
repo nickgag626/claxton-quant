@@ -104,6 +104,7 @@ export type Database = {
           fees: number | null
           id: string
           multiplier: number | null
+          needs_reconcile: boolean | null
           notes: string | null
           open_order_id: string | null
           open_side: string | null
@@ -131,6 +132,7 @@ export type Database = {
           fees?: number | null
           id?: string
           multiplier?: number | null
+          needs_reconcile?: boolean | null
           notes?: string | null
           open_order_id?: string | null
           open_side?: string | null
@@ -158,6 +160,7 @@ export type Database = {
           fees?: number | null
           id?: string
           multiplier?: number | null
+          needs_reconcile?: boolean | null
           notes?: string | null
           open_order_id?: string | null
           open_side?: string | null

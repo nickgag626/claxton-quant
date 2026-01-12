@@ -251,6 +251,15 @@ export const tradierApi = {
     error?: string;
     debug?: any;
     clientRequestId?: string;
+    // Additional details for trade journaling
+    closeSide?: string;
+    closeQty?: number;
+    positionDetails?: {
+      symbol: string;
+      quantity: number;
+      costBasis: number;
+      side?: string;
+    };
   }> {
     const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
     const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/tradier-api`;
@@ -319,6 +328,14 @@ export const tradierApi = {
           orderId: data.order.id,
           debug: data?.debug,
           clientRequestId: data?.clientRequestId || clientRequestId,
+          closeSide: data?.debug?.instruction?.closeSide,
+          closeQty: data?.debug?.instruction?.closeQty,
+          positionDetails: data?.debug?.raw_position ? {
+            symbol: data.debug.raw_position.symbol,
+            quantity: data.debug.raw_position.quantity,
+            costBasis: data.debug.raw_position.cost_basis,
+            side: data.debug.raw_position.side,
+          } : undefined,
         };
       }
 
