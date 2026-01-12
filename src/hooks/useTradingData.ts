@@ -38,7 +38,8 @@ const defaultStrategies: Strategy[] = [
     entryConditions: {
       minDte: 0,
       maxDte: 0,
-      maxDelta: 0.10,
+      shortDeltaTarget: 0.10,
+      longDeltaTarget: 0.05,
       minPremium: 1.50,
       marketHoursOnly: true,
       startTime: '09:45',
@@ -49,6 +50,7 @@ const defaultStrategies: Strategy[] = [
       stopLossPercent: 100,
       timeStopTime: '15:45',
     },
+    sizing: { mode: 'fixed', fixedContracts: 1 },
   },
   {
     id: '2',
@@ -61,13 +63,15 @@ const defaultStrategies: Strategy[] = [
     entryConditions: {
       minDte: 5,
       maxDte: 7,
-      maxDelta: 0.16,
+      shortDeltaTarget: 0.16,
+      longDeltaTarget: 0.08,
       marketHoursOnly: true,
     },
     exitConditions: {
       profitTargetPercent: 50,
       stopLossPercent: 200,
     },
+    sizing: { mode: 'fixed', fixedContracts: 2 },
   },
   {
     id: '3',
@@ -80,7 +84,8 @@ const defaultStrategies: Strategy[] = [
     entryConditions: {
       minDte: 28,
       maxDte: 35,
-      maxDelta: 0.30,
+      shortDeltaTarget: 0.30,
+      longDeltaTarget: 0.15,
       minIvRank: 25,
       marketHoursOnly: true,
     },
@@ -89,6 +94,7 @@ const defaultStrategies: Strategy[] = [
       stopLossPercent: 200,
       timeStopDte: 7,
     },
+    sizing: { mode: 'fixed', fixedContracts: 5 },
   },
 ];
 

@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Plus, Trash2, Save, RotateCcw, Zap } from 'lucide-react';
+import { Plus, Trash2, Save, RotateCcw, Zap, Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -9,8 +9,21 @@ import { Switch } from '@/components/ui/switch';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
-import type { Strategy, StrategyType, EntryConditions, ExitConditions } from '@/types/trading';
+import type { 
+  Strategy, 
+  StrategyType, 
+  EntryConditions, 
+  ExitConditions, 
+  TrackedLeg, 
+  TrackedLegRole,
+  StrategySizing,
+  MAFilter,
+  MAFilterRule,
+  TrailingStopConfig 
+} from '@/types/trading';
 
 interface StrategyBuilderProps {
   onSaveStrategy: (strategy: Omit<Strategy, 'id'>) => void;
@@ -24,15 +37,18 @@ interface StrategyLeg {
   quantity: number;
 }
 
+// Updated presets with new delta fields
 const STRATEGY_PRESETS = {
   '0DTE Iron Condor (SPX)': {
     type: 'iron_condor' as StrategyType,
     underlying: 'SPX',
     dte: 0,
-    delta: 0.10,
+    shortDeltaTarget: 0.10,
+    longDeltaTarget: 0.05,
     wingWidth: 10,
     profitTarget: 50,
     stopLoss: 100,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'buy', strikeOffset: -10, quantity: 1 },
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -44,10 +60,12 @@ const STRATEGY_PRESETS = {
     type: 'iron_condor' as StrategyType,
     underlying: 'SPY',
     dte: 7,
-    delta: 0.16,
+    shortDeltaTarget: 0.16,
+    longDeltaTarget: 0.08,
     wingWidth: 5,
     profitTarget: 50,
     stopLoss: 200,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'buy', strikeOffset: -5, quantity: 1 },
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -59,10 +77,12 @@ const STRATEGY_PRESETS = {
     type: 'credit_put_spread' as StrategyType,
     underlying: 'SPY',
     dte: 30,
-    delta: 0.30,
+    shortDeltaTarget: 0.30,
+    longDeltaTarget: 0.15,
     wingWidth: 5,
     profitTarget: 50,
     stopLoss: 200,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
       { optionType: 'put', side: 'buy', strikeOffset: -5, quantity: 1 },
@@ -72,10 +92,12 @@ const STRATEGY_PRESETS = {
     type: 'straddle' as StrategyType,
     underlying: 'SPX',
     dte: 0,
-    delta: 0.50,
+    shortDeltaTarget: 0.50,
+    longDeltaTarget: undefined,
     wingWidth: 0,
     profitTarget: 25,
     stopLoss: 100,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
       { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -85,10 +107,12 @@ const STRATEGY_PRESETS = {
     type: 'strangle' as StrategyType,
     underlying: 'SPY',
     dte: 7,
-    delta: 0.16,
+    shortDeltaTarget: 0.16,
+    longDeltaTarget: undefined,
     wingWidth: 0,
     profitTarget: 50,
     stopLoss: 200,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
       { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -98,10 +122,12 @@ const STRATEGY_PRESETS = {
     type: 'butterfly' as StrategyType,
     underlying: 'SPX',
     dte: 7,
-    delta: 0.30,
+    shortDeltaTarget: 0.30,
+    longDeltaTarget: 0.15,
     wingWidth: 10,
     profitTarget: 75,
     stopLoss: 50,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'call', side: 'buy', strikeOffset: -10, quantity: 1 },
       { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 2 },
@@ -112,10 +138,12 @@ const STRATEGY_PRESETS = {
     type: 'iron_fly' as StrategyType,
     underlying: 'SPX',
     dte: 0,
-    delta: 0.50,
+    shortDeltaTarget: 0.50,
+    longDeltaTarget: 0.10,
     wingWidth: 20,
     profitTarget: 25,
     stopLoss: 100,
+    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
     legs: [
       { optionType: 'put', side: 'buy', strikeOffset: -20, quantity: 1 },
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -138,6 +166,60 @@ const STRATEGY_TYPES: { value: StrategyType; label: string; description: string 
 
 const UNDERLYINGS = ['SPX', 'NDX', 'SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA', 'NVDA', 'AMD'];
 
+// MA filter preset rules
+const MA_PRESETS: { label: string; rules: MAFilterRule[] }[] = [
+  { label: 'Price above SMA20', rules: [{ left: 'price', op: 'above', right: 'sma20' }] },
+  { label: 'Price above SMA50', rules: [{ left: 'price', op: 'above', right: 'sma50' }] },
+  { label: 'SMA50 above SMA200', rules: [{ left: 'sma50', op: 'above', right: 'sma200' }] },
+  { label: 'Price above SMA50 and SMA50 above SMA200', rules: [
+    { left: 'price', op: 'above', right: 'sma50' },
+    { left: 'sma50', op: 'above', right: 'sma200' }
+  ]},
+];
+
+// Get default tracked legs based on strategy type
+function getDefaultTrackedLegs(type: StrategyType): TrackedLeg[] {
+  switch (type) {
+    case 'iron_condor':
+    case 'iron_fly':
+      return [
+        { role: 'short_put', optionType: 'put', side: 'sell', closeOnExit: true },
+        { role: 'long_put', optionType: 'put', side: 'buy', closeOnExit: true },
+        { role: 'short_call', optionType: 'call', side: 'sell', closeOnExit: true },
+        { role: 'long_call', optionType: 'call', side: 'buy', closeOnExit: true },
+      ];
+    case 'credit_put_spread':
+      return [
+        { role: 'short_put', optionType: 'put', side: 'sell', closeOnExit: true },
+        { role: 'long_put', optionType: 'put', side: 'buy', closeOnExit: true },
+      ];
+    case 'credit_call_spread':
+      return [
+        { role: 'short_call', optionType: 'call', side: 'sell', closeOnExit: true },
+        { role: 'long_call', optionType: 'call', side: 'buy', closeOnExit: true },
+      ];
+    case 'strangle':
+    case 'straddle':
+      return [
+        { role: 'short_put', optionType: 'put', side: 'sell', closeOnExit: true },
+        { role: 'short_call', optionType: 'call', side: 'sell', closeOnExit: true },
+      ];
+    case 'butterfly':
+      return [
+        { role: 'long_call', optionType: 'call', side: 'buy', closeOnExit: true },
+        { role: 'short_call', optionType: 'call', side: 'sell', closeOnExit: true },
+        { role: 'long_call', optionType: 'call', side: 'buy', closeOnExit: true },
+      ];
+    default:
+      return [];
+  }
+}
+
+// Check if strategy type supports long delta (has wing/protective legs)
+function supportsLongDelta(type: StrategyType): boolean {
+  return ['iron_condor', 'iron_fly', 'credit_put_spread', 'credit_call_spread', 'butterfly'].includes(type);
+}
+
 export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProps) => {
   // Basic info
   const [name, setName] = useState('');
@@ -149,7 +231,8 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
   // Entry conditions
   const [minDte, setMinDte] = useState(0);
   const [maxDte, setMaxDte] = useState(0);
-  const [maxDelta, setMaxDelta] = useState(0.10);
+  const [shortDeltaTarget, setShortDeltaTarget] = useState(0.10);
+  const [longDeltaTarget, setLongDeltaTarget] = useState(0.05);
   const [wingWidth, setWingWidth] = useState(10);
   const [minPremium, setMinPremium] = useState(0);
   const [useIvFilter, setUseIvFilter] = useState(false);
@@ -160,13 +243,37 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
   const [endTime, setEndTime] = useState('15:30');
   const [is0dte, setIs0dte] = useState(false);
   
+  // MA Filter
+  const [useMaFilter, setUseMaFilter] = useState(false);
+  const [maFilterPreset, setMaFilterPreset] = useState<string>('');
+  const [maFilter, setMaFilter] = useState<MAFilter>({
+    enabled: false,
+    sma20: false,
+    sma50: false,
+    sma200: false,
+    rules: [],
+  });
+  
   // Exit conditions
   const [profitTarget, setProfitTarget] = useState(50);
   const [stopLoss, setStopLoss] = useState(100);
   const [timeStopDte, setTimeStopDte] = useState(0);
   const [timeStopTime, setTimeStopTime] = useState('15:45');
+  
+  // Advanced trailing stop
   const [useTrailingStop, setUseTrailingStop] = useState(false);
-  const [trailingStopPercent, setTrailingStopPercent] = useState(25);
+  const [trailingStopType, setTrailingStopType] = useState<'percent' | 'dollars'>('percent');
+  const [trailingStopAmount, setTrailingStopAmount] = useState(25);
+  const [trailingStopActivation, setTrailingStopActivation] = useState<number | undefined>(undefined);
+  const [trailingStopBasis, setTrailingStopBasis] = useState<'group' | 'tracked_legs' | 'short_legs'>('group');
+  
+  // Tracked legs
+  const [trackedLegs, setTrackedLegs] = useState<TrackedLeg[]>([]);
+  
+  // Sizing
+  const [sizingMode, setSizingMode] = useState<'fixed' | 'risk'>('fixed');
+  const [riskPerTrade, setRiskPerTrade] = useState(100);
+  const [maxContracts, setMaxContracts] = useState(10);
   
   // Custom legs
   const [customLegs, setCustomLegs] = useState<StrategyLeg[]>([]);
@@ -174,6 +281,18 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
   const [newLegSide, setNewLegSide] = useState<'buy' | 'sell'>('sell');
   const [newLegOffset, setNewLegOffset] = useState(0);
   const [newLegQty, setNewLegQty] = useState(1);
+
+  // Update tracked legs when strategy type changes
+  useEffect(() => {
+    setTrackedLegs(getDefaultTrackedLegs(strategyType));
+  }, [strategyType]);
+
+  // Update long delta when short delta changes (default to half)
+  useEffect(() => {
+    if (supportsLongDelta(strategyType)) {
+      setLongDeltaTarget(Math.max(0.02, shortDeltaTarget * 0.5));
+    }
+  }, [shortDeltaTarget, strategyType]);
 
   const loadPreset = (presetName: string) => {
     const preset = STRATEGY_PRESETS[presetName as keyof typeof STRATEGY_PRESETS];
@@ -184,12 +303,41 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
     setUnderlying(preset.underlying);
     setMinDte(preset.dte);
     setMaxDte(preset.dte);
-    setMaxDelta(preset.delta);
+    setShortDeltaTarget(preset.shortDeltaTarget);
+    setLongDeltaTarget(preset.longDeltaTarget ?? preset.shortDeltaTarget * 0.5);
     setWingWidth(preset.wingWidth);
     setProfitTarget(preset.profitTarget);
     setStopLoss(preset.stopLoss);
     setCustomLegs(preset.legs as StrategyLeg[]);
     setIs0dte(preset.dte === 0);
+    setSizingMode(preset.sizing.mode);
+    setPositionSize(preset.sizing.fixedContracts || 1);
+    setTrackedLegs(getDefaultTrackedLegs(preset.type));
+  };
+
+  const handleMaPresetChange = (presetLabel: string) => {
+    setMaFilterPreset(presetLabel);
+    const preset = MA_PRESETS.find(p => p.label === presetLabel);
+    if (preset) {
+      // Determine which SMAs are needed
+      const needsSma20 = preset.rules.some(r => r.left === 'sma20' || r.right === 'sma20');
+      const needsSma50 = preset.rules.some(r => r.left === 'sma50' || r.right === 'sma50');
+      const needsSma200 = preset.rules.some(r => r.left === 'sma200' || r.right === 'sma200');
+      
+      setMaFilter({
+        enabled: true,
+        sma20: needsSma20,
+        sma50: needsSma50,
+        sma200: needsSma200,
+        rules: preset.rules,
+      });
+    }
+  };
+
+  const toggleTrackedLeg = (role: TrackedLegRole, checked: boolean) => {
+    setTrackedLegs(prev => 
+      prev.map(leg => leg.role === role ? { ...leg, closeOnExit: checked } : leg)
+    );
   };
 
   const addCustomLeg = () => {
@@ -254,22 +402,36 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
     const entryConditions: EntryConditions = {
       minDte,
       maxDte,
-      maxDelta,
+      shortDeltaTarget,
+      longDeltaTarget: supportsLongDelta(strategyType) ? longDeltaTarget : undefined,
       minPremium: minPremium > 0 ? minPremium : undefined,
       minIvRank: useIvFilter ? minIvRank : undefined,
       maxIvRank: useIvFilter ? maxIvRank : undefined,
       marketHoursOnly,
       startTime: marketHoursOnly ? startTime : undefined,
       endTime: marketHoursOnly ? endTime : undefined,
+      maFilter: useMaFilter ? maFilter : undefined,
     };
+
+    const trailingStopConfig: TrailingStopConfig | undefined = useTrailingStop ? {
+      enabled: true,
+      type: trailingStopType,
+      amount: trailingStopAmount,
+      activationProfit: trailingStopActivation,
+      basis: trailingStopBasis,
+    } : undefined;
 
     const exitConditions: ExitConditions = {
       profitTargetPercent: profitTarget,
       stopLossPercent: stopLoss,
       timeStopDte,
       timeStopTime: is0dte ? timeStopTime : undefined,
-      trailingStopPercent: useTrailingStop ? trailingStopPercent : undefined,
+      trailingStop: trailingStopConfig,
     };
+
+    const sizing: StrategySizing = sizingMode === 'fixed' 
+      ? { mode: 'fixed', fixedContracts: positionSize }
+      : { mode: 'risk', riskPerTrade, maxContracts };
 
     const strategy: Omit<Strategy, 'id'> = {
       name: name || `${strategyType} - ${underlying}`,
@@ -277,9 +439,11 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
       underlying,
       enabled: true,
       maxPositions,
-      positionSize,
+      positionSize: sizingMode === 'fixed' ? positionSize : 1,
       entryConditions,
       exitConditions,
+      trackedLegs: trackedLegs.length > 0 ? trackedLegs : undefined,
+      sizing,
     };
 
     onSaveStrategy(strategy);
@@ -287,6 +451,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
 
   const strategyInfo = STRATEGY_TYPES.find(t => t.value === strategyType);
   const currentLegs = strategyType === 'custom' ? customLegs : buildLegsFromType();
+  const hasLongLegs = supportsLongDelta(strategyType);
 
   return (
     <motion.div
@@ -374,7 +539,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
               </div>
             </div>
 
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label className="text-xs text-muted-foreground">Strategy Name</Label>
                 <Input
@@ -395,17 +560,62 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
                   className="bg-secondary/50 border-border text-sm"
                 />
               </div>
-              <div className="space-y-2">
-                <Label className="text-xs text-muted-foreground">Contracts/Position</Label>
-                <Input
-                  type="number"
-                  value={positionSize}
-                  onChange={(e) => setPositionSize(parseInt(e.target.value) || 1)}
-                  min={1}
-                  max={100}
-                  className="bg-secondary/50 border-border text-sm"
-                />
+            </div>
+
+            {/* Position Sizing */}
+            <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs text-bloomberg-amber font-medium">Position Sizing</Label>
+                <div className="flex items-center gap-2">
+                  <span className={cn("text-xs", sizingMode === 'fixed' ? 'text-foreground' : 'text-muted-foreground')}>Fixed</span>
+                  <Switch
+                    checked={sizingMode === 'risk'}
+                    onCheckedChange={(checked) => setSizingMode(checked ? 'risk' : 'fixed')}
+                  />
+                  <span className={cn("text-xs", sizingMode === 'risk' ? 'text-foreground' : 'text-muted-foreground')}>Risk-based</span>
+                </div>
               </div>
+              
+              {sizingMode === 'fixed' ? (
+                <div className="space-y-2">
+                  <Label className="text-[10px] text-muted-foreground">Contracts per Position</Label>
+                  <Input
+                    type="number"
+                    value={positionSize}
+                    onChange={(e) => setPositionSize(parseInt(e.target.value) || 1)}
+                    min={1}
+                    max={100}
+                    className="bg-secondary/50 border-border text-sm"
+                  />
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <Label className="text-[10px] text-muted-foreground">Risk per Trade ($)</Label>
+                    <Input
+                      type="number"
+                      value={riskPerTrade}
+                      onChange={(e) => setRiskPerTrade(parseInt(e.target.value) || 100)}
+                      min={10}
+                      className="bg-secondary/50 border-border text-sm"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-[10px] text-muted-foreground">Max Contracts</Label>
+                    <Input
+                      type="number"
+                      value={maxContracts}
+                      onChange={(e) => setMaxContracts(parseInt(e.target.value) || 10)}
+                      min={1}
+                      max={100}
+                      className="bg-secondary/50 border-border text-sm"
+                    />
+                  </div>
+                  <div className="col-span-2 text-[10px] text-muted-foreground italic">
+                    Contracts calculated at entry based on max loss per contract
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -460,23 +670,39 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
 
               {/* Strike Selection */}
               <div className="space-y-3">
-                <Label className="text-xs text-bloomberg-amber font-medium">Strike Selection</Label>
+                <Label className="text-xs text-bloomberg-amber font-medium">Strike Selection (Delta)</Label>
                 <div className="space-y-2">
                   <div className="flex justify-between text-[10px]">
                     <span className="text-muted-foreground">Short Strike Delta</span>
-                    <span className="font-mono text-foreground">{maxDelta.toFixed(2)}</span>
+                    <span className="font-mono text-foreground">{shortDeltaTarget.toFixed(2)}</span>
                   </div>
                   <Slider
-                    value={[maxDelta * 100]}
-                    onValueChange={([v]) => setMaxDelta(v / 100)}
+                    value={[shortDeltaTarget * 100]}
+                    onValueChange={([v]) => setShortDeltaTarget(v / 100)}
                     min={5}
                     max={50}
                     step={1}
                     className="w-full"
                   />
                 </div>
+                {hasLongLegs && (
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-[10px]">
+                      <span className="text-muted-foreground">Long Strike Delta</span>
+                      <span className="font-mono text-foreground">{longDeltaTarget.toFixed(2)}</span>
+                    </div>
+                    <Slider
+                      value={[longDeltaTarget * 100]}
+                      onValueChange={([v]) => setLongDeltaTarget(Math.max(0.02, v / 100))}
+                      min={2}
+                      max={Math.round(shortDeltaTarget * 100)}
+                      step={1}
+                      className="w-full"
+                    />
+                  </div>
+                )}
                 <div className="space-y-1">
-                  <Label className="text-[10px] text-muted-foreground">Wing Width (points)</Label>
+                  <Label className="text-[10px] text-muted-foreground">Wing Width (points fallback)</Label>
                   <Input
                     type="number"
                     value={wingWidth}
@@ -537,6 +763,112 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
                 </div>
               </div>
             </div>
+
+            {/* Moving Averages Filter */}
+            <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs text-bloomberg-amber font-medium flex items-center gap-1">
+                  Moving Averages Filter
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Info className="w-3 h-3 text-muted-foreground" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">Filter entries based on price vs moving average relationships</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </Label>
+                <Switch
+                  checked={useMaFilter}
+                  onCheckedChange={setUseMaFilter}
+                />
+              </div>
+              
+              {useMaFilter && (
+                <div className="space-y-3">
+                  <div className="flex gap-4">
+                    <div className="flex items-center gap-2">
+                      <Checkbox 
+                        id="sma20" 
+                        checked={maFilter.sma20} 
+                        onCheckedChange={(checked) => setMaFilter(prev => ({ ...prev, sma20: !!checked }))}
+                      />
+                      <Label htmlFor="sma20" className="text-xs">SMA20</Label>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox 
+                        id="sma50" 
+                        checked={maFilter.sma50} 
+                        onCheckedChange={(checked) => setMaFilter(prev => ({ ...prev, sma50: !!checked }))}
+                      />
+                      <Label htmlFor="sma50" className="text-xs">SMA50</Label>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Checkbox 
+                        id="sma200" 
+                        checked={maFilter.sma200} 
+                        onCheckedChange={(checked) => setMaFilter(prev => ({ ...prev, sma200: !!checked }))}
+                      />
+                      <Label htmlFor="sma200" className="text-xs">SMA200</Label>
+                    </div>
+                  </div>
+                  
+                  <div className="space-y-1">
+                    <Label className="text-[10px] text-muted-foreground">Filter Rule Preset</Label>
+                    <Select value={maFilterPreset} onValueChange={handleMaPresetChange}>
+                      <SelectTrigger className="bg-secondary/50 border-border text-xs">
+                        <SelectValue placeholder="Select rule..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {MA_PRESETS.map((preset) => (
+                          <SelectItem key={preset.label} value={preset.label}>
+                            {preset.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Tracked Legs */}
+            {trackedLegs.length > 0 && (
+              <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
+                <Label className="text-xs text-bloomberg-amber font-medium flex items-center gap-1">
+                  Tracked Legs (for exits & journaling)
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Info className="w-3 h-3 text-muted-foreground" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">Select which legs to track for exit calculations and trade journaling</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </Label>
+                <div className="flex flex-wrap gap-3">
+                  {trackedLegs.map((leg) => (
+                    <div key={leg.role} className="flex items-center gap-2">
+                      <Checkbox 
+                        id={leg.role}
+                        checked={leg.closeOnExit}
+                        onCheckedChange={(checked) => toggleTrackedLeg(leg.role, !!checked)}
+                      />
+                      <Label htmlFor={leg.role} className={cn(
+                        "text-xs font-mono",
+                        leg.side === 'sell' ? 'text-panic-red' : 'text-trading-green'
+                      )}>
+                        {leg.role.replace('_', ' ')}
+                      </Label>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Step 3: Exit Conditions */}
@@ -602,9 +934,9 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
                 )}
               </div>
 
-              {/* Advanced Exits */}
+              {/* Advanced Trailing Stop */}
               <div className="space-y-3">
-                <Label className="text-xs text-bloomberg-amber font-medium">Advanced Exits</Label>
+                <Label className="text-xs text-bloomberg-amber font-medium">Trailing Stop</Label>
                 <div className="flex items-center gap-2">
                   <Switch
                     checked={useTrailingStop}
@@ -614,17 +946,53 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
                 </div>
                 {useTrailingStop && (
                   <div className="space-y-2">
-                    <div className="flex justify-between text-[10px]">
-                      <span className="text-muted-foreground">Trailing Stop</span>
-                      <span className="font-mono">{trailingStopPercent}%</span>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <Label className="text-[10px] text-muted-foreground">Type</Label>
+                        <Select value={trailingStopType} onValueChange={(v) => setTrailingStopType(v as 'percent' | 'dollars')}>
+                          <SelectTrigger className="bg-secondary/50 border-border text-xs h-8">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="percent">Percent</SelectItem>
+                            <SelectItem value="dollars">Dollars</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1">
+                        <Label className="text-[10px] text-muted-foreground">Amount</Label>
+                        <Input
+                          type="number"
+                          value={trailingStopAmount}
+                          onChange={(e) => setTrailingStopAmount(parseFloat(e.target.value) || 0)}
+                          min={1}
+                          className="bg-secondary/50 border-border text-xs h-8"
+                        />
+                      </div>
                     </div>
-                    <Slider
-                      value={[trailingStopPercent]}
-                      onValueChange={([v]) => setTrailingStopPercent(v)}
-                      min={10}
-                      max={50}
-                      step={5}
-                    />
+                    <div className="space-y-1">
+                      <Label className="text-[10px] text-muted-foreground">Activation Profit (optional, %)</Label>
+                      <Input
+                        type="number"
+                        value={trailingStopActivation ?? ''}
+                        onChange={(e) => setTrailingStopActivation(e.target.value ? parseFloat(e.target.value) : undefined)}
+                        placeholder="e.g. 20"
+                        className="bg-secondary/50 border-border text-xs h-8"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-[10px] text-muted-foreground">Basis</Label>
+                      <Select value={trailingStopBasis} onValueChange={(v) => setTrailingStopBasis(v as any)}>
+                        <SelectTrigger className="bg-secondary/50 border-border text-xs h-8">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="group">Entire Group</SelectItem>
+                          <SelectItem value="tracked_legs">Tracked Legs</SelectItem>
+                          <SelectItem value="short_legs">Short Legs Only</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
                   </div>
                 )}
               </div>
