@@ -563,6 +563,7 @@ export const TradeJournal = () => {
     needsReconcileCount: 0,
     verifiedCount: 0,
   });
+  const [todayRealized, setTodayRealized] = useState<{ pnl: number; count: number }>({ pnl: 0, count: 0 });
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -609,14 +610,16 @@ export const TradeJournal = () => {
       setIsRefreshing(true);
     }
     
-    const [tradesData, statsData] = await Promise.all([
+    const [tradesData, statsData, todayData] = await Promise.all([
       tradeJournal.getGroupedTrades(),
       tradeJournal.getTradeStats(countByLeg),
+      tradeJournal.getRealizedTodayPnl(),
     ]);
     
     // Update data without clearing first to prevent flicker
     setTrades(tradesData);
     setStats(statsData);
+    setTodayRealized({ pnl: todayData.realized, count: todayData.tradeCount });
     
     if (!hasLoadedOnce.current) {
       hasLoadedOnce.current = true;
@@ -798,6 +801,13 @@ export const TradeJournal = () => {
           <div className="flex items-center gap-4">
             <div className="flex gap-3 text-[10px]">
               <span className="text-muted-foreground">
+                Today (ET): <span className={cn(
+                  todayRealized.pnl >= 0 ? 'text-trading-green' : 'text-panic-red'
+                )}>${todayRealized.pnl.toFixed(2)}</span>
+                <span className="text-muted-foreground/60 ml-0.5">({todayRealized.count} trades)</span>
+              </span>
+              <span className="text-muted-foreground mx-1">|</span>
+              <span className="text-muted-foreground">
                 Verified: <span className="text-trading-green">{stats.verifiedCount}</span>
                 {stats.needsReconcileCount > 0 && (
                   <span className="text-bloomberg-amber ml-1">({stats.needsReconcileCount} unverified)</span>
@@ -809,10 +819,9 @@ export const TradeJournal = () => {
                 )}>{stats.winRate.toFixed(1)}%</span>
               </span>
               <span className="text-muted-foreground">
-                Total P&L: <span className={cn(
+                All-Time P&L: <span className={cn(
                   stats.totalPnl >= 0 ? 'text-trading-green' : 'text-panic-red'
                 )}>${stats.totalPnl.toFixed(2)}</span>
-                <span className="text-muted-foreground/60 ml-0.5">(verified only)</span>
               </span>
             </div>
             {isExpanded ? (
