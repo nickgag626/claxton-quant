@@ -126,18 +126,28 @@ serve(async (req) => {
           );
         }
         
-        // Determine order side (buy to close short, sell to close long)
+        // Tradier reports quantity as:
+        // - POSITIVE for LONG positions (bought options) -> need to sell_to_close
+        // - NEGATIVE for SHORT positions (sold options) -> need to buy_to_close
+        // The quantity passed here is the raw Tradier quantity
         const side = positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close';
         const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
         
         // Check if this is an OCC option symbol (e.g., SPY260112C00700000)
         const isOccOption = /^[A-Z]+\d{6}[CP]\d{8}$/.test(positionSymbol);
         
-        console.log('Closing position:', positionSymbol, 'qty:', positionQuantity, 'side:', side, 'isOption:', isOccOption);
+        // Extract underlying from OCC symbol (e.g., SPY260112C00700000 -> SPY)
+        let underlying = positionSymbol;
+        if (isOccOption) {
+          const match = positionSymbol.match(/^([A-Z]+)\d{6}[CP]\d{8}$/);
+          underlying = match ? match[1] : positionSymbol;
+        }
+        
+        console.log('Closing position:', positionSymbol, 'underlying:', underlying, 'qty:', positionQuantity, 'side:', side, 'isOption:', isOccOption);
         
         const orderParams: Record<string, string> = {
           class: isOccOption ? 'option' : 'equity',
-          symbol: isOccOption ? positionSymbol.replace(/\d{6}[CP]\d{8}$/, '') : positionSymbol,
+          symbol: underlying,
           side: side,
           quantity: Math.abs(positionQuantity).toString(),
           type: 'market',

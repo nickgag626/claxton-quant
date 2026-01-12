@@ -361,15 +361,43 @@ export const useTradingData = () => {
       const parsed = parseOptionSymbol(position.symbol);
       const stratInfo = strategyPositions.get(position.symbol);
       
-      // Calculate P&L properly: for options, costBasis is total cost, currentValue is current market value
-      // P&L = currentValue - costBasis (positive means profit)
-      const pnl = position.currentValue - position.costBasis;
-      const entryPrice = Math.abs(position.costBasis / position.quantity);
-      const exitPrice = Math.abs(position.currentValue / position.quantity);
+      // Calculate P&L properly for options:
+      // - costBasis from Tradier is NEGATIVE for short positions (credit received)
+      // - costBasis from Tradier is POSITIVE for long positions (debit paid)
+      // - currentValue is always the current market value (positive)
+      // 
+      // For SHORT positions (sold options): P&L = costBasis (negative = credit) + currentValue (cost to close)
+      //   e.g., sold for $1 credit (costBasis=-100), now worth $0.50 (currentValue=50): P&L = -100 + 50 = -50? NO!
+      //   Actually: P&L = credit received - cost to close = abs(costBasis) - currentValue
+      // 
+      // For LONG positions (bought options): P&L = currentValue - costBasis
+      //   e.g., bought for $1 (costBasis=100), now worth $1.50 (currentValue=150): P&L = 150 - 100 = 50 profit
+      
+      const isShortPosition = position.quantity < 0 || position.costBasis < 0;
+      let pnl: number;
+      let entryPrice: number;
+      let exitPrice: number;
+      
+      if (isShortPosition) {
+        // Short position: credit received minus cost to buy back
+        const creditReceived = Math.abs(position.costBasis);
+        const costToClose = position.currentValue;
+        pnl = creditReceived - costToClose;
+        entryPrice = creditReceived / Math.abs(position.quantity) / 100; // Per share price
+        exitPrice = costToClose / Math.abs(position.quantity) / 100;
+      } else {
+        // Long position: current value minus cost
+        pnl = position.currentValue - position.costBasis;
+        entryPrice = position.costBasis / Math.abs(position.quantity) / 100;
+        exitPrice = position.currentValue / Math.abs(position.quantity) / 100;
+      }
       
       console.log('Saving trade to journal:', {
         symbol: position.symbol,
         underlying: parsed?.underlying || position.underlying,
+        isShortPosition,
+        costBasis: position.costBasis,
+        currentValue: position.currentValue,
         pnl,
         entryPrice,
         exitPrice,
@@ -459,9 +487,23 @@ export const useTradingData = () => {
             const parsed = parseOptionSymbol(exitSignal.symbol);
             const stratInfo = strategyPositions.get(exitSignal.symbol);
             
-            const pnl = position.currentValue - position.costBasis;
-            const entryPrice = Math.abs(position.costBasis / position.quantity);
-            const exitPrice = Math.abs(position.currentValue / position.quantity);
+            // Calculate P&L properly for short vs long positions
+            const isShortPosition = position.quantity < 0 || position.costBasis < 0;
+            let pnl: number;
+            let entryPrice: number;
+            let exitPrice: number;
+            
+            if (isShortPosition) {
+              const creditReceived = Math.abs(position.costBasis);
+              const costToClose = position.currentValue;
+              pnl = creditReceived - costToClose;
+              entryPrice = creditReceived / Math.abs(position.quantity) / 100;
+              exitPrice = costToClose / Math.abs(position.quantity) / 100;
+            } else {
+              pnl = position.currentValue - position.costBasis;
+              entryPrice = position.costBasis / Math.abs(position.quantity) / 100;
+              exitPrice = position.currentValue / Math.abs(position.quantity) / 100;
+            }
             
             try {
               await tradeJournal.saveTrade({
