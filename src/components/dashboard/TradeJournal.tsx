@@ -34,7 +34,6 @@ interface TradeDetailsRowProps {
   onSaveNotes: (tradeId: string) => void;
   onCancelEdit: () => void;
   onNotesChange: (notes: string) => void;
-  onManualOverride: (tradeId: string, openSide: string, closeSide: string) => void;
 }
 
 const TradeDetailsRow = ({ 
@@ -45,12 +44,7 @@ const TradeDetailsRow = ({
   onSaveNotes, 
   onCancelEdit,
   onNotesChange,
-  onManualOverride,
 }: TradeDetailsRowProps) => {
-  const [isEditingDirection, setIsEditingDirection] = useState(false);
-  const [editOpenSide, setEditOpenSide] = useState(trade.open_side || '');
-  const [editCloseSide, setEditCloseSide] = useState(trade.close_side || '');
-
   const entryTime = trade.entry_time ? new Date(trade.entry_time) : null;
   const exitTime = trade.exit_time ? new Date(trade.exit_time) : null;
   const duration = entryTime && exitTime 
@@ -68,13 +62,6 @@ const TradeDetailsRow = ({
     return `${days}d ${remainingHours}h`;
   };
 
-  const handleSaveDirection = () => {
-    if (editOpenSide && editCloseSide && trade.id) {
-      onManualOverride(trade.id, editOpenSide, editCloseSide);
-      setIsEditingDirection(false);
-    }
-  };
-
   const isVerified = hasVerifiedDirection(trade);
   const pnlDisplay = trade.pnl != null ? trade.pnl : null;
 
@@ -87,81 +74,15 @@ const TradeDetailsRow = ({
     >
       <TableCell colSpan={6} className="p-0">
         <div className="p-4 space-y-4">
-          {/* Reconciliation Warning */}
+          {/* Reconciliation Warning - No manual override, must use Reconcile from Tradier */}
           {trade.needs_reconcile && (
-            <div className="flex items-center justify-between gap-2 p-3 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded">
-              <div className="flex items-center gap-2 text-xs text-bloomberg-amber">
-                <AlertTriangle className="h-4 w-4" />
-                <span className="font-medium">Needs reconcile – direction unknown</span>
-                <span className="text-bloomberg-amber/70">
-                  (Missing: {!trade.open_side ? 'open_side ' : ''}{!trade.close_side ? 'close_side ' : ''}{!trade.close_order_id ? 'close_order_id' : ''})
-                </span>
-              </div>
-              {!isEditingDirection && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-6 text-xs border-bloomberg-amber/50 text-bloomberg-amber hover:bg-bloomberg-amber/20"
-                  onClick={() => setIsEditingDirection(true)}
-                >
-                  <Edit2 className="h-3 w-3 mr-1" />
-                  Manual Override
-                </Button>
-              )}
-            </div>
-          )}
-
-          {/* Manual Direction Override Form */}
-          {isEditingDirection && (
-            <div className="p-3 bg-primary/10 border border-primary/30 rounded space-y-3">
-              <div className="text-xs font-medium text-primary">Manual Direction Override</div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-1">
-                  <Label className="text-[10px] text-muted-foreground uppercase">Open Side</Label>
-                  <Select value={editOpenSide} onValueChange={setEditOpenSide}>
-                    <SelectTrigger className="h-8 text-xs">
-                      <SelectValue placeholder="Select open side" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="sell_to_open">sell_to_open (Credit)</SelectItem>
-                      <SelectItem value="buy_to_open">buy_to_open (Debit)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-[10px] text-muted-foreground uppercase">Close Side</Label>
-                  <Select value={editCloseSide} onValueChange={setEditCloseSide}>
-                    <SelectTrigger className="h-8 text-xs">
-                      <SelectValue placeholder="Select close side" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="buy_to_close">buy_to_close</SelectItem>
-                      <SelectItem value="sell_to_close">sell_to_close</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-              <div className="flex justify-end gap-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={() => setIsEditingDirection(false)}
-                >
-                  <X className="h-3 w-3 mr-1" />
-                  Cancel
-                </Button>
-                <Button
-                  variant="default"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={handleSaveDirection}
-                  disabled={!editOpenSide || !editCloseSide}
-                >
-                  <Save className="h-3 w-3 mr-1" />
-                  Save & Recalculate P&L
-                </Button>
-              </div>
+            <div className="flex items-center gap-2 p-3 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded">
+              <AlertTriangle className="h-4 w-4 text-bloomberg-amber" />
+              <span className="text-xs text-bloomberg-amber font-medium">Needs reconcile – direction unknown</span>
+              <span className="text-xs text-bloomberg-amber/70">
+                (Missing: {!trade.open_side ? 'open_side ' : ''}{!trade.close_side ? 'close_side ' : ''}{!trade.close_order_id ? 'close_order_id' : ''})
+              </span>
+              <span className="text-xs text-muted-foreground ml-2">Use "Reconcile from Tradier" to auto-verify</span>
             </div>
           )}
 

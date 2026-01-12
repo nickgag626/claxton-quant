@@ -499,59 +499,7 @@ export const tradeJournal = {
     }
   },
 
-  /**
-   * Manual override: Set direction and recalculate P&L
-   * Use for trades that cannot be auto-reconciled
-   */
-  async manualOverride(
-    tradeId: string,
-    openSide: string,
-    closeSide: string
-  ): Promise<{ success: boolean; error?: string }> {
-    try {
-      // Fetch the trade first
-      const { data: trade, error: fetchError } = await supabase
-        .from('trades')
-        .select('*')
-        .eq('id', tradeId)
-        .single();
-      
-      if (fetchError) throw fetchError;
-      if (!trade) return { success: false, error: 'Trade not found' };
-
-      // Calculate P&L with the manual override
-      const calc = calculatePnl(
-        openSide,
-        Number(trade.entry_price),
-        Number(trade.exit_price),
-        Number(trade.quantity),
-        Number(trade.multiplier) || 100,
-        Number(trade.fees) || 0
-      );
-
-      if (!calc) {
-        return { success: false, error: 'Cannot calculate P&L - missing prices' };
-      }
-
-      const { error: updateError } = await supabase
-        .from('trades')
-        .update({
-          open_side: openSide,
-          close_side: closeSide,
-          pnl: calc.pnl,
-          pnl_percent: calc.pnlPercent,
-          pnl_formula: calc.formula,
-          needs_reconcile: false,
-        })
-        .eq('id', tradeId);
-
-      if (updateError) throw updateError;
-      return { success: true };
-    } catch (error) {
-      console.error('Error in manual override:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
-  },
+  // manualOverride has been REMOVED - direction must be inferred automatically from Tradier executions
 
   /**
    * Recalculate P&L for trades with verified direction

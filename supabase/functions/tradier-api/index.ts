@@ -16,6 +16,7 @@ interface TradierRequest {
     | "chain"
     | "clock"
     | "orders"
+    | "order_detail"
     | "close_position";
   symbols?: string[];
   symbol?: string;
@@ -26,9 +27,10 @@ interface TradierRequest {
   // kept for backwards compatibility; close logic derives from live Tradier position
   positionQuantity?: number;
 
-  // orders (for reconciliation)
+  // orders / order_detail (for reconciliation)
   startDate?: string;
   endDate?: string;
+  orderId?: string; // For fetching specific order details
 
   // debug / idempotency
   dryRun?: boolean;
@@ -332,6 +334,23 @@ serve(async (req) => {
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
         console.log("Orders response received, count:", Array.isArray(data?.orders?.order) ? data.orders.order.length : (data?.orders?.order ? 1 : 0));
+        break;
+      }
+
+      case "order_detail": {
+        // Fetch specific order details with leg info (includes fill prices)
+        const orderId = body.orderId;
+        if (!orderId) {
+          return new Response(JSON.stringify({ error: "orderId required for order_detail" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
+        }
+        const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
+        console.log("Fetching order detail:", url);
+        response = await fetch(url, { headers });
+        data = await safeParseTradierResponse(response);
+        console.log("Order detail response:", JSON.stringify(data));
         break;
       }
 
