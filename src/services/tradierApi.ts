@@ -206,22 +206,85 @@ export const tradierApi = {
     }
   },
 
-  async closePosition(symbol: string, quantity: number): Promise<{ success: boolean; orderId?: string; error?: string }> {
+  async closePosition(
+    symbol: string,
+    quantity: number,
+    opts?: {
+      dryRun?: boolean;
+      debug?: boolean;
+      clientRequestId?: string;
+      trade_group_id?: string;
+      source?: 'manual_ui' | 'bot_engine' | string;
+    }
+  ): Promise<{
+    success: boolean;
+    dryRun?: boolean;
+    skipped?: boolean;
+    orderId?: string;
+    error?: string;
+    debug?: any;
+    clientRequestId?: string;
+  }> {
     try {
+      const clientRequestId = opts?.clientRequestId;
+
       const { data, error } = await supabase.functions.invoke('tradier-api', {
-        body: { action: 'close_position', positionSymbol: symbol, positionQuantity: quantity },
+        body: {
+          action: 'close_position',
+          positionSymbol: symbol,
+          positionQuantity: quantity,
+          dryRun: opts?.dryRun,
+          debug: opts?.debug,
+          clientRequestId,
+          trade_group_id: opts?.trade_group_id,
+          source: opts?.source,
+        },
+        headers: clientRequestId ? { 'x-client-request-id': clientRequestId } : undefined,
       });
 
       if (error) throw error;
-      
-      if (data?.order?.id) {
-        return { success: true, orderId: data.order.id };
+
+      if (data?.skipped) {
+        return {
+          success: false,
+          skipped: true,
+          error: `SKIP: ${data?.reason || 'cooldown/lock'}`,
+          debug: data?.debug,
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
       }
-      
-      return { success: false, error: data?.errors?.error || 'Order failed' };
+
+      if (data?.dry_run) {
+        return {
+          success: true,
+          dryRun: true,
+          orderId: undefined,
+          debug: data?.debug || { planned_order: data?.planned_order },
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
+      }
+
+      if (data?.order?.id) {
+        return {
+          success: true,
+          orderId: data.order.id,
+          debug: data?.debug,
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
+      }
+
+      return {
+        success: false,
+        error: data?.errors?.error || data?.error || 'Order failed',
+        debug: data?.debug,
+        clientRequestId: data?.clientRequestId || clientRequestId,
+      };
     } catch (error) {
       console.error('Error closing position:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
     }
   },
 

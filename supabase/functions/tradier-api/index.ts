@@ -17,11 +17,18 @@ interface TradierRequest {
   symbols?: string[];
   symbol?: string;
   expiration?: string;
+
+  // close_position
   positionSymbol?: string;
   // kept for backwards compatibility; close logic derives from live Tradier position
   positionQuantity?: number;
+
+  // debug / idempotency
   dryRun?: boolean;
   debug?: boolean;
+  clientRequestId?: string;
+  trade_group_id?: string;
+  source?: "manual_ui" | "bot_engine" | string;
 }
 
 type TradierPosition = Record<string, unknown> & {
@@ -170,15 +177,21 @@ serve(async (req) => {
       });
     }
 
-    const {
-      action,
-      symbols,
-      symbol,
-      expiration,
-      positionSymbol,
-      dryRun,
-      debug,
-    }: TradierRequest = await req.json();
+    const body = (await req.json()) as TradierRequest;
+
+    const action = body.action;
+    const symbols = body.symbols;
+    const symbol = body.symbol;
+    const expiration = body.expiration;
+    const positionSymbol = body.positionSymbol;
+
+    // debug fields
+    const dryRun = !!body.dryRun;
+    const debug = !!body.debug;
+    const clientRequestId =
+      body.clientRequestId || req.headers.get("x-client-request-id") || crypto.randomUUID();
+    const trade_group_id = body.trade_group_id;
+    const source = body.source || "unknown";
 
     // Use sandbox for paper trading - change to api.tradier.com for live
     const baseUrl = "https://sandbox.tradier.com/v1";
@@ -281,17 +294,28 @@ serve(async (req) => {
         const lockKey = `${accountId}:${positionSymbol}`;
         const now = Date.now();
         const lock = closeLocks.get(lockKey);
+
+        console.log("CLOSE_REQUEST", {
+          source,
+          clientRequestId,
+          trade_group_id,
+          symbol: positionSymbol,
+          lockKey,
+          dryRun,
+          debug,
+        });
+
         if (lock?.inFlight) {
-          console.log("SKIP: cooldown/lock (in-flight)", { lockKey });
+          console.log("SKIP: cooldown/lock (in-flight)", { source, clientRequestId, lockKey });
           return new Response(
-            JSON.stringify({ skipped: true, reason: "lock_in_flight" }),
+            JSON.stringify({ skipped: true, reason: "lock_in_flight", clientRequestId }),
             { headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
         if (lock?.lastAcceptedAt && now - lock.lastAcceptedAt < CLOSE_COOLDOWN_MS) {
-          console.log("SKIP: cooldown/lock (recently accepted)", { lockKey });
+          console.log("SKIP: cooldown/lock (recently accepted)", { source, clientRequestId, lockKey });
           return new Response(
-            JSON.stringify({ skipped: true, reason: "cooldown" }),
+            JSON.stringify({ skipped: true, reason: "cooldown", clientRequestId }),
             { headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
@@ -313,11 +337,13 @@ serve(async (req) => {
           const matched = posArray.find((p) => String(p.symbol) === positionSymbol);
           if (!matched) {
             console.log("CLOSE_DECISION: position_not_found", {
+              source,
+              clientRequestId,
               positionSymbol,
               positionsCount: posArray.length,
             });
             return new Response(
-              JSON.stringify({ error: "Position not found", symbol: positionSymbol }),
+              JSON.stringify({ error: "Position not found", symbol: positionSymbol, clientRequestId }),
               { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
             );
           }
@@ -332,6 +358,8 @@ serve(async (req) => {
             quoteType = (Array.isArray(q) ? q[0]?.type : q?.type) as string | undefined;
           } catch (e) {
             console.warn("WARN: failed to fetch quote for instrument_type", {
+              source,
+              clientRequestId,
               positionSymbol,
               error: e instanceof Error ? e.message : String(e),
             });
@@ -340,9 +368,15 @@ serve(async (req) => {
           const qty = normalizeNumber(matched.quantity);
           const costBasis = normalizeNumber(matched.cost_basis);
           const side = String(matched.side || "");
-          const instrument_type = String(matched.instrument_type || quoteType || (isOccOptionSymbol(positionSymbol) ? "option" : "equity"));
+          const instrument_type = String(
+            matched.instrument_type ||
+              quoteType ||
+              (isOccOptionSymbol(positionSymbol) ? "option" : "equity"),
+          );
 
           console.log("CLOSE_RAW_POSITION", {
+            source,
+            clientRequestId,
             symbol: positionSymbol,
             instrument_type,
             quantity: qty,
@@ -353,16 +387,9 @@ serve(async (req) => {
 
           const instruction = getCloseInstruction(matched, positionSymbol, quoteType);
           if (!instruction.ok) {
-            console.log("CLOSE_DECISION_ERROR", instruction);
-            return new Response(JSON.stringify({ error: instruction.error, debug: { instruction } }), {
-              status: 400,
-              headers: { ...corsHeaders, "Content-Type": "application/json" },
-            });
-          }
-
-          if (!Number.isFinite(instruction.closeQty) || instruction.closeQty <= 0) {
+            console.log("CLOSE_DECISION_ERROR", { source, clientRequestId, ...instruction });
             return new Response(
-              JSON.stringify({ error: "Invalid close quantity", debug: { instruction } }),
+              JSON.stringify({ error: instruction.error, clientRequestId, debug: { instruction } }),
               { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
             );
           }
@@ -370,14 +397,16 @@ serve(async (req) => {
           // 2) Never exceed position size
           const positionSize = Math.abs(qty);
           const closeQty = Math.min(instruction.closeQty, positionSize);
-          if (closeQty <= 0) {
+          if (!Number.isFinite(closeQty) || closeQty <= 0) {
             console.log("CLOSE_DECISION: zero_position_size", {
+              source,
+              clientRequestId,
               positionSymbol,
               qty,
               instruction,
             });
             return new Response(
-              JSON.stringify({ error: "Position size is zero", debug: { instruction } }),
+              JSON.stringify({ error: "Position size is zero", clientRequestId, debug: { instruction } }),
               { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
             );
           }
@@ -401,31 +430,36 @@ serve(async (req) => {
           }
 
           console.log("CLOSE_DECISION", {
+            source,
+            clientRequestId,
+            trade_group_id,
             symbol: positionSymbol,
             instrument_type: instruction.instrument_type,
             side: instruction.side,
             computed: instruction,
             orderParams,
-            dryRun: !!dryRun,
+            dryRun,
           });
 
           if (dryRun) {
             closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
-            return new Response(
-              JSON.stringify({
-                dry_run: true,
-                planned_order: orderParams,
-                debug: debug
-                  ? {
-                      raw_position: matched,
-                      quote_type: quoteType,
-                      instruction,
-                      orderParams,
-                    }
-                  : undefined,
-              }),
-              { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-            );
+            data = {
+              dry_run: true,
+              clientRequestId,
+              planned_order: orderParams,
+              debug: debug
+                ? {
+                    source,
+                    trade_group_id,
+                    raw_position: matched,
+                    quote_type: quoteType,
+                    instruction,
+                    orderParams,
+                    response: { dry_run: true },
+                  }
+                : undefined,
+            };
+            break;
           }
 
           response = await fetch(orderUrl, {
@@ -439,7 +473,11 @@ serve(async (req) => {
           });
 
           const responseText = await response.text();
-          console.log("CLOSE_ORDER_RESPONSE_TEXT", responseText);
+          console.log("CLOSE_ORDER_RESPONSE_TEXT", {
+            source,
+            clientRequestId,
+            responseText,
+          });
 
           let parsed: any = null;
           try {
@@ -457,8 +495,11 @@ serve(async (req) => {
 
           data = {
             ...parsed,
+            clientRequestId,
             debug: debug
               ? {
+                  source,
+                  trade_group_id,
                   raw_position: matched,
                   quote_type: quoteType,
                   instruction,
@@ -490,7 +531,6 @@ serve(async (req) => {
       });
     }
 
-    // close_position parses response body itself and still returns non-2xx with details if needed
     if (action === "close_position" && response && !response.ok) {
       console.error("Tradier API close_position error:", response.status, data);
       return new Response(JSON.stringify({ error: "Tradier API error", details: data }), {

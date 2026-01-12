@@ -110,7 +110,18 @@ export const useTradingData = () => {
   const [error, setError] = useState<string | null>(null);
   const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
   const [pnlHistory, setPnlHistory] = useState<{ time: string; pnl: number }[]>([]);
-  const [strategyPositions, setStrategyPositions] = useState<Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>>(new Map());
+  const [strategyPositions, setStrategyPositions] = useState<
+    Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>
+  >(new Map());
+
+  // Close controls + debug
+  const [closeDebugOptions, setCloseDebugOptions] = useState<{ dryRun: boolean; debug: boolean }>({
+    dryRun: false,
+    debug: false,
+  });
+  const [lastCloseDebug, setLastCloseDebug] = useState<any>(null);
+  const [pendingCloseSymbols, setPendingCloseSymbols] = useState<Set<string>>(new Set());
+
   const lastEngineRun = useRef<number>(0);
   const lastCloseAttempt = useRef<Map<string, number>>(new Map());
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
@@ -135,18 +146,36 @@ export const useTradingData = () => {
       // Fetch positions and enrich with strategy info
       const positionsData = await tradierApi.getPositions();
       
-      // Enrich positions with strategy info from tracked positions
+      // Reconcile pending_close set: remove symbols that no longer exist at broker
+      const brokerSymbols = new Set(positionsData.map(p => p.symbol));
+      setPendingCloseSymbols(prev => {
+        const next = new Set<string>();
+        prev.forEach(sym => {
+          if (brokerSymbols.has(sym)) next.add(sym);
+        });
+        return next;
+      });
+
+      // Enrich positions with strategy info + pending_close state
       const enrichedPositions = positionsData.map(pos => {
         const stratInfo = strategyPositions.get(pos.symbol);
+        const isPending = pendingCloseSymbols.has(pos.symbol);
+
+        const base = {
+          ...pos,
+          status: (isPending ? 'pending_close' : 'open') as Position['status'],
+        };
+
         if (stratInfo) {
           return {
-            ...pos,
+            ...base,
             strategyName: stratInfo.strategyName,
             underlying: stratInfo.underlying,
             entryCredit: stratInfo.entryCredit,
           };
         }
-        return pos;
+
+        return base;
       });
       setPositions(enrichedPositions);
       
@@ -323,107 +352,54 @@ export const useTradingData = () => {
   }, [strategies, addActivity]);
 
   const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
-    console.log('closePosition called with:', positionId);
-    console.log('Current positions:', positions.map(p => ({ id: p.id, symbol: p.symbol })));
-    
     const position = positions.find(p => p.id === positionId);
-    console.log('Found position:', position);
-    
-    if (!position) {
-      console.log('Position not found, returning false');
+    if (!position) return false;
+
+    if (pendingCloseSymbols.has(position.symbol)) {
+      addActivity('SYSTEM', `SKIP: already pending close: ${position.symbol}`);
       return false;
     }
-    
+
+    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    console.log('CLOSE_REQUEST', { source: 'manual_ui', clientRequestId, symbol: position.symbol });
+
     addActivity('TRADE', `Closing position: ${position.symbol}`);
-    console.log('Calling tradierApi.closePosition with:', position.symbol, position.quantity);
-    const result = await tradierApi.closePosition(position.symbol, position.quantity);
-    console.log('tradierApi.closePosition result:', result);
-    
-    if (result.success) {
-      addActivity('TRADE', `Position closed: ${position.symbol} (Order #${result.orderId})`);
-      
-      // Save to trade journal
-      const parsed = parseOptionSymbol(position.symbol);
-      const stratInfo = strategyPositions.get(position.symbol);
-      
-      // Calculate P&L properly for options:
-      // - costBasis from Tradier is NEGATIVE for short positions (credit received)
-      // - costBasis from Tradier is POSITIVE for long positions (debit paid)
-      // - currentValue is always the current market value (positive)
-      // 
-      // For SHORT positions (sold options): P&L = costBasis (negative = credit) + currentValue (cost to close)
-      //   e.g., sold for $1 credit (costBasis=-100), now worth $0.50 (currentValue=50): P&L = -100 + 50 = -50? NO!
-      //   Actually: P&L = credit received - cost to close = abs(costBasis) - currentValue
-      // 
-      // For LONG positions (bought options): P&L = currentValue - costBasis
-      //   e.g., bought for $1 (costBasis=100), now worth $1.50 (currentValue=150): P&L = 150 - 100 = 50 profit
-      
-      const isShortPosition = position.quantity < 0 || position.costBasis < 0;
-      let pnl: number;
-      let entryPrice: number;
-      let exitPrice: number;
-      
-      if (isShortPosition) {
-        // Short position: credit received minus cost to buy back
-        const creditReceived = Math.abs(position.costBasis);
-        const costToClose = position.currentValue;
-        pnl = creditReceived - costToClose;
-        entryPrice = creditReceived / Math.abs(position.quantity) / 100; // Per share price
-        exitPrice = costToClose / Math.abs(position.quantity) / 100;
-      } else {
-        // Long position: current value minus cost
-        pnl = position.currentValue - position.costBasis;
-        entryPrice = position.costBasis / Math.abs(position.quantity) / 100;
-        exitPrice = position.currentValue / Math.abs(position.quantity) / 100;
-      }
-      
-      console.log('Saving trade to journal:', {
-        symbol: position.symbol,
-        underlying: parsed?.underlying || position.underlying,
-        isShortPosition,
-        costBasis: position.costBasis,
-        currentValue: position.currentValue,
-        pnl,
-        entryPrice,
-        exitPrice,
-        quantity: position.quantity,
-      });
-      
-      try {
-        await tradeJournal.saveTrade({
-          symbol: position.symbol,
-          underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
-          strategy_name: stratInfo?.strategyName || position.strategyName,
-          strategy_type: position.strategyType,
-          quantity: Math.abs(position.quantity),
-          entry_time: position.entryTime?.toISOString() || new Date().toISOString(),
-          exit_time: new Date().toISOString(),
-          entry_price: entryPrice,
-          exit_price: exitPrice,
-          entry_credit: stratInfo?.entryCredit || position.entryCredit,
-          pnl: pnl,
-          pnl_percent: entryPrice !== 0 ? (pnl / Math.abs(position.costBasis)) * 100 : 0,
-          exit_reason: exitReason,
-        });
-        console.log('Trade saved to journal successfully');
-      } catch (err) {
-        console.error('Failed to save trade to journal:', err);
-      }
-      
-      // Remove from tracked strategy positions
-      setStrategyPositions(prev => {
-        const newMap = new Map(prev);
-        newMap.delete(position.symbol);
-        return newMap;
-      });
-      
-      fetchData();
-      return true;
-    } else {
-      addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
+
+    const result = await tradierApi.closePosition(position.symbol, position.quantity, {
+      dryRun: closeDebugOptions.dryRun,
+      debug: closeDebugOptions.debug,
+      clientRequestId,
+      source: 'manual_ui',
+    });
+
+    setLastCloseDebug({
+      source: 'manual_ui',
+      clientRequestId,
+      symbol: position.symbol,
+      result,
+      edgeDebug: result.debug,
+    });
+
+    if (result.skipped) {
+      addActivity('SYSTEM', `${result.error || 'SKIP: cooldown/lock'}`);
       return false;
     }
-  }, [positions, addActivity, fetchData, strategyPositions]);
+
+    if (result.success && !result.dryRun) {
+      setPendingCloseSymbols(prev => new Set(prev).add(position.symbol));
+      addActivity('TRADE', `Close order accepted: ${position.symbol} (Order #${result.orderId})`);
+      await fetchData();
+      return true;
+    }
+
+    if (result.success && result.dryRun) {
+      addActivity('SYSTEM', `Dry run computed for ${position.symbol} (no order sent)`);
+      return true;
+    }
+
+    addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
+    return false;
+  }, [positions, pendingCloseSymbols, addActivity, fetchData, closeDebugOptions]);
 
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
@@ -461,78 +437,53 @@ export const useTradingData = () => {
 
       for (const exitSignal of exitResult.exitSignals) {
         const key = exitSignal.symbol;
+
+        if (pendingCloseSymbols.has(key)) {
+          addActivity('SYSTEM', `SKIP: already pending close: ${key}`);
+          continue;
+        }
+
         const nowTs = Date.now();
         const lastAttemptTs = lastCloseAttempt.current.get(key) || 0;
 
-        // Avoid spamming close orders for the same leg every 30s if Tradier is slow to update positions.
-        // This is the main cause of repeated rejections / 0-filled orders.
+        // Frontend-side spam guard (edge function enforces the real lock/cooldown).
         if (nowTs - lastAttemptTs < 120_000) {
           addActivity('SYSTEM', `Skipping duplicate close attempt (cooldown): ${exitSignal.symbol}`);
           continue;
         }
         lastCloseAttempt.current.set(key, nowTs);
 
+        const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        console.log('CLOSE_REQUEST', { source: 'bot_engine', clientRequestId, symbol: exitSignal.symbol });
+
         addActivity('TRADE', `Exit signal: ${exitSignal.symbol} - ${exitSignal.reason}`);
-        
-        // Find the position to get full details for journal logging
-        const position = positions.find(p => p.symbol === exitSignal.symbol);
-        
-        const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity);
-        if (result.success) {
+
+        const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity, {
+          dryRun: closeDebugOptions.dryRun,
+          debug: closeDebugOptions.debug,
+          clientRequestId,
+          source: 'bot_engine',
+        });
+
+        setLastCloseDebug({
+          source: 'bot_engine',
+          clientRequestId,
+          symbol: exitSignal.symbol,
+          result,
+          edgeDebug: result.debug,
+        });
+
+        if (result.skipped) {
+          addActivity('SYSTEM', `${result.error || 'SKIP: cooldown/lock'}`);
+          continue;
+        }
+
+        if (result.success && !result.dryRun) {
           placedAnyExitOrder = true;
+          setPendingCloseSymbols(prev => new Set(prev).add(exitSignal.symbol));
           addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
-          
-          // Log to trade journal (same as manual close)
-          if (position) {
-            const parsed = parseOptionSymbol(exitSignal.symbol);
-            const stratInfo = strategyPositions.get(exitSignal.symbol);
-            
-            // Calculate P&L properly for short vs long positions
-            const isShortPosition = position.quantity < 0 || position.costBasis < 0;
-            let pnl: number;
-            let entryPrice: number;
-            let exitPrice: number;
-            
-            if (isShortPosition) {
-              const creditReceived = Math.abs(position.costBasis);
-              const costToClose = position.currentValue;
-              pnl = creditReceived - costToClose;
-              entryPrice = creditReceived / Math.abs(position.quantity) / 100;
-              exitPrice = costToClose / Math.abs(position.quantity) / 100;
-            } else {
-              pnl = position.currentValue - position.costBasis;
-              entryPrice = position.costBasis / Math.abs(position.quantity) / 100;
-              exitPrice = position.currentValue / Math.abs(position.quantity) / 100;
-            }
-            
-            try {
-              await tradeJournal.saveTrade({
-                symbol: exitSignal.symbol,
-                underlying: parsed?.underlying || position.underlying || 'UNKNOWN',
-                strategy_name: stratInfo?.strategyName || position.strategyName,
-                strategy_type: position.strategyType,
-                quantity: Math.abs(exitSignal.quantity),
-                entry_time: position.entryTime?.toISOString() || new Date().toISOString(),
-                exit_time: new Date().toISOString(),
-                entry_price: entryPrice,
-                exit_price: exitPrice,
-                entry_credit: stratInfo?.entryCredit || position.entryCredit,
-                pnl: pnl,
-                pnl_percent: entryPrice !== 0 ? (pnl / Math.abs(position.costBasis)) * 100 : 0,
-                exit_reason: exitSignal.reason,
-              });
-              addActivity('SYSTEM', `Trade logged: ${exitSignal.symbol} (${exitSignal.reason})`);
-            } catch (err) {
-              console.error('Failed to save bot trade to journal:', err);
-            }
-            
-            // Remove from tracked strategy positions
-            setStrategyPositions(prev => {
-              const newMap = new Map(prev);
-              newMap.delete(exitSignal.symbol);
-              return newMap;
-            });
-          }
+        } else if (result.success && result.dryRun) {
+          addActivity('SYSTEM', `Dry run computed for ${exitSignal.symbol} (no order sent)`);
         } else {
           addActivity('RISK', `Close order rejected: ${exitSignal.symbol} - ${result.error || 'Unknown error'}`);
         }
@@ -583,7 +534,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData, strategyPositions]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, pendingCloseSymbols, closeDebugOptions, addActivity, fetchData, strategyPositions]);
 
   // Load saved settings and strategies on mount
   useEffect(() => {
@@ -691,6 +642,17 @@ export const useTradingData = () => {
     return () => clearInterval(engineInterval);
   }, [isBotRunning, runStrategyEngine]);
 
+  const copyLastCloseDebug = useCallback(async () => {
+    try {
+      if (!lastCloseDebug) return;
+      await navigator.clipboard.writeText(JSON.stringify(lastCloseDebug, null, 2));
+      addActivity('SYSTEM', 'Close debug copied to clipboard');
+    } catch (e) {
+      console.error('Failed to copy close debug:', e);
+      addActivity('SYSTEM', 'Failed to copy close debug');
+    }
+  }, [lastCloseDebug, addActivity]);
+
   return {
     positions,
     greeks,
@@ -717,5 +679,10 @@ export const useTradingData = () => {
     closePosition,
     emergencyCloseAll,
     refetch: fetchData,
+
+    closeDebugOptions,
+    setCloseDebugOptions,
+    lastCloseDebug,
+    copyLastCloseDebug,
   };
 };

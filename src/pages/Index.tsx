@@ -38,6 +38,10 @@ const Index = () => {
     deleteStrategy,
     closePosition,
     emergencyCloseAll,
+    closeDebugOptions,
+    setCloseDebugOptions,
+    lastCloseDebug,
+    copyLastCloseDebug,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -90,6 +94,10 @@ const Index = () => {
               onEmergencyClose={emergencyCloseAll}
               onUpdateRiskSettings={updateRiskSettings}
               onUpdateSafeguards={updateSafeguards}
+              closeDebugOptions={closeDebugOptions}
+              onCloseDebugOptionsChange={setCloseDebugOptions}
+              lastCloseDebug={lastCloseDebug}
+              onCopyCloseDebug={copyLastCloseDebug}
             />
           </div>
         </div>
