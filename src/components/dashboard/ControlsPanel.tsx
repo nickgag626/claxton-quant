@@ -1,11 +1,12 @@
 import { motion } from 'framer-motion';
-import { Play, Square, Lock, Unlock, AlertTriangle, Gauge, Settings, Save, Shield } from 'lucide-react';
+import { Play, Square, Lock, Unlock, AlertTriangle, Gauge, Settings, Save, Shield, Wifi } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Slider } from '@/components/ui/slider';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
+import { tradierApi } from '@/services/tradierApi';
 import type { Greeks, RiskStatus, TradeSafeguards } from '@/types/trading';
 
 interface ControlsPanelProps {
@@ -47,9 +48,24 @@ export const ControlsPanel = ({
   const [editSpread, setEditSpread] = useState(safeguards.maxBidAskSpreadPercent);
   const [editCloseBuffer, setEditCloseBuffer] = useState(safeguards.zeroDteCloseBufferMinutes);
   const [editFillBuffer, setEditFillBuffer] = useState(safeguards.fillPriceBufferPercent);
+  const [pingResult, setPingResult] = useState<{ ok: boolean; timestamp?: string; error?: string; details?: any } | null>(null);
+  const [isPinging, setIsPinging] = useState(false);
   
   const deltaDirection = greeks.delta > 10 ? 'Bullish' : greeks.delta < -10 ? 'Bearish' : 'Neutral';
   const deltaColor = greeks.delta > 10 ? 'text-trading-green' : greeks.delta < -10 ? 'text-panic-red' : 'text-muted-foreground';
+
+  const handlePing = async () => {
+    setIsPinging(true);
+    setPingResult(null);
+    try {
+      const result = await tradierApi.ping();
+      setPingResult(result);
+    } catch (err) {
+      setPingResult({ ok: false, error: String(err) });
+    } finally {
+      setIsPinging(false);
+    }
+  };
 
   const handleSaveRiskSettings = () => {
     const maxLoss = Math.max(0, Math.min(1000000, Number(editMaxLoss) || 1000));
@@ -437,18 +453,47 @@ export const ControlsPanel = ({
               </label>
             </div>
 
-            <div className="mt-2 flex items-center justify-end">
+            <div className="mt-2 flex items-center gap-2">
               <Button
                 type="button"
                 variant="secondary"
                 size="sm"
-                className="font-mono text-xs"
+                className="font-mono text-xs flex-1"
+                onClick={handlePing}
+                disabled={isPinging}
+              >
+                <Wifi className="w-3 h-3 mr-1" />
+                {isPinging ? 'Pinging...' : 'Test Edge'}
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="font-mono text-xs flex-1"
                 onClick={onCopyCloseDebug}
                 disabled={!lastCloseDebug}
               >
                 Copy Debug JSON
               </Button>
             </div>
+
+            {pingResult && (
+              <div className={cn(
+                "mt-2 p-2 rounded border text-[10px] font-mono",
+                pingResult.ok
+                  ? "border-trading-green/30 bg-trading-green/10 text-trading-green"
+                  : "border-panic-red/30 bg-panic-red/10 text-panic-red"
+              )}>
+                {pingResult.ok
+                  ? `✓ Edge OK @ ${pingResult.timestamp}`
+                  : `✗ ${pingResult.error}`}
+                {pingResult.details && (
+                  <pre className="mt-1 text-[9px] text-muted-foreground whitespace-pre-wrap">
+                    {JSON.stringify(pingResult.details, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
 
             {lastCloseDebug && (
               <pre className="mt-2 max-h-56 overflow-auto rounded border border-border bg-secondary/30 p-2 text-[10px] text-foreground whitespace-pre-wrap break-words">
