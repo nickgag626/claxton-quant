@@ -112,7 +112,7 @@ export const useTradingData = () => {
   const [pnlHistory, setPnlHistory] = useState<{ time: string; pnl: number }[]>([]);
   const [strategyPositions, setStrategyPositions] = useState<Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>>(new Map());
   const lastEngineRun = useRef<number>(0);
-
+  const lastCloseAttempt = useRef<Map<string, number>>(new Map());
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
     setActivity(prev => [
       {
@@ -457,7 +457,21 @@ export const useTradingData = () => {
       // Check for exit conditions first
       const exitResult = await strategyEngine.checkExits(strategies, positions);
       
+      let placedAnyExitOrder = false;
+
       for (const exitSignal of exitResult.exitSignals) {
+        const key = exitSignal.symbol;
+        const nowTs = Date.now();
+        const lastAttemptTs = lastCloseAttempt.current.get(key) || 0;
+
+        // Avoid spamming close orders for the same leg every 30s if Tradier is slow to update positions.
+        // This is the main cause of repeated rejections / 0-filled orders.
+        if (nowTs - lastAttemptTs < 120_000) {
+          addActivity('SYSTEM', `Skipping duplicate close attempt (cooldown): ${exitSignal.symbol}`);
+          continue;
+        }
+        lastCloseAttempt.current.set(key, nowTs);
+
         addActivity('TRADE', `Exit signal: ${exitSignal.symbol} - ${exitSignal.reason}`);
         
         // Find the position to get full details for journal logging
@@ -465,7 +479,8 @@ export const useTradingData = () => {
         
         const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity);
         if (result.success) {
-          addActivity('TRADE', `Position closed: ${exitSignal.symbol}`);
+          placedAnyExitOrder = true;
+          addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
           
           // Log to trade journal (same as manual close)
           if (position) {
@@ -518,9 +533,15 @@ export const useTradingData = () => {
               return newMap;
             });
           }
+        } else {
+          addActivity('RISK', `Close order rejected: ${exitSignal.symbol} - ${result.error || 'Unknown error'}`);
         }
       }
 
+      if (placedAnyExitOrder) {
+        // Refresh positions so the next engine run doesn't keep trying to close legs that are already closing/closed.
+        await fetchData();
+      }
       // Then evaluate entry conditions
       const entryResult = await strategyEngine.evaluateStrategies(strategies, positions);
       
