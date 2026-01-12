@@ -3,10 +3,12 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
 interface TradierRequest {
   action:
+    | "ping"
     | "quote"
     | "positions"
     | "balances"
@@ -166,6 +168,18 @@ serve(async (req) => {
   }
 
   try {
+    const body = (await req.json()) as TradierRequest;
+    const action = body.action;
+
+    // Handle ping immediately (no Tradier credentials needed)
+    if (action === "ping") {
+      console.log("PING received");
+      return new Response(
+        JSON.stringify({ ok: true, timestamp: new Date().toISOString(), action: "ping" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
     const apiToken = Deno.env.get("TRADIER_API_TOKEN");
     const accountId = Deno.env.get("TRADIER_ACCOUNT_ID");
 
@@ -177,9 +191,6 @@ serve(async (req) => {
       });
     }
 
-    const body = (await req.json()) as TradierRequest;
-
-    const action = body.action;
     const symbols = body.symbols;
     const symbol = body.symbol;
     const expiration = body.expiration;

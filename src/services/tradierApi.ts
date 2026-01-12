@@ -30,6 +30,33 @@ interface TradierBalance {
 }
 
 export const tradierApi = {
+  async ping(): Promise<{ ok: boolean; timestamp?: string; error?: string; details?: any }> {
+    const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/tradier-api`;
+    console.log('[tradierApi.ping] Request URL:', url);
+    
+    try {
+      const { data, error } = await supabase.functions.invoke('tradier-api', {
+        body: { action: 'ping' },
+      });
+
+      if (error) {
+        console.error('[tradierApi.ping] Supabase invoke error:', error);
+        return { ok: false, error: error.message, details: error };
+      }
+
+      console.log('[tradierApi.ping] Response:', data);
+      return { ok: data?.ok ?? false, timestamp: data?.timestamp };
+    } catch (err) {
+      const isCors = err instanceof TypeError && err.message.includes('Failed to fetch');
+      console.error('[tradierApi.ping] Network/CORS error:', { error: err, isCors });
+      return {
+        ok: false,
+        error: isCors ? 'CORS/network error - edge function unreachable' : String(err),
+        details: { isCors, raw: String(err) },
+      };
+    }
+  },
+
   async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
     try {
       const { data, error } = await supabase.functions.invoke('tradier-api', {
@@ -225,9 +252,20 @@ export const tradierApi = {
     debug?: any;
     clientRequestId?: string;
   }> {
-    try {
-      const clientRequestId = opts?.clientRequestId;
+    const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
+    const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/tradier-api`;
 
+    console.log('[tradierApi.closePosition] Request', {
+      url,
+      symbol,
+      quantity,
+      source: opts?.source,
+      clientRequestId,
+      dryRun: opts?.dryRun,
+      debug: opts?.debug,
+    });
+
+    try {
       const { data, error } = await supabase.functions.invoke('tradier-api', {
         body: {
           action: 'close_position',
@@ -239,10 +277,21 @@ export const tradierApi = {
           trade_group_id: opts?.trade_group_id,
           source: opts?.source,
         },
-        headers: clientRequestId ? { 'x-client-request-id': clientRequestId } : undefined,
+        headers: { 'x-client-request-id': clientRequestId },
       });
 
-      if (error) throw error;
+      console.log('[tradierApi.closePosition] Response', { data, error, clientRequestId });
+
+      if (error) {
+        const isCors = error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError');
+        console.error('[tradierApi.closePosition] Invoke error:', { error, isCors, clientRequestId });
+        return {
+          success: false,
+          error: isCors ? 'CORS/network error - edge function unreachable' : error.message,
+          debug: { isCors, raw: error },
+          clientRequestId,
+        };
+      }
 
       if (data?.skipped) {
         return {
@@ -279,11 +328,14 @@ export const tradierApi = {
         debug: data?.debug,
         clientRequestId: data?.clientRequestId || clientRequestId,
       };
-    } catch (error) {
-      console.error('Error closing position:', error);
+    } catch (err) {
+      const isCors = err instanceof TypeError && String(err).includes('Failed to fetch');
+      console.error('[tradierApi.closePosition] Network/CORS error:', { error: err, isCors, clientRequestId });
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: isCors ? 'CORS/network error - edge function unreachable' : String(err),
+        debug: { isCors, raw: String(err) },
+        clientRequestId,
       };
     }
   },
