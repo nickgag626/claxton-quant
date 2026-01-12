@@ -583,7 +583,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData, strategyPositions]);
 
   // Load saved settings and strategies on mount
   useEffect(() => {
