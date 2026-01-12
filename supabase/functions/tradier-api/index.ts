@@ -125,26 +125,34 @@ serve(async (req) => {
             { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
-        
-        // Tradier reports quantity as:
-        // - POSITIVE for LONG positions (bought options) -> need to sell_to_close
-        // - NEGATIVE for SHORT positions (sold options) -> need to buy_to_close
-        // The quantity passed here is the raw Tradier quantity
-        const side = positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close';
+
         const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
-        
+
         // Check if this is an OCC option symbol (e.g., SPY260112C00700000)
         const isOccOption = /^[A-Z]+\d{6}[CP]\d{8}$/.test(positionSymbol);
-        
+
+        // Determine correct close side:
+        // - Options: long -> sell_to_close, short -> buy_to_close
+        // - Equity:  long -> sell,        short -> buy_to_cover
+        const side = isOccOption
+          ? (positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close')
+          : (positionQuantity < 0 ? 'buy_to_cover' : 'sell');
+
         // Extract underlying from OCC symbol (e.g., SPY260112C00700000 -> SPY)
         let underlying = positionSymbol;
         if (isOccOption) {
           const match = positionSymbol.match(/^([A-Z]+)\d{6}[CP]\d{8}$/);
           underlying = match ? match[1] : positionSymbol;
         }
-        
-        console.log('Closing position:', positionSymbol, 'underlying:', underlying, 'qty:', positionQuantity, 'side:', side, 'isOption:', isOccOption);
-        
+
+        console.log('Closing position:', {
+          positionSymbol,
+          underlying,
+          positionQuantity,
+          isOccOption,
+          side,
+        });
+
         const orderParams: Record<string, string> = {
           class: isOccOption ? 'option' : 'equity',
           symbol: underlying,
@@ -153,14 +161,14 @@ serve(async (req) => {
           type: 'market',
           duration: 'day',
         };
-        
+
         // For options, add the option_symbol parameter
         if (isOccOption) {
           orderParams.option_symbol = positionSymbol;
         }
-        
+
         console.log('Order params:', JSON.stringify(orderParams));
-        
+
         response = await fetch(orderUrl, {
           method: 'POST',
           headers: {
@@ -170,11 +178,11 @@ serve(async (req) => {
           },
           body: new URLSearchParams(orderParams).toString(),
         });
-        
+
         // Handle potential non-JSON response
         const responseText = await response.text();
         console.log('Close order response:', responseText);
-        
+
         try {
           data = JSON.parse(responseText);
         } catch {

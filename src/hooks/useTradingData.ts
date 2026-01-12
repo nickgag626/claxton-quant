@@ -150,29 +150,14 @@ export const useTradingData = () => {
       });
       setPositions(enrichedPositions);
       
-      // Fetch balances for open P&L
+      // Fetch balances for open/closed P&L (authoritative)
       const balances = await tradierApi.getBalances();
       const openPnl = balances?.open_pl || 0;
-      
-      // Fetch realized P&L from today's closed trades in the database
-      let realizedPnl = 0;
-      try {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
-        const { data: todayTrades } = await supabase
-          .from('trades')
-          .select('pnl')
-          .gte('exit_time', today.toISOString());
-        
-        if (todayTrades) {
-          realizedPnl = todayTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-        }
-      } catch (err) {
-        console.error('Error fetching daily P&L:', err);
-      }
-      
-      // Total daily P&L = realized (closed trades) + unrealized (open positions)
-      const totalDailyPnl = realizedPnl + openPnl;
+      const closedPnl = balances?.close_pl || 0;
+
+      // Total daily P&L = realized (close_pl) + unrealized (open_pl)
+      // This avoids double-counting / duplicates from the local trade journal.
+      const totalDailyPnl = closedPnl + openPnl;
       
       setRiskStatus(prev => ({
         ...prev,

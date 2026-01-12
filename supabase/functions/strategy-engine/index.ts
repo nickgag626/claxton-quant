@@ -207,7 +207,17 @@ serve(async (req) => {
         const strategy = (strategies as Strategy[]).find(s => s.name === position.strategyName);
         if (!strategy) continue;
 
-        const pnlPercent = ((position.currentValue - position.entryCredit) / position.entryCredit) * 100;
+        // Use costBasis/currentValue to compute P&L consistently for both long/short options.
+        // - For short positions: cost_basis is negative (credit received)
+        //   P&L = credit_received - cost_to_close
+        // - For long positions: cost_basis is positive (debit paid)
+        //   P&L = current_value - cost_paid
+        const costBasis = Number(position.costBasis ?? 0);
+        const currentValue = Number(position.currentValue ?? 0);
+        const isShort = Number(position.quantity ?? 0) < 0 || costBasis < 0;
+
+        const pnl = isShort ? Math.abs(costBasis) - currentValue : currentValue - costBasis;
+        const pnlPercent = Math.abs(costBasis) > 0 ? (pnl / Math.abs(costBasis)) * 100 : 0;
         
         // Check profit target
         if (pnlPercent >= strategy.exitConditions.profitTargetPercent) {
