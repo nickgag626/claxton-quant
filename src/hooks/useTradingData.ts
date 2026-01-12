@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
-import { tradeJournal } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord } from '@/services/tradeJournal';
 import { settingsService } from '@/services/settingsService';
 import type {
   Position, 
@@ -15,6 +15,15 @@ import type {
   TradeSafeguards 
 } from '@/types/trading';
 import type { DeltaDataPoint } from '@/components/dashboard/GreeksChart';
+
+/**
+ * Extract underlying symbol from OCC option symbol
+ * e.g., SPY260112P00693000 -> SPY
+ */
+function extractUnderlyingFromSymbol(symbol: string): string {
+  const match = symbol.match(/^([A-Z]+)\d/);
+  return match ? match[1] : symbol;
+}
 
 // Default strategies (would come from database in production)
 const defaultStrategies: Strategy[] = [
@@ -351,6 +360,89 @@ export const useTradingData = () => {
     await settingsService.deleteStrategy(strategyId);
   }, [strategies, addActivity]);
 
+  /**
+   * Journal a closed trade to the database
+   */
+  const journalClosedTrade = useCallback(async (
+    position: Position,
+    closeResult: {
+      orderId?: string;
+      closeSide?: string;
+      closeQty?: number;
+      positionDetails?: {
+        symbol: string;
+        quantity: number;
+        costBasis: number;
+        side?: string;
+      };
+    },
+    exitReason: string,
+    source: string,
+    clientRequestId: string
+  ) => {
+    try {
+      const stratInfo = strategyPositions.get(position.symbol);
+      const underlying = extractUnderlyingFromSymbol(position.symbol);
+      
+      // Determine open_side from position or strategy tracking
+      // For options: positive cost_basis with short position = sold to open
+      const positionSide = closeResult.positionDetails?.side;
+      let openSide: string | undefined;
+      if (positionSide === 'short') {
+        openSide = 'sell_to_open';
+      } else if (positionSide === 'long') {
+        openSide = 'buy_to_open';
+      } else if (position.costBasis < 0) {
+        // Negative cost basis typically means credit received (sold to open)
+        openSide = 'sell_to_open';
+      } else if (position.costBasis > 0) {
+        openSide = 'buy_to_open';
+      }
+      
+      // Entry price per contract
+      const entryPrice = Math.abs(position.costBasis) / (position.quantity * 100);
+      
+      // We don't have fill price yet - mark for reconciliation
+      // The reconciliation job will backfill from Tradier fills
+      const needsReconcile = true;
+      
+      const tradeRecord: Omit<TradeRecord, 'id'> = {
+        symbol: position.symbol,
+        underlying,
+        strategy_name: stratInfo?.strategyName || position.strategyName,
+        strategy_type: position.strategyType,
+        quantity: closeResult.closeQty || position.quantity,
+        entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || new Date().toISOString(),
+        exit_time: new Date().toISOString(),
+        entry_price: entryPrice,
+        exit_price: 0, // Will be backfilled by reconciliation
+        entry_credit: stratInfo?.entryCredit,
+        pnl: 0, // Will be recalculated after reconciliation
+        pnl_percent: 0,
+        exit_reason: exitReason,
+        trade_group_id: undefined, // Could link multi-leg closes later
+        open_side: openSide,
+        close_side: closeResult.closeSide,
+        close_order_id: closeResult.orderId,
+        multiplier: 100,
+        fees: 0, // Will be backfilled by reconciliation
+        needs_reconcile: needsReconcile,
+      };
+
+      const saveResult = await tradeJournal.saveTrade(tradeRecord);
+      
+      if (saveResult.duplicate) {
+        console.log('Trade already journaled (duplicate close_order_id):', position.symbol, closeResult.orderId);
+      } else if (saveResult.success) {
+        console.log('Trade journaled:', position.symbol, saveResult.id);
+      } else {
+        console.error('Failed to journal trade:', saveResult.error);
+      }
+    } catch (error) {
+      console.error('Error journaling trade:', error);
+    }
+  }, [strategyPositions]);
+
   const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
     const position = positions.find(p => p.id === positionId);
     if (!position) return false;
@@ -388,6 +480,10 @@ export const useTradingData = () => {
     if (result.success && !result.dryRun) {
       setPendingCloseSymbols(prev => new Set(prev).add(position.symbol));
       addActivity('TRADE', `Close order accepted: ${position.symbol} (Order #${result.orderId})`);
+      
+      // Journal the trade immediately
+      await journalClosedTrade(position, result, exitReason, 'manual_ui', clientRequestId);
+      
       await fetchData();
       return true;
     }
@@ -399,7 +495,7 @@ export const useTradingData = () => {
 
     addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
     return false;
-  }, [positions, pendingCloseSymbols, addActivity, fetchData, closeDebugOptions]);
+  }, [positions, pendingCloseSymbols, addActivity, fetchData, closeDebugOptions, journalClosedTrade]);
 
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
@@ -482,6 +578,12 @@ export const useTradingData = () => {
           placedAnyExitOrder = true;
           setPendingCloseSymbols(prev => new Set(prev).add(exitSignal.symbol));
           addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
+          
+          // Journal the trade - find the position to get full details
+          const position = positions.find(p => p.symbol === exitSignal.symbol);
+          if (position) {
+            await journalClosedTrade(position, result, exitSignal.reason, 'bot_engine', clientRequestId);
+          }
         } else if (result.success && result.dryRun) {
           addActivity('SYSTEM', `Dry run computed for ${exitSignal.symbol} (no order sent)`);
         } else {
@@ -534,7 +636,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, pendingCloseSymbols, closeDebugOptions, addActivity, fetchData, strategyPositions]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, pendingCloseSymbols, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade]);
 
   // Load saved settings and strategies on mount
   useEffect(() => {

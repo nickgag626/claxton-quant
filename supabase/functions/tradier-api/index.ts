@@ -15,6 +15,7 @@ interface TradierRequest {
     | "expirations"
     | "chain"
     | "clock"
+    | "orders"
     | "close_position";
   symbols?: string[];
   symbol?: string;
@@ -24,6 +25,10 @@ interface TradierRequest {
   positionSymbol?: string;
   // kept for backwards compatibility; close logic derives from live Tradier position
   positionQuantity?: number;
+
+  // orders (for reconciliation)
+  startDate?: string;
+  endDate?: string;
 
   // debug / idempotency
   dryRun?: boolean;
@@ -315,6 +320,18 @@ serve(async (req) => {
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
         console.log("Clock response:", JSON.stringify(data));
+        break;
+      }
+
+      case "orders": {
+        // Fetch order history for reconciliation
+        const startDate = body.startDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const endDate = body.endDate || new Date().toISOString().split('T')[0];
+        const url = `${baseUrl}/accounts/${accountId}/orders?includeTags=true`;
+        console.log("Fetching orders:", url);
+        response = await fetch(url, { headers });
+        data = await safeParseTradierResponse(response);
+        console.log("Orders response received, count:", Array.isArray(data?.orders?.order) ? data.orders.order.length : (data?.orders?.order ? 1 : 0));
         break;
       }
 
