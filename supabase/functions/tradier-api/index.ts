@@ -1,224 +1,513 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
 interface TradierRequest {
-  action: 'quote' | 'positions' | 'balances' | 'expirations' | 'chain' | 'clock' | 'close_position';
+  action:
+    | "quote"
+    | "positions"
+    | "balances"
+    | "expirations"
+    | "chain"
+    | "clock"
+    | "close_position";
   symbols?: string[];
   symbol?: string;
   expiration?: string;
   positionSymbol?: string;
+  // kept for backwards compatibility; close logic derives from live Tradier position
   positionQuantity?: number;
+  dryRun?: boolean;
+  debug?: boolean;
+}
+
+type TradierPosition = Record<string, unknown> & {
+  symbol?: string;
+  quantity?: number | string;
+  cost_basis?: number | string;
+  side?: string;
+  instrument_type?: string;
+};
+
+type InstrumentType = "option" | "equity";
+
+type CloseInstruction = {
+  ok: true;
+  instrument_type: InstrumentType;
+  side: "long" | "short";
+  closeSide: "buy_to_close" | "sell_to_close" | "buy_to_cover" | "sell";
+  closeQty: number;
+};
+
+type CloseInstructionError = {
+  ok: false;
+  instrument_type: InstrumentType;
+  side: "long" | "short" | "unknown";
+  quantity: number;
+  cost_basis: number;
+  error: string;
+};
+
+const closeLocks = new Map<string, { inFlight: boolean; lastAcceptedAt: number }>();
+const CLOSE_COOLDOWN_MS = 120_000;
+
+const isOccOptionSymbol = (s: string) => /^[A-Z]+\d{6}[CP]\d{8}$/.test(s);
+
+function normalizeNumber(n: unknown): number {
+  if (typeof n === "number") return n;
+  if (typeof n === "string" && n.trim() !== "") {
+    const parsed = Number(n);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function extractUnderlyingFromOcc(positionSymbol: string): string {
+  const match = positionSymbol.match(/^([A-Z]+)\d{6}[CP]\d{8}$/);
+  return match ? match[1] : positionSymbol;
+}
+
+function inferSide(pos: TradierPosition, qty: number): "long" | "short" | "unknown" {
+  const side = String(pos.side || "").toLowerCase();
+  if (side === "long" || side === "short") return side as "long" | "short";
+  if (qty < 0) return "short";
+  if (qty > 0) return "long";
+  return "unknown";
+}
+
+function inferSideFromCostBasis(costBasis: number): "long" | "short" | "unknown" {
+  if (costBasis < 0) return "short";
+  if (costBasis > 0) return "long";
+  return "unknown";
+}
+
+function detectInstrumentType(
+  pos: TradierPosition,
+  positionSymbol: string,
+  quoteType?: string,
+): InstrumentType {
+  const fromPos = String(pos.instrument_type || "").toLowerCase();
+  if (fromPos.includes("option")) return "option";
+  if (fromPos.includes("equity") || fromPos.includes("stock")) return "equity";
+
+  const fromQuote = String(quoteType || "").toLowerCase();
+  if (fromQuote === "option") return "option";
+
+  // fallback
+  return isOccOptionSymbol(positionSymbol) ? "option" : "equity";
+}
+
+// Truth table: SINGLE deterministic mapping used everywhere.
+function getCloseInstruction(
+  pos: TradierPosition,
+  positionSymbol: string,
+  quoteType?: string,
+): CloseInstruction | CloseInstructionError {
+  const qty = normalizeNumber(pos.quantity);
+  const costBasis = normalizeNumber(pos.cost_basis);
+  const instrument_type = detectInstrumentType(pos, positionSymbol, quoteType);
+
+  let side = inferSide(pos, qty);
+  if (side === "unknown") {
+    const cbSide = inferSideFromCostBasis(costBasis);
+    if (cbSide !== "unknown") {
+      side = cbSide;
+      console.warn("WARN: inferred position side from cost_basis as last resort", {
+        positionSymbol,
+        cost_basis: costBasis,
+      });
+    }
+  }
+
+  if (side === "unknown" || qty === 0) {
+    return {
+      ok: false,
+      instrument_type,
+      side,
+      quantity: qty,
+      cost_basis: costBasis,
+      error: `Unable to determine reliable side/size for ${positionSymbol}`,
+    };
+  }
+
+  if (instrument_type === "option") {
+    return {
+      ok: true,
+      instrument_type,
+      side,
+      closeSide: side === "short" ? "buy_to_close" : "sell_to_close",
+      closeQty: Math.abs(qty),
+    };
+  }
+
+  return {
+    ok: true,
+    instrument_type,
+    side,
+    closeSide: side === "short" ? "buy_to_cover" : "sell",
+    closeQty: Math.abs(qty),
+  };
 }
 
 serve(async (req) => {
   // Handle CORS preflight
-  if (req.method === 'OPTIONS') {
+  if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    const apiToken = Deno.env.get('TRADIER_API_TOKEN');
-    const accountId = Deno.env.get('TRADIER_ACCOUNT_ID');
+    const apiToken = Deno.env.get("TRADIER_API_TOKEN");
+    const accountId = Deno.env.get("TRADIER_ACCOUNT_ID");
 
     if (!apiToken || !accountId) {
-      console.error('Missing Tradier credentials');
-      return new Response(
-        JSON.stringify({ error: 'Tradier API not configured' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      console.error("Missing Tradier credentials");
+      return new Response(JSON.stringify({ error: "Tradier API not configured" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    const { action, symbols, symbol, expiration, positionSymbol, positionQuantity }: TradierRequest = await req.json();
-    
+    const {
+      action,
+      symbols,
+      symbol,
+      expiration,
+      positionSymbol,
+      dryRun,
+      debug,
+    }: TradierRequest = await req.json();
+
     // Use sandbox for paper trading - change to api.tradier.com for live
-    const baseUrl = 'https://sandbox.tradier.com/v1';
-    
+    const baseUrl = "https://sandbox.tradier.com/v1";
+
     const headers = {
-      'Authorization': `Bearer ${apiToken}`,
-      'Accept': 'application/json',
+      Authorization: `Bearer ${apiToken}`,
+      Accept: "application/json",
     };
 
-    let response;
-    let data;
+    let response: Response | undefined;
+    let data: any;
 
     switch (action) {
-      case 'quote': {
+      case "quote": {
         if (!symbols || symbols.length === 0) {
-          return new Response(
-            JSON.stringify({ error: 'Symbols required for quote' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
+          return new Response(JSON.stringify({ error: "Symbols required for quote" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
         }
-        const url = `${baseUrl}/markets/quotes?symbols=${symbols.join(',')}`;
-        console.log('Fetching quotes:', url);
+        const url = `${baseUrl}/markets/quotes?symbols=${symbols.join(",")}`;
+        console.log("Fetching quotes:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Quote response:', JSON.stringify(data));
+        console.log("Quote response:", JSON.stringify(data));
         break;
       }
 
-      case 'positions': {
+      case "positions": {
         const url = `${baseUrl}/accounts/${accountId}/positions`;
-        console.log('Fetching positions:', url);
+        console.log("Fetching positions:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Positions response:', JSON.stringify(data));
+        console.log("Positions response:", JSON.stringify(data));
         break;
       }
 
-      case 'balances': {
+      case "balances": {
         const url = `${baseUrl}/accounts/${accountId}/balances`;
-        console.log('Fetching balances:', url);
+        console.log("Fetching balances:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Balances response:', JSON.stringify(data));
+        console.log("Balances response:", JSON.stringify(data));
         break;
       }
 
-      case 'expirations': {
+      case "expirations": {
         if (!symbol) {
-          return new Response(
-            JSON.stringify({ error: 'Symbol required for expirations' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
+          return new Response(JSON.stringify({ error: "Symbol required for expirations" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          });
         }
         const url = `${baseUrl}/markets/options/expirations?symbol=${symbol}`;
-        console.log('Fetching expirations:', url);
+        console.log("Fetching expirations:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Expirations response:', JSON.stringify(data));
+        console.log("Expirations response:", JSON.stringify(data));
         break;
       }
 
-      case 'chain': {
+      case "chain": {
         if (!symbol || !expiration) {
           return new Response(
-            JSON.stringify({ error: 'Symbol and expiration required for chain' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            JSON.stringify({ error: "Symbol and expiration required for chain" }),
+            {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            },
           );
         }
         const url = `${baseUrl}/markets/options/chains?symbol=${symbol}&expiration=${expiration}&greeks=true`;
-        console.log('Fetching chain:', url);
+        console.log("Fetching chain:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Chain response received');
+        console.log("Chain response received");
         break;
       }
 
-      case 'clock': {
+      case "clock": {
         const url = `${baseUrl}/markets/clock`;
-        console.log('Fetching market clock:', url);
+        console.log("Fetching market clock:", url);
         response = await fetch(url, { headers });
         data = await response.json();
-        console.log('Clock response:', JSON.stringify(data));
+        console.log("Clock response:", JSON.stringify(data));
         break;
       }
 
-      case 'close_position': {
-        if (!positionSymbol || positionQuantity === undefined) {
+      case "close_position": {
+        if (!positionSymbol) {
           return new Response(
-            JSON.stringify({ error: 'Symbol and quantity required for close_position' }),
-            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            JSON.stringify({ error: "positionSymbol required for close_position" }),
+            {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            },
           );
         }
 
-        const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
-
-        // Check if this is an OCC option symbol (e.g., SPY260112C00700000)
-        const isOccOption = /^[A-Z]+\d{6}[CP]\d{8}$/.test(positionSymbol);
-
-        // Determine correct close side:
-        // - Options: long -> sell_to_close, short -> buy_to_close
-        // - Equity:  long -> sell,        short -> buy_to_cover
-        const side = isOccOption
-          ? (positionQuantity < 0 ? 'buy_to_close' : 'sell_to_close')
-          : (positionQuantity < 0 ? 'buy_to_cover' : 'sell');
-
-        // Extract underlying from OCC symbol (e.g., SPY260112C00700000 -> SPY)
-        let underlying = positionSymbol;
-        if (isOccOption) {
-          const match = positionSymbol.match(/^([A-Z]+)\d{6}[CP]\d{8}$/);
-          underlying = match ? match[1] : positionSymbol;
+        const lockKey = `${accountId}:${positionSymbol}`;
+        const now = Date.now();
+        const lock = closeLocks.get(lockKey);
+        if (lock?.inFlight) {
+          console.log("SKIP: cooldown/lock (in-flight)", { lockKey });
+          return new Response(
+            JSON.stringify({ skipped: true, reason: "lock_in_flight" }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        if (lock?.lastAcceptedAt && now - lock.lastAcceptedAt < CLOSE_COOLDOWN_MS) {
+          console.log("SKIP: cooldown/lock (recently accepted)", { lockKey });
+          return new Response(
+            JSON.stringify({ skipped: true, reason: "cooldown" }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
         }
 
-        console.log('Closing position:', {
-          positionSymbol,
-          underlying,
-          positionQuantity,
-          isOccOption,
-          side,
-        });
-
-        const orderParams: Record<string, string> = {
-          class: isOccOption ? 'option' : 'equity',
-          symbol: underlying,
-          side: side,
-          quantity: Math.abs(positionQuantity).toString(),
-          type: 'market',
-          duration: 'day',
-        };
-
-        // For options, add the option_symbol parameter
-        if (isOccOption) {
-          orderParams.option_symbol = positionSymbol;
-        }
-
-        console.log('Order params:', JSON.stringify(orderParams));
-
-        response = await fetch(orderUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiToken}`,
-            'Accept': 'application/json',
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: new URLSearchParams(orderParams).toString(),
-        });
-
-        // Handle potential non-JSON response
-        const responseText = await response.text();
-        console.log('Close order response:', responseText);
+        closeLocks.set(lockKey, { inFlight: true, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
 
         try {
-          data = JSON.parse(responseText);
-        } catch {
-          // Tradier returned non-JSON (likely an error message)
-          console.error('Non-JSON response from Tradier:', responseText);
-          data = { error: responseText };
+          // 0) Fetch exact position snapshot
+          const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
+          const posResp = await fetch(posUrl, { headers });
+          const posData = await posResp.json();
+          const positionsRaw = posData?.positions?.position;
+          const posArray: TradierPosition[] = Array.isArray(positionsRaw)
+            ? positionsRaw
+            : positionsRaw
+              ? [positionsRaw]
+              : [];
+
+          const matched = posArray.find((p) => String(p.symbol) === positionSymbol);
+          if (!matched) {
+            console.log("CLOSE_DECISION: position_not_found", {
+              positionSymbol,
+              positionsCount: posArray.length,
+            });
+            return new Response(
+              JSON.stringify({ error: "Position not found", symbol: positionSymbol }),
+              { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+
+          // Pull quote to get instrument type if possible
+          let quoteType: string | undefined;
+          try {
+            const qUrl = `${baseUrl}/markets/quotes?symbols=${encodeURIComponent(positionSymbol)}`;
+            const qResp = await fetch(qUrl, { headers });
+            const qData = await qResp.json();
+            const q = qData?.quotes?.quote;
+            quoteType = (Array.isArray(q) ? q[0]?.type : q?.type) as string | undefined;
+          } catch (e) {
+            console.warn("WARN: failed to fetch quote for instrument_type", {
+              positionSymbol,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+
+          const qty = normalizeNumber(matched.quantity);
+          const costBasis = normalizeNumber(matched.cost_basis);
+          const side = String(matched.side || "");
+          const instrument_type = String(matched.instrument_type || quoteType || (isOccOptionSymbol(positionSymbol) ? "option" : "equity"));
+
+          console.log("CLOSE_RAW_POSITION", {
+            symbol: positionSymbol,
+            instrument_type,
+            quantity: qty,
+            cost_basis: costBasis,
+            side: side || undefined,
+            raw: matched,
+          });
+
+          const instruction = getCloseInstruction(matched, positionSymbol, quoteType);
+          if (!instruction.ok) {
+            console.log("CLOSE_DECISION_ERROR", instruction);
+            return new Response(JSON.stringify({ error: instruction.error, debug: { instruction } }), {
+              status: 400,
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            });
+          }
+
+          if (!Number.isFinite(instruction.closeQty) || instruction.closeQty <= 0) {
+            return new Response(
+              JSON.stringify({ error: "Invalid close quantity", debug: { instruction } }),
+              { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+
+          // 2) Never exceed position size
+          const positionSize = Math.abs(qty);
+          const closeQty = Math.min(instruction.closeQty, positionSize);
+          if (closeQty <= 0) {
+            console.log("CLOSE_DECISION: zero_position_size", {
+              positionSymbol,
+              qty,
+              instruction,
+            });
+            return new Response(
+              JSON.stringify({ error: "Position size is zero", debug: { instruction } }),
+              { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+
+          const underlying = instruction.instrument_type === "option"
+            ? extractUnderlyingFromOcc(positionSymbol)
+            : positionSymbol;
+
+          const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
+
+          const orderParams: Record<string, string> = {
+            class: instruction.instrument_type,
+            symbol: underlying,
+            side: instruction.closeSide,
+            quantity: closeQty.toString(),
+            type: "market",
+            duration: "day",
+          };
+          if (instruction.instrument_type === "option") {
+            orderParams.option_symbol = positionSymbol;
+          }
+
+          console.log("CLOSE_DECISION", {
+            symbol: positionSymbol,
+            instrument_type: instruction.instrument_type,
+            side: instruction.side,
+            computed: instruction,
+            orderParams,
+            dryRun: !!dryRun,
+          });
+
+          if (dryRun) {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+            return new Response(
+              JSON.stringify({
+                dry_run: true,
+                planned_order: orderParams,
+                debug: debug
+                  ? {
+                      raw_position: matched,
+                      quote_type: quoteType,
+                      instruction,
+                      orderParams,
+                    }
+                  : undefined,
+              }),
+              { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+            );
+          }
+
+          response = await fetch(orderUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiToken}`,
+              Accept: "application/json",
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams(orderParams).toString(),
+          });
+
+          const responseText = await response.text();
+          console.log("CLOSE_ORDER_RESPONSE_TEXT", responseText);
+
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(responseText);
+          } catch {
+            parsed = { error: responseText };
+          }
+
+          // mark accepted timestamp only when Tradier returns an order id
+          if (parsed?.order?.id) {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: Date.now() });
+          } else {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+          }
+
+          data = {
+            ...parsed,
+            debug: debug
+              ? {
+                  raw_position: matched,
+                  quote_type: quoteType,
+                  instruction,
+                  orderParams,
+                  response: parsed,
+                }
+              : undefined,
+          };
+
+          break;
+        } finally {
+          const cur = closeLocks.get(lockKey);
+          if (cur) closeLocks.set(lockKey, { ...cur, inFlight: false });
         }
-        break;
       }
 
       default:
-        return new Response(
-          JSON.stringify({ error: 'Invalid action' }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+        return new Response(JSON.stringify({ error: "Invalid action" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
     }
 
-    if (!response.ok) {
-      console.error('Tradier API error:', response.status, data);
-      return new Response(
-        JSON.stringify({ error: 'Tradier API error', details: data }),
-        { status: response.status, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    if (!response?.ok && action !== "close_position") {
+      console.error("Tradier API error:", response?.status, data);
+      return new Response(JSON.stringify({ error: "Tradier API error", details: data }), {
+        status: response?.status || 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    return new Response(
-      JSON.stringify(data),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    // close_position parses response body itself and still returns non-2xx with details if needed
+    if (action === "close_position" && response && !response.ok) {
+      console.error("Tradier API close_position error:", response.status, data);
+      return new Response(JSON.stringify({ error: "Tradier API error", details: data }), {
+        status: response.status,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
+    return new Response(JSON.stringify(data), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error('Error in tradier-api function:', error);
-    return new Response(
-      JSON.stringify({ error: errorMessage }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    console.error("Error in tradier-api function:", error);
+    return new Response(JSON.stringify({ error: errorMessage }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });
