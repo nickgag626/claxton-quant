@@ -5,11 +5,12 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection } from '@/services/tradeJournal';
 import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
 import { format, subDays } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -33,6 +34,7 @@ interface TradeDetailsRowProps {
   onSaveNotes: (tradeId: string) => void;
   onCancelEdit: () => void;
   onNotesChange: (notes: string) => void;
+  onManualOverride: (tradeId: string, openSide: string, closeSide: string) => void;
 }
 
 const TradeDetailsRow = ({ 
@@ -42,8 +44,13 @@ const TradeDetailsRow = ({
   onEditNotes, 
   onSaveNotes, 
   onCancelEdit,
-  onNotesChange 
+  onNotesChange,
+  onManualOverride,
 }: TradeDetailsRowProps) => {
+  const [isEditingDirection, setIsEditingDirection] = useState(false);
+  const [editOpenSide, setEditOpenSide] = useState(trade.open_side || '');
+  const [editCloseSide, setEditCloseSide] = useState(trade.close_side || '');
+
   const entryTime = trade.entry_time ? new Date(trade.entry_time) : null;
   const exitTime = trade.exit_time ? new Date(trade.exit_time) : null;
   const duration = entryTime && exitTime 
@@ -61,6 +68,16 @@ const TradeDetailsRow = ({
     return `${days}d ${remainingHours}h`;
   };
 
+  const handleSaveDirection = () => {
+    if (editOpenSide && editCloseSide && trade.id) {
+      onManualOverride(trade.id, editOpenSide, editCloseSide);
+      setIsEditingDirection(false);
+    }
+  };
+
+  const isVerified = hasVerifiedDirection(trade);
+  const pnlDisplay = trade.pnl != null ? trade.pnl : null;
+
   return (
     <motion.tr
       initial={{ opacity: 0, height: 0 }}
@@ -72,11 +89,96 @@ const TradeDetailsRow = ({
         <div className="p-4 space-y-4">
           {/* Reconciliation Warning */}
           {trade.needs_reconcile && (
-            <div className="flex items-center gap-2 p-2 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded text-xs text-bloomberg-amber">
-              <AlertTriangle className="h-4 w-4" />
-              <span>This trade needs reconciliation - missing open_side or close_order_id</span>
+            <div className="flex items-center justify-between gap-2 p-3 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded">
+              <div className="flex items-center gap-2 text-xs text-bloomberg-amber">
+                <AlertTriangle className="h-4 w-4" />
+                <span className="font-medium">Needs reconcile – direction unknown</span>
+                <span className="text-bloomberg-amber/70">
+                  (Missing: {!trade.open_side ? 'open_side ' : ''}{!trade.close_side ? 'close_side ' : ''}{!trade.close_order_id ? 'close_order_id' : ''})
+                </span>
+              </div>
+              {!isEditingDirection && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 text-xs border-bloomberg-amber/50 text-bloomberg-amber hover:bg-bloomberg-amber/20"
+                  onClick={() => setIsEditingDirection(true)}
+                >
+                  <Edit2 className="h-3 w-3 mr-1" />
+                  Manual Override
+                </Button>
+              )}
             </div>
           )}
+
+          {/* Manual Direction Override Form */}
+          {isEditingDirection && (
+            <div className="p-3 bg-primary/10 border border-primary/30 rounded space-y-3">
+              <div className="text-xs font-medium text-primary">Manual Direction Override</div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground uppercase">Open Side</Label>
+                  <Select value={editOpenSide} onValueChange={setEditOpenSide}>
+                    <SelectTrigger className="h-8 text-xs">
+                      <SelectValue placeholder="Select open side" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="sell_to_open">sell_to_open (Credit)</SelectItem>
+                      <SelectItem value="buy_to_open">buy_to_open (Debit)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground uppercase">Close Side</Label>
+                  <Select value={editCloseSide} onValueChange={setEditCloseSide}>
+                    <SelectTrigger className="h-8 text-xs">
+                      <SelectValue placeholder="Select close side" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="buy_to_close">buy_to_close</SelectItem>
+                      <SelectItem value="sell_to_close">sell_to_close</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => setIsEditingDirection(false)}
+                >
+                  <X className="h-3 w-3 mr-1" />
+                  Cancel
+                </Button>
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={handleSaveDirection}
+                  disabled={!editOpenSide || !editCloseSide}
+                >
+                  <Save className="h-3 w-3 mr-1" />
+                  Save & Recalculate P&L
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Verification Status Badge */}
+          <div className="flex items-center gap-2">
+            {isVerified ? (
+              <div className="flex items-center gap-1 text-xs text-trading-green bg-trading-green/10 px-2 py-0.5 rounded">
+                <CheckCircle className="h-3 w-3" />
+                <span>Verified</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1 text-xs text-bloomberg-amber bg-bloomberg-amber/10 px-2 py-0.5 rounded">
+                <XCircle className="h-3 w-3" />
+                <span>Unverified - Excluded from totals</span>
+              </div>
+            )}
+          </div>
 
           {/* Trade Details Grid */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -127,21 +229,29 @@ const TradeDetailsRow = ({
             {/* P&L Section */}
             <div className="space-y-2">
               <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground uppercase tracking-wide">
-                {trade.pnl >= 0 ? <TrendingUp className="h-3 w-3 text-trading-green" /> : <TrendingDown className="h-3 w-3 text-panic-red" />}
+                {pnlDisplay != null && pnlDisplay >= 0 ? <TrendingUp className="h-3 w-3 text-trading-green" /> : <TrendingDown className="h-3 w-3 text-panic-red" />}
                 Profit/Loss
               </div>
               <div className="space-y-1 text-xs">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">P&L:</span>
-                  <span className={cn("font-mono font-semibold", trade.pnl >= 0 ? "text-trading-green" : "text-panic-red")}>
-                    {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
-                  </span>
+                  {pnlDisplay != null ? (
+                    <span className={cn("font-mono font-semibold", pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red")}>
+                      {pnlDisplay >= 0 ? '+' : ''}${Number(pnlDisplay).toFixed(2)}
+                    </span>
+                  ) : (
+                    <span className="font-mono text-muted-foreground">--</span>
+                  )}
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">P&L %:</span>
-                  <span className={cn("font-mono", trade.pnl >= 0 ? "text-trading-green" : "text-panic-red")}>
-                    {trade.pnl_percent != null ? `${trade.pnl_percent >= 0 ? '+' : ''}${Number(trade.pnl_percent).toFixed(1)}%` : '--'}
-                  </span>
+                  {trade.pnl_percent != null ? (
+                    <span className={cn("font-mono", trade.pnl_percent >= 0 ? "text-trading-green" : "text-panic-red")}>
+                      {trade.pnl_percent >= 0 ? '+' : ''}{Number(trade.pnl_percent).toFixed(1)}%
+                    </span>
+                  ) : (
+                    <span className="font-mono text-muted-foreground">--</span>
+                  )}
                 </div>
                 {trade.entry_credit != null && (
                   <div className="flex justify-between">
@@ -201,25 +311,29 @@ const TradeDetailsRow = ({
               <div className="space-y-1">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Open Side:</span>
-                  <span className={cn("font-mono", trade.open_side?.includes('sell') ? "text-trading-green" : "text-bloomberg-amber")}>
+                  <span className={cn("font-mono", trade.open_side?.includes('sell') ? "text-trading-green" : trade.open_side ? "text-bloomberg-amber" : "text-muted-foreground")}>
                     {trade.open_side || '--'}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">Open Price:</span>
-                  <span className="font-mono">${Number(trade.entry_price).toFixed(4)}</span>
+                  <span className="text-muted-foreground">Open Order:</span>
+                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={trade.open_order_id || 'N/A'}>
+                    {trade.open_order_id ? `#${trade.open_order_id}` : '--'}
+                  </span>
                 </div>
               </div>
               <div className="space-y-1">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Close Side:</span>
-                  <span className={cn("font-mono", trade.close_side?.includes('buy') ? "text-panic-red" : "text-bloomberg-amber")}>
+                  <span className={cn("font-mono", trade.close_side?.includes('buy') ? "text-panic-red" : trade.close_side ? "text-bloomberg-amber" : "text-muted-foreground")}>
                     {trade.close_side || '--'}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">Close Price:</span>
-                  <span className="font-mono">${Number(trade.exit_price).toFixed(4)}</span>
+                  <span className="text-muted-foreground">Close Order:</span>
+                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={trade.close_order_id || 'N/A'}>
+                    {trade.close_order_id ? `#${trade.close_order_id}` : '--'}
+                  </span>
                 </div>
               </div>
               <div className="space-y-1">
@@ -228,9 +342,9 @@ const TradeDetailsRow = ({
                   <span className="font-mono">${Number(trade.fees || 0).toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">Close Order:</span>
-                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={trade.close_order_id || 'N/A'}>
-                    {trade.close_order_id ? `#${trade.close_order_id}` : '--'}
+                  <span className="text-muted-foreground">Reconcile:</span>
+                  <span className={cn("font-mono", trade.needs_reconcile ? "text-bloomberg-amber" : "text-trading-green")}>
+                    {trade.needs_reconcile ? 'Yes' : 'No'}
                   </span>
                 </div>
               </div>
@@ -318,18 +432,24 @@ interface TradeGroupRowProps {
 }
 
 const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
+  const pnlDisplay = group.needsReconcile ? null : group.totalPnl;
+  
   return (
     <>
       <TableRow 
         className={cn(
           "border-border cursor-pointer transition-colors",
-          isExpanded ? "bg-primary/10" : "hover:bg-secondary/30"
+          isExpanded ? "bg-primary/10" : "hover:bg-secondary/30",
+          group.needsReconcile && "border-l-2 border-l-bloomberg-amber"
         )}
         onClick={onToggle}
       >
         <TableCell className="py-1.5 w-8">
           <div className="flex items-center gap-1">
             <Layers className="h-3 w-3 text-primary" />
+            {group.needsReconcile && (
+              <AlertTriangle className="h-3 w-3 text-bloomberg-amber" />
+            )}
             <ChevronRight 
               className={cn(
                 "h-4 w-4 text-muted-foreground transition-transform",
@@ -354,9 +474,9 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
         </TableCell>
         <TableCell className={cn(
           "font-mono text-xs text-right py-1.5 font-semibold",
-          group.totalPnl >= 0 ? "text-trading-green" : "text-panic-red"
+          pnlDisplay != null ? (pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red") : "text-muted-foreground"
         )}>
-          {group.totalPnl >= 0 ? '+' : ''}${Number(group.totalPnl).toFixed(2)}
+          {pnlDisplay != null ? `${pnlDisplay >= 0 ? '+' : ''}$${Number(pnlDisplay).toFixed(2)}` : '--'}
         </TableCell>
         <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
           {group.exitReason || '--'}
@@ -371,43 +491,69 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
         >
           <TableCell colSpan={6} className="p-0">
             <div className="p-3 space-y-2 border-l-2 border-primary/50 ml-4">
+              {group.needsReconcile && (
+                <div className="flex items-center gap-2 text-xs text-bloomberg-amber bg-bloomberg-amber/10 p-2 rounded">
+                  <AlertTriangle className="h-3 w-3" />
+                  <span>Some legs need reconciliation - P&L excluded from totals</span>
+                </div>
+              )}
               <div className="text-[10px] text-muted-foreground uppercase tracking-wide mb-2">
                 Legs in this spread
               </div>
-              {group.trades.map((leg, idx) => (
-                <div key={leg.id || idx} className="flex items-center justify-between text-xs bg-background/50 rounded px-2 py-1.5">
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground text-[10px] w-4">{idx + 1}.</span>
-                    <span className="font-mono">{leg.symbol}</span>
-                    <span className="text-muted-foreground">×{leg.quantity}</span>
-                    <span className={cn(
-                      "text-[9px] px-1 rounded",
-                      leg.open_side?.includes('sell') ? "bg-trading-green/20 text-trading-green" : "bg-bloomberg-amber/20 text-bloomberg-amber"
-                    )}>
-                      {leg.open_side || '?'}
-                    </span>
+              {group.trades.map((leg, idx) => {
+                const legPnl = leg.pnl != null && !leg.needs_reconcile ? leg.pnl : null;
+                return (
+                  <div key={leg.id || idx} className={cn(
+                    "flex items-center justify-between text-xs bg-background/50 rounded px-2 py-1.5",
+                    leg.needs_reconcile && "border border-bloomberg-amber/30"
+                  )}>
+                    <div className="flex items-center gap-2">
+                      <span className="text-muted-foreground text-[10px] w-4">{idx + 1}.</span>
+                      <span className="font-mono">{leg.symbol}</span>
+                      <span className="text-muted-foreground">×{leg.quantity}</span>
+                      <span className={cn(
+                        "text-[9px] px-1 rounded",
+                        leg.open_side?.includes('sell') ? "bg-trading-green/20 text-trading-green" : 
+                        leg.open_side ? "bg-bloomberg-amber/20 text-bloomberg-amber" : "bg-muted/20 text-muted-foreground"
+                      )}>
+                        {leg.open_side || '?'}
+                      </span>
+                      {leg.needs_reconcile && (
+                        <AlertTriangle className="h-3 w-3 text-bloomberg-amber" />
+                      )}
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <span className="text-muted-foreground">
+                        ${Number(leg.entry_price).toFixed(4)} → ${Number(leg.exit_price).toFixed(4)}
+                      </span>
+                      {legPnl != null ? (
+                        <span className={cn(
+                          "font-mono",
+                          legPnl >= 0 ? "text-trading-green" : "text-panic-red"
+                        )}>
+                          {legPnl >= 0 ? '+' : ''}${Number(legPnl).toFixed(2)}
+                        </span>
+                      ) : (
+                        <span className="font-mono text-muted-foreground">--</span>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-4">
-                    <span className="text-muted-foreground">
-                      ${Number(leg.entry_price).toFixed(4)} → ${Number(leg.exit_price).toFixed(4)}
-                    </span>
-                    <span className={cn(
-                      "font-mono",
-                      leg.pnl >= 0 ? "text-trading-green" : "text-panic-red"
-                    )}>
-                      {leg.pnl >= 0 ? '+' : ''}${Number(leg.pnl).toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
               <div className="flex justify-between items-center pt-2 border-t border-border mt-2">
-                <span className="text-[10px] text-muted-foreground uppercase">Combined P&L</span>
-                <span className={cn(
-                  "font-mono font-semibold",
-                  group.totalPnl >= 0 ? "text-trading-green" : "text-panic-red"
-                )}>
-                  {group.totalPnl >= 0 ? '+' : ''}${Number(group.totalPnl).toFixed(2)}
+                <span className="text-[10px] text-muted-foreground uppercase">
+                  Combined P&L {group.needsReconcile && '(partial)'}
                 </span>
+                {pnlDisplay != null ? (
+                  <span className={cn(
+                    "font-mono font-semibold",
+                    pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red"
+                  )}>
+                    {pnlDisplay >= 0 ? '+' : ''}${Number(pnlDisplay).toFixed(2)}
+                  </span>
+                ) : (
+                  <span className="font-mono text-muted-foreground">--</span>
+                )}
               </div>
             </div>
           </TableCell>
@@ -428,6 +574,8 @@ export const TradeJournal = () => {
     winRate: 0,
     avgWinner: 0,
     avgLoser: 0,
+    needsReconcileCount: 0,
+    verifiedCount: 0,
   });
   const [isLoading, setIsLoading] = useState(true);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -499,12 +647,27 @@ export const TradeJournal = () => {
     }
   };
 
+  const handleManualOverride = async (tradeId: string, openSide: string, closeSide: string) => {
+    try {
+      const result = await tradeJournal.manualOverride(tradeId, openSide, closeSide);
+      if (result.success) {
+        toast.success('Direction updated and P&L recalculated');
+        loadTrades();
+      } else {
+        toast.error(result.error || 'Failed to update direction');
+      }
+    } catch (error) {
+      console.error('Error in manual override:', error);
+      toast.error('Error updating direction');
+    }
+  };
+
   const handleRecalculatePnl = async () => {
     setIsRecalculating(true);
     try {
       const result = await tradeJournal.recalculatePnl();
       if (result.success) {
-        toast.success(`Recalculated P&L for ${result.updated} trades`);
+        toast.success(`Verified: ${result.updated} | Skipped (no direction): ${result.skipped}`);
         if (result.errors.length > 0) {
           console.warn('P&L recalculation warnings:', result.errors);
           toast.warning(`${result.errors.length} trades had issues - check console`);
@@ -596,15 +759,20 @@ export const TradeJournal = () => {
       const reconcileResult = await reconcileFromTradierFills(startDate, endDate);
       
       if (reconcileResult.success) {
-        if (reconcileResult.reconciled > 0) {
-          toast.success(`Reconciled ${reconcileResult.reconciled} trades with Tradier fills`);
-        } else {
-          toast.info('No trades needed reconciliation');
+        // Show summary
+        const verified = reconcileResult.reconciled;
+        const stillUnverified = reconcileResult.skipped;
+        
+        if (verified > 0) {
+          toast.success(`Reconciled ${verified} trades with Tradier fills`);
         }
         
-        if (reconcileResult.mismatches.length > 0) {
-          console.warn('Reconciliation mismatches:', reconcileResult.mismatches);
-          toast.warning(`${reconcileResult.mismatches.length} trades could not be matched - check console`);
+        if (stillUnverified > 0) {
+          toast.warning(`${stillUnverified} trades still need manual override`);
+        }
+        
+        if (verified === 0 && stillUnverified === 0 && importResult.imported === 0) {
+          toast.info('No trades needed reconciliation');
         }
         
         if (reconcileResult.errors.length > 0) {
@@ -641,8 +809,10 @@ export const TradeJournal = () => {
           <div className="flex items-center gap-4">
             <div className="flex gap-3 text-[10px]">
               <span className="text-muted-foreground">
-                {countByLeg ? 'Legs' : 'Strategies'}: <span className="text-foreground">{stats.totalTrades}</span>
-                {!countByLeg && <span className="text-muted-foreground/60 ml-0.5">({stats.totalLegs}L)</span>}
+                Verified: <span className="text-trading-green">{stats.verifiedCount}</span>
+                {stats.needsReconcileCount > 0 && (
+                  <span className="text-bloomberg-amber ml-1">({stats.needsReconcileCount} unverified)</span>
+                )}
               </span>
               <span className="text-muted-foreground">
                 Win Rate: <span className={cn(
@@ -653,6 +823,7 @@ export const TradeJournal = () => {
                 Total P&L: <span className={cn(
                   stats.totalPnl >= 0 ? 'text-trading-green' : 'text-panic-red'
                 )}>${stats.totalPnl.toFixed(2)}</span>
+                <span className="text-muted-foreground/60 ml-0.5">(verified only)</span>
               </span>
             </div>
             {isExpanded ? (
@@ -796,6 +967,8 @@ export const TradeJournal = () => {
                         }
                         
                         const trade = item;
+                        const tradePnl = trade.pnl != null && !trade.needs_reconcile ? trade.pnl : null;
+                        
                         return (
                           <>
                             <TableRow 
@@ -831,9 +1004,9 @@ export const TradeJournal = () => {
                               </TableCell>
                               <TableCell className={cn(
                                 "font-mono text-xs text-right py-1.5",
-                                trade.pnl >= 0 ? "text-trading-green" : "text-panic-red"
+                                tradePnl != null ? (tradePnl >= 0 ? "text-trading-green" : "text-panic-red") : "text-muted-foreground"
                               )}>
-                                {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
+                                {tradePnl != null ? `${tradePnl >= 0 ? '+' : ''}$${Number(tradePnl).toFixed(2)}` : '--'}
                               </TableCell>
                               <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
                                 {trade.exit_reason || '--'}
@@ -849,6 +1022,7 @@ export const TradeJournal = () => {
                                 onSaveNotes={handleSaveNotes}
                                 onCancelEdit={() => setEditingId(null)}
                                 onNotesChange={setEditNotes}
+                                onManualOverride={handleManualOverride}
                               />
                             )}
                           </>
