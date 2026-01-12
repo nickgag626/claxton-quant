@@ -3,11 +3,21 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord, TradeGroup, TradeStats } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate } from '@/services/tradeJournal';
 import { format } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Trash2, RefreshCw } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 // Type guard to check if item is a TradeGroup
 const isTradeGroup = (item: TradeRecord | TradeGroup): item is TradeGroup => {
@@ -59,6 +69,14 @@ const TradeDetailsRow = ({
     >
       <TableCell colSpan={6} className="p-0">
         <div className="p-4 space-y-4">
+          {/* Reconciliation Warning */}
+          {trade.needs_reconcile && (
+            <div className="flex items-center gap-2 p-2 bg-bloomberg-amber/20 border border-bloomberg-amber/30 rounded text-xs text-bloomberg-amber">
+              <AlertTriangle className="h-4 w-4" />
+              <span>This trade needs reconciliation - missing open_side or close_order_id</span>
+            </div>
+          )}
+
           {/* Trade Details Grid */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {/* Timing Section */}
@@ -209,9 +227,9 @@ const TradeDetailsRow = ({
                   <span className="font-mono">${Number(trade.fees || 0).toFixed(2)}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">Order IDs:</span>
-                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={`Open: ${trade.open_order_id || 'N/A'}, Close: ${trade.close_order_id || 'N/A'}`}>
-                    {trade.close_order_id ? trade.close_order_id.slice(-6) : '--'}
+                  <span className="text-muted-foreground">Close Order:</span>
+                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={trade.close_order_id || 'N/A'}>
+                    {trade.close_order_id ? `#${trade.close_order_id}` : '--'}
                   </span>
                 </div>
               </div>
@@ -416,36 +434,47 @@ export const TradeJournal = () => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editNotes, setEditNotes] = useState('');
   const [isRecalculating, setIsRecalculating] = useState(false);
-  const [isDeduplicating, setIsDeduplicating] = useState(false);
+  const [countByLeg, setCountByLeg] = useState(false);
+  
+  // Duplicate detection state
+  const [isDetectingDuplicates, setIsDetectingDuplicates] = useState(false);
+  const [duplicateCandidates, setDuplicateCandidates] = useState<DuplicateCandidate[]>([]);
+  const [showDuplicatesDialog, setShowDuplicatesDialog] = useState(false);
+  const [selectedDuplicates, setSelectedDuplicates] = useState<Set<string>>(new Set());
+  const [isDeleting, setIsDeleting] = useState(false);
 
   useEffect(() => {
     loadTrades();
   }, []);
 
-  // Keep the journal fresh while it's expanded (so manual closes show up immediately)
   useEffect(() => {
     if (!isExpanded) return;
-
-    // Load immediately when expanding
     loadTrades();
-
-    // Then poll while expanded
     const interval = window.setInterval(() => {
       loadTrades();
     }, 5000);
-
     return () => window.clearInterval(interval);
   }, [isExpanded]);
+
+  // Reload stats when count mode changes
+  useEffect(() => {
+    loadStats();
+  }, [countByLeg]);
 
   const loadTrades = async () => {
     setIsLoading(true);
     const [tradesData, statsData] = await Promise.all([
       tradeJournal.getGroupedTrades(),
-      tradeJournal.getTradeStats(),
+      tradeJournal.getTradeStats(countByLeg),
     ]);
     setTrades(tradesData);
     setStats(statsData);
     setIsLoading(false);
+  };
+
+  const loadStats = async () => {
+    const statsData = await tradeJournal.getTradeStats(countByLeg);
+    setStats(statsData);
   };
 
   const handleEditNotes = (trade: TradeRecord) => {
@@ -488,223 +517,352 @@ export const TradeJournal = () => {
     }
   };
 
-  const handleDeduplicateTrades = async () => {
-    setIsDeduplicating(true);
+  const handleDetectDuplicates = async () => {
+    setIsDetectingDuplicates(true);
     try {
-      const result = await tradeJournal.deduplicateTrades(2);
-      if (result.success) {
-        toast.success(`Removed ${result.deleted} duplicate trades`);
-        loadTrades();
+      const result = await tradeJournal.detectDuplicates();
+      if (result.error) {
+        toast.error(result.error);
+      } else if (result.candidates.length === 0) {
+        toast.success('No duplicates detected');
       } else {
-        toast.error(result.error || 'Failed to deduplicate');
+        setDuplicateCandidates(result.candidates);
+        setSelectedDuplicates(new Set(result.candidates.map(c => c.id)));
+        setShowDuplicatesDialog(true);
       }
     } catch (error) {
-      console.error('Error deduplicating:', error);
-      toast.error('Error deduplicating trades');
+      console.error('Error detecting duplicates:', error);
+      toast.error('Error detecting duplicates');
     } finally {
-      setIsDeduplicating(false);
+      setIsDetectingDuplicates(false);
     }
   };
 
+  const handleDeleteSelectedDuplicates = async () => {
+    if (selectedDuplicates.size === 0) return;
+    
+    setIsDeleting(true);
+    try {
+      const result = await tradeJournal.deleteDuplicates(Array.from(selectedDuplicates));
+      if (result.success) {
+        toast.success(`Deleted ${result.deleted} duplicate trades`);
+        setShowDuplicatesDialog(false);
+        setDuplicateCandidates([]);
+        setSelectedDuplicates(new Set());
+        loadTrades();
+      } else {
+        toast.error(result.error || 'Failed to delete duplicates');
+      }
+    } catch (error) {
+      console.error('Error deleting duplicates:', error);
+      toast.error('Error deleting duplicates');
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const toggleDuplicateSelection = (id: string) => {
+    setSelectedDuplicates(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: 0.35 }}
-      className="terminal-panel"
-    >
-      <div 
-        className="flex items-center justify-between cursor-pointer border-b border-border pb-1.5 mb-3"
-        onClick={() => setIsExpanded(!isExpanded)}
+    <>
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.35 }}
+        className="terminal-panel"
       >
-        <div className="text-[10px] text-muted-foreground uppercase tracking-widest">
-          Trade Journal
-        </div>
-        <div className="flex items-center gap-4">
-          <div className="flex gap-3 text-[10px]">
-            <span className="text-muted-foreground">
-              Strategies: <span className="text-foreground">{stats.totalTrades}</span>
-              <span className="text-muted-foreground/60 ml-0.5">({stats.totalLegs}L)</span>
-            </span>
-            <span className="text-muted-foreground">
-              Win Rate: <span className={cn(
-                stats.winRate >= 50 ? 'text-trading-green' : 'text-panic-red'
-              )}>{stats.winRate.toFixed(1)}%</span>
-            </span>
-            <span className="text-muted-foreground">
-              Total P&L: <span className={cn(
-                stats.totalPnl >= 0 ? 'text-trading-green' : 'text-panic-red'
-              )}>${stats.totalPnl.toFixed(2)}</span>
-            </span>
-          </div>
-          {isExpanded ? (
-            <ChevronUp className="h-4 w-4 text-muted-foreground" />
-          ) : (
-            <ChevronDown className="h-4 w-4 text-muted-foreground" />
-          )}
-        </div>
-      </div>
-
-      {isExpanded && (
-        <motion.div
-          initial={{ opacity: 0, height: 0 }}
-          animate={{ opacity: 1, height: 'auto' }}
-          exit={{ opacity: 0, height: 0 }}
+        <div 
+          className="flex items-center justify-between cursor-pointer border-b border-border pb-1.5 mb-3"
+          onClick={() => setIsExpanded(!isExpanded)}
         >
-          {/* Stats Summary */}
-          <div className="grid grid-cols-4 gap-3 mb-4 p-2 bg-secondary/30 rounded">
-            <div className="text-center">
-              <div className="text-[10px] text-muted-foreground uppercase">Winners</div>
-              <div className="text-sm font-mono text-trading-green">{stats.winningTrades}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] text-muted-foreground uppercase">Losers</div>
-              <div className="text-sm font-mono text-panic-red">{stats.losingTrades}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] text-muted-foreground uppercase">Avg Win</div>
-              <div className="text-sm font-mono text-trading-green">${stats.avgWinner.toFixed(2)}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] text-muted-foreground uppercase">Avg Loss</div>
-              <div className="text-sm font-mono text-panic-red">${stats.avgLoser.toFixed(2)}</div>
-            </div>
+          <div className="text-[10px] text-muted-foreground uppercase tracking-widest">
+            Trade Journal
           </div>
-
-          {/* Maintenance Actions */}
-          <div className="flex gap-2 mb-4">
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 text-xs"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleRecalculatePnl();
-              }}
-              disabled={isRecalculating}
-            >
-              {isRecalculating ? (
-                <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
-              ) : (
-                <Calculator className="h-3 w-3 mr-1" />
-              )}
-              Recompute P&L
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 text-xs"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleDeduplicateTrades();
-              }}
-              disabled={isDeduplicating}
-            >
-              {isDeduplicating ? (
-                <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
-              ) : (
-                <Trash2 className="h-3 w-3 mr-1" />
-              )}
-              Remove Duplicates
-            </Button>
+          <div className="flex items-center gap-4">
+            <div className="flex gap-3 text-[10px]">
+              <span className="text-muted-foreground">
+                {countByLeg ? 'Legs' : 'Strategies'}: <span className="text-foreground">{stats.totalTrades}</span>
+                {!countByLeg && <span className="text-muted-foreground/60 ml-0.5">({stats.totalLegs}L)</span>}
+              </span>
+              <span className="text-muted-foreground">
+                Win Rate: <span className={cn(
+                  stats.winRate >= 50 ? 'text-trading-green' : 'text-panic-red'
+                )}>{stats.winRate.toFixed(1)}%</span>
+              </span>
+              <span className="text-muted-foreground">
+                Total P&L: <span className={cn(
+                  stats.totalPnl >= 0 ? 'text-trading-green' : 'text-panic-red'
+                )}>${stats.totalPnl.toFixed(2)}</span>
+              </span>
+            </div>
+            {isExpanded ? (
+              <ChevronUp className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+            )}
           </div>
+        </div>
 
-          {/* Trades Table */}
-          {isLoading ? (
-            <div className="text-center text-muted-foreground text-sm py-8">
-              Loading trades...
+        {isExpanded && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+          >
+            {/* Stats Summary */}
+            <div className="grid grid-cols-4 gap-3 mb-4 p-2 bg-secondary/30 rounded">
+              <div className="text-center">
+                <div className="text-[10px] text-muted-foreground uppercase">Winners</div>
+                <div className="text-sm font-mono text-trading-green">{stats.winningTrades}</div>
+              </div>
+              <div className="text-center">
+                <div className="text-[10px] text-muted-foreground uppercase">Losers</div>
+                <div className="text-sm font-mono text-panic-red">{stats.losingTrades}</div>
+              </div>
+              <div className="text-center">
+                <div className="text-[10px] text-muted-foreground uppercase">Avg Win</div>
+                <div className="text-sm font-mono text-trading-green">${stats.avgWinner.toFixed(2)}</div>
+              </div>
+              <div className="text-center">
+                <div className="text-[10px] text-muted-foreground uppercase">Avg Loss</div>
+                <div className="text-sm font-mono text-panic-red">${stats.avgLoser.toFixed(2)}</div>
+              </div>
             </div>
-          ) : trades.length === 0 ? (
-            <div className="text-center text-muted-foreground text-sm py-8">
-              No completed trades yet
+
+            {/* Controls Row */}
+            <div className="flex items-center justify-between gap-4 mb-4">
+              {/* Maintenance Actions */}
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleRecalculatePnl();
+                  }}
+                  disabled={isRecalculating}
+                >
+                  {isRecalculating ? (
+                    <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+                  ) : (
+                    <Calculator className="h-3 w-3 mr-1" />
+                  )}
+                  Recompute P&L
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDetectDuplicates();
+                  }}
+                  disabled={isDetectingDuplicates}
+                >
+                  {isDetectingDuplicates ? (
+                    <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+                  ) : (
+                    <Search className="h-3 w-3 mr-1" />
+                  )}
+                  Detect Duplicates
+                </Button>
+              </div>
+
+              {/* Count by Leg Toggle */}
+              <div className="flex items-center space-x-2" onClick={(e) => e.stopPropagation()}>
+                <Switch
+                  id="count-by-leg"
+                  checked={countByLeg}
+                  onCheckedChange={setCountByLeg}
+                />
+                <Label htmlFor="count-by-leg" className="text-[10px] text-muted-foreground cursor-pointer">
+                  Count by leg
+                </Label>
+              </div>
             </div>
-          ) : (
-            <div className="overflow-auto max-h-[500px]">
-              <Table>
-                <TableHeader>
-                  <TableRow className="border-border hover:bg-transparent">
-                    <TableHead className="w-8"></TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Date</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Strategy</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Symbol</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">P&L</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Exit</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <AnimatePresence>
-                    {trades.map((item) => {
-                      if (isTradeGroup(item)) {
-                        return (
-                          <TradeGroupRow
-                            key={item.groupId}
-                            group={item}
-                            isExpanded={expandedTradeId === item.groupId}
-                            onToggle={() => toggleTradeExpanded(item.groupId)}
-                          />
-                        );
-                      }
-                      
-                      const trade = item;
-                      return (
-                        <>
-                          <TableRow 
-                            key={trade.id} 
-                            className={cn(
-                              "border-border cursor-pointer transition-colors",
-                              expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30"
-                            )}
-                            onClick={() => toggleTradeExpanded(trade.id!)}
-                          >
-                            <TableCell className="py-1.5 w-8">
-                              <ChevronRight 
-                                className={cn(
-                                  "h-4 w-4 text-muted-foreground transition-transform",
-                                  expandedTradeId === trade.id && "rotate-90"
-                                )} 
-                              />
-                            </TableCell>
-                            <TableCell className="font-mono text-xs text-foreground py-1.5">
-                              {trade.exit_time ? format(new Date(trade.exit_time), 'MM/dd HH:mm') : '--'}
-                            </TableCell>
-                            <TableCell className="font-mono text-xs text-foreground py-1.5">
-                              {trade.strategy_name?.slice(0, 15) || trade.underlying}
-                            </TableCell>
-                            <TableCell className="font-mono text-xs text-foreground py-1.5">
-                              {trade.symbol.length > 18 ? trade.symbol.slice(0, 18) + '...' : trade.symbol}
-                            </TableCell>
-                            <TableCell className={cn(
-                              "font-mono text-xs text-right py-1.5",
-                              trade.pnl >= 0 ? "text-trading-green" : "text-panic-red"
-                            )}>
-                              {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
-                            </TableCell>
-                            <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
-                              {trade.exit_reason || '--'}
-                            </TableCell>
-                          </TableRow>
-                          {expandedTradeId === trade.id && (
-                            <TradeDetailsRow
-                              key={`${trade.id}-details`}
-                              trade={trade}
-                              isEditing={editingId === trade.id}
-                              editNotes={editNotes}
-                              onEditNotes={handleEditNotes}
-                              onSaveNotes={handleSaveNotes}
-                              onCancelEdit={() => setEditingId(null)}
-                              onNotesChange={setEditNotes}
+
+            {/* Trades Table */}
+            {isLoading ? (
+              <div className="text-center text-muted-foreground text-sm py-8">
+                Loading trades...
+              </div>
+            ) : trades.length === 0 ? (
+              <div className="text-center text-muted-foreground text-sm py-8">
+                No completed trades yet
+              </div>
+            ) : (
+              <div className="overflow-auto max-h-[500px]">
+                <Table>
+                  <TableHeader>
+                    <TableRow className="border-border hover:bg-transparent">
+                      <TableHead className="w-8"></TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Date</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Strategy</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Symbol</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">P&L</TableHead>
+                      <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">Exit</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    <AnimatePresence>
+                      {trades.map((item) => {
+                        if (isTradeGroup(item)) {
+                          return (
+                            <TradeGroupRow
+                              key={item.groupId}
+                              group={item}
+                              isExpanded={expandedTradeId === item.groupId}
+                              onToggle={() => toggleTradeExpanded(item.groupId)}
                             />
-                          )}
-                        </>
-                      );
-                    })}
-                  </AnimatePresence>
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </motion.div>
-      )}
-    </motion.div>
+                          );
+                        }
+                        
+                        const trade = item;
+                        return (
+                          <>
+                            <TableRow 
+                              key={trade.id} 
+                              className={cn(
+                                "border-border cursor-pointer transition-colors",
+                                expandedTradeId === trade.id ? "bg-secondary/40" : "hover:bg-secondary/30",
+                                trade.needs_reconcile && "border-l-2 border-l-bloomberg-amber"
+                              )}
+                              onClick={() => toggleTradeExpanded(trade.id!)}
+                            >
+                              <TableCell className="py-1.5 w-8">
+                                <div className="flex items-center gap-1">
+                                  {trade.needs_reconcile && (
+                                    <AlertTriangle className="h-3 w-3 text-bloomberg-amber" />
+                                  )}
+                                  <ChevronRight 
+                                    className={cn(
+                                      "h-4 w-4 text-muted-foreground transition-transform",
+                                      expandedTradeId === trade.id && "rotate-90"
+                                    )} 
+                                  />
+                                </div>
+                              </TableCell>
+                              <TableCell className="font-mono text-xs text-foreground py-1.5">
+                                {trade.exit_time ? format(new Date(trade.exit_time), 'MM/dd HH:mm') : '--'}
+                              </TableCell>
+                              <TableCell className="font-mono text-xs text-foreground py-1.5">
+                                {trade.strategy_name?.slice(0, 15) || trade.underlying}
+                              </TableCell>
+                              <TableCell className="font-mono text-xs text-foreground py-1.5">
+                                {trade.symbol.length > 18 ? trade.symbol.slice(0, 18) + '...' : trade.symbol}
+                              </TableCell>
+                              <TableCell className={cn(
+                                "font-mono text-xs text-right py-1.5",
+                                trade.pnl >= 0 ? "text-trading-green" : "text-panic-red"
+                              )}>
+                                {trade.pnl >= 0 ? '+' : ''}${Number(trade.pnl).toFixed(2)}
+                              </TableCell>
+                              <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
+                                {trade.exit_reason || '--'}
+                              </TableCell>
+                            </TableRow>
+                            {expandedTradeId === trade.id && (
+                              <TradeDetailsRow
+                                key={`${trade.id}-details`}
+                                trade={trade}
+                                isEditing={editingId === trade.id}
+                                editNotes={editNotes}
+                                onEditNotes={handleEditNotes}
+                                onSaveNotes={handleSaveNotes}
+                                onCancelEdit={() => setEditingId(null)}
+                                onNotesChange={setEditNotes}
+                              />
+                            )}
+                          </>
+                        );
+                      })}
+                    </AnimatePresence>
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </motion.div>
+        )}
+      </motion.div>
+
+      {/* Duplicates Confirmation Dialog */}
+      <Dialog open={showDuplicatesDialog} onOpenChange={setShowDuplicatesDialog}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-5 w-5 text-bloomberg-amber" />
+              Duplicate Trades Detected
+            </DialogTitle>
+            <DialogDescription>
+              Found {duplicateCandidates.length} potential duplicate trades based on matching close_order_id.
+              Review and select which ones to delete.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="max-h-[300px] overflow-auto space-y-2">
+            {duplicateCandidates.map((candidate) => (
+              <div 
+                key={candidate.id}
+                className={cn(
+                  "flex items-center gap-3 p-2 rounded border",
+                  selectedDuplicates.has(candidate.id) 
+                    ? "border-panic-red/50 bg-panic-red/10" 
+                    : "border-border bg-secondary/20"
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={selectedDuplicates.has(candidate.id)}
+                  onChange={() => toggleDuplicateSelection(candidate.id)}
+                  className="h-4 w-4"
+                />
+                <div className="flex-1 text-xs">
+                  <div className="font-mono">{candidate.symbol}</div>
+                  <div className="text-muted-foreground">{candidate.reason}</div>
+                </div>
+                <div className="text-xs font-mono">
+                  {format(new Date(candidate.exit_time), 'MM/dd HH:mm')}
+                </div>
+                <div className={cn(
+                  "text-xs font-mono",
+                  candidate.pnl >= 0 ? "text-trading-green" : "text-panic-red"
+                )}>
+                  ${candidate.pnl.toFixed(2)}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowDuplicatesDialog(false)}>
+              Cancel
+            </Button>
+            <Button 
+              variant="destructive" 
+              onClick={handleDeleteSelectedDuplicates}
+              disabled={selectedDuplicates.size === 0 || isDeleting}
+            >
+              {isDeleting ? (
+                <RefreshCw className="h-4 w-4 mr-1 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4 mr-1" />
+              )}
+              Delete {selectedDuplicates.size} Selected
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };

@@ -18,7 +18,7 @@ export interface TradeRecord {
   exit_reason?: string;
   notes?: string;
   trade_group_id?: string;
-  // New audit columns
+  // Audit columns
   open_side?: string;
   close_side?: string;
   open_order_id?: string;
@@ -26,6 +26,7 @@ export interface TradeRecord {
   fees?: number;
   multiplier?: number;
   pnl_formula?: string;
+  needs_reconcile?: boolean;
 }
 
 export interface TradeGroup {
@@ -48,6 +49,15 @@ export interface TradeStats {
   winRate: number;          // % of winning groups
   avgWinner: number;
   avgLoser: number;
+}
+
+export interface DuplicateCandidate {
+  id: string;
+  symbol: string;
+  close_order_id?: string;
+  exit_time: string;
+  pnl: number;
+  reason: string;
 }
 
 /**
@@ -83,12 +93,16 @@ export function calculatePnl(
 }
 
 export const tradeJournal = {
-  async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string; id?: string }> {
+  /**
+   * Save a single trade with proper deduplication by close_order_id
+   */
+  async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string; id?: string; duplicate?: boolean }> {
     try {
       // Calculate P&L from fills if we have the data
       let pnl = trade.pnl;
       let pnlPercent = trade.pnl_percent;
       let pnlFormula = trade.pnl_formula;
+      let needsReconcile = false;
       
       if (trade.open_side && trade.entry_price && trade.exit_price) {
         const calc = calculatePnl(
@@ -102,6 +116,9 @@ export const tradeJournal = {
         pnl = calc.pnl;
         pnlPercent = calc.pnlPercent;
         pnlFormula = calc.formula;
+      } else {
+        // Missing critical fields - mark for reconciliation
+        needsReconcile = true;
       }
 
       const { data, error } = await supabase
@@ -130,15 +147,16 @@ export const tradeJournal = {
           fees: trade.fees || 0,
           multiplier: trade.multiplier || 100,
           pnl_formula: pnlFormula,
+          needs_reconcile: needsReconcile,
         })
         .select('id')
         .single();
 
       if (error) {
-        // Check for unique constraint violation (duplicate)
+        // Check for unique constraint violation (duplicate close_order_id)
         if (error.code === '23505') {
-          console.warn('Duplicate trade detected, skipping:', trade.symbol, trade.close_order_id);
-          return { success: true, id: undefined }; // Treat as success but no new record
+          console.warn('Duplicate trade detected (same close_order_id), skipping:', trade.symbol, trade.close_order_id);
+          return { success: true, duplicate: true };
         }
         throw error;
       }
@@ -149,11 +167,12 @@ export const tradeJournal = {
     }
   },
 
-  // Save multiple trades as a group (for spreads, iron condors, etc.)
+  /**
+   * Save multiple trades as a group (for spreads, iron condors, etc.)
+   */
   async saveTradeGroup(trades: Omit<TradeRecord, 'id' | 'trade_group_id'>[]): Promise<{ success: boolean; error?: string; groupId?: string }> {
     if (trades.length === 0) return { success: false, error: 'No trades to save' };
     
-    // Generate a group ID
     const groupId = crypto.randomUUID();
     
     try {
@@ -161,6 +180,7 @@ export const tradeJournal = {
         let pnl = trade.pnl;
         let pnlPercent = trade.pnl_percent;
         let pnlFormula = trade.pnl_formula;
+        let needsReconcile = false;
         
         if (trade.open_side && trade.entry_price && trade.exit_price) {
           const calc = calculatePnl(
@@ -174,6 +194,8 @@ export const tradeJournal = {
           pnl = calc.pnl;
           pnlPercent = calc.pnlPercent;
           pnlFormula = calc.formula;
+        } else {
+          needsReconcile = true;
         }
         
         return {
@@ -200,6 +222,7 @@ export const tradeJournal = {
           fees: trade.fees || 0,
           multiplier: trade.multiplier || 100,
           pnl_formula: pnlFormula,
+          needs_reconcile: needsReconcile,
         };
       });
 
@@ -237,37 +260,30 @@ export const tradeJournal = {
     }
   },
 
-  // Get trades grouped by trade_group_id
   async getGroupedTrades(limit = 50): Promise<(TradeRecord | TradeGroup)[]> {
     try {
       const { data, error } = await supabase
         .from('trades')
         .select('*')
         .order('exit_time', { ascending: false })
-        .limit(limit * 4); // Fetch more to account for legs
+        .limit(limit * 4);
 
       if (error) throw error;
       
       const trades = data || [];
       const grouped = new Map<string, TradeRecord[]>();
-      const ungrouped: TradeRecord[] = [];
 
-      // Separate grouped and ungrouped trades
       trades.forEach(trade => {
         if (trade.trade_group_id) {
           const existing = grouped.get(trade.trade_group_id) || [];
           existing.push(trade);
           grouped.set(trade.trade_group_id, existing);
-        } else {
-          ungrouped.push(trade);
         }
       });
 
-      // Build result array with groups and singles
       const result: (TradeRecord | TradeGroup)[] = [];
       const processedGroupIds = new Set<string>();
 
-      // Go through original order and insert groups/singles
       trades.forEach(trade => {
         if (trade.trade_group_id) {
           if (!processedGroupIds.has(trade.trade_group_id)) {
@@ -297,8 +313,10 @@ export const tradeJournal = {
     }
   },
 
-  // Get stats based on trade groups (strategies) not individual legs
-  async getTradeStats(): Promise<TradeStats> {
+  /**
+   * Get stats - can toggle between counting by strategy group vs by individual leg
+   */
+  async getTradeStats(countByLeg: boolean = false): Promise<TradeStats> {
     try {
       const { data, error } = await supabase
         .from('trades')
@@ -307,19 +325,42 @@ export const tradeJournal = {
       if (error) throw error;
 
       const trades = data || [];
+      const totalLegs = trades.length;
       
-      // Group trades by trade_group_id
-      const grouped = new Map<string | null, number>();
-      let totalLegs = 0;
+      if (countByLeg) {
+        // Count individual legs
+        const winners = trades.filter(t => Number(t.pnl) > 0);
+        const losers = trades.filter(t => Number(t.pnl) < 0);
+        const totalPnl = trades.reduce((sum, t) => sum + Number(t.pnl), 0);
+        const avgWinner = winners.length > 0 
+          ? winners.reduce((sum, t) => sum + Number(t.pnl), 0) / winners.length 
+          : 0;
+        const avgLoser = losers.length > 0 
+          ? losers.reduce((sum, t) => sum + Number(t.pnl), 0) / losers.length 
+          : 0;
+
+        return {
+          totalTrades: totalLegs,
+          totalLegs,
+          winningTrades: winners.length,
+          losingTrades: losers.length,
+          totalPnl,
+          winRate: totalLegs > 0 ? (winners.length / totalLegs) * 100 : 0,
+          avgWinner,
+          avgLoser,
+        };
+      }
+      
+      // Group by trade_group_id (default - count strategies)
+      const grouped = new Map<string, number>();
+      let singleTradeIndex = 0;
       
       trades.forEach(t => {
-        totalLegs++;
-        const groupKey = t.trade_group_id || `single_${totalLegs}`; // Treat ungrouped as individual
+        const groupKey = t.trade_group_id || `single_${singleTradeIndex++}`;
         const currentPnl = grouped.get(groupKey) || 0;
         grouped.set(groupKey, currentPnl + Number(t.pnl));
       });
 
-      // Calculate stats from groups
       const groupPnls = Array.from(grouped.values());
       const winners = groupPnls.filter(pnl => pnl > 0);
       const losers = groupPnls.filter(pnl => pnl < 0);
@@ -372,7 +413,9 @@ export const tradeJournal = {
     }
   },
 
-  // Recalculate P&L for all trades using stored open_side, prices, qty
+  /**
+   * Recalculate P&L for all trades using stored open_side, prices, qty
+   */
   async recalculatePnl(): Promise<{ success: boolean; updated: number; errors: string[] }> {
     try {
       const { data: trades, error } = await supabase
@@ -386,7 +429,8 @@ export const tradeJournal = {
 
       for (const trade of trades || []) {
         if (!trade.open_side) {
-          errors.push(`Trade ${trade.id} (${trade.symbol}): missing open_side`);
+          errors.push(`Trade ${trade.id?.slice(0, 8)} (${trade.symbol}): missing open_side - marked needs_reconcile`);
+          await supabase.from('trades').update({ needs_reconcile: true }).eq('id', trade.id);
           continue;
         }
 
@@ -405,6 +449,7 @@ export const tradeJournal = {
             pnl: calc.pnl,
             pnl_percent: calc.pnlPercent,
             pnl_formula: calc.formula,
+            needs_reconcile: false,
           })
           .eq('id', trade.id);
 
@@ -426,56 +471,90 @@ export const tradeJournal = {
     }
   },
 
-  // Delete duplicate trades keeping only the earliest per symbol within a time window
-  async deduplicateTrades(windowMinutes: number = 2): Promise<{ success: boolean; deleted: number; error?: string }> {
+  /**
+   * Detect duplicate trades based on close_order_id (safe, non-destructive)
+   */
+  async detectDuplicates(): Promise<{ candidates: DuplicateCandidate[]; error?: string }> {
     try {
       const { data: trades, error } = await supabase
         .from('trades')
-        .select('id, symbol, exit_time')
+        .select('id, symbol, close_order_id, exit_time, pnl')
         .order('exit_time', { ascending: true });
 
       if (error) throw error;
 
-      const seen = new Map<string, { id: string; time: Date }>();
-      const toDelete: string[] = [];
-
+      const candidates: DuplicateCandidate[] = [];
+      const seenByOrderId = new Map<string, string>(); // close_order_id -> first trade id
+      
       for (const trade of trades || []) {
-        const exitTime = new Date(trade.exit_time);
-        const key = trade.symbol;
-        
-        const existing = seen.get(key);
-        if (existing) {
-          const diffMs = Math.abs(exitTime.getTime() - existing.time.getTime());
-          const diffMinutes = diffMs / (1000 * 60);
-          
-          if (diffMinutes <= windowMinutes) {
-            // This is a duplicate - mark for deletion (keep the earlier one)
-            toDelete.push(trade.id);
-            continue;
+        if (trade.close_order_id) {
+          const key = `${trade.symbol}:${trade.close_order_id}`;
+          if (seenByOrderId.has(key)) {
+            // This is a duplicate - same symbol + close_order_id
+            candidates.push({
+              id: trade.id,
+              symbol: trade.symbol,
+              close_order_id: trade.close_order_id,
+              exit_time: trade.exit_time,
+              pnl: Number(trade.pnl),
+              reason: `Duplicate close_order_id (first: ${seenByOrderId.get(key)?.slice(0, 8)})`,
+            });
+          } else {
+            seenByOrderId.set(key, trade.id);
           }
         }
-        
-        // Update seen with this trade
-        seen.set(key, { id: trade.id, time: exitTime });
       }
 
-      if (toDelete.length > 0) {
-        const { error: deleteError } = await supabase
-          .from('trades')
-          .delete()
-          .in('id', toDelete);
-
-        if (deleteError) throw deleteError;
-      }
-
-      return { success: true, deleted: toDelete.length };
+      return { candidates };
     } catch (error) {
-      console.error('Error deduplicating trades:', error);
+      console.error('Error detecting duplicates:', error);
+      return { 
+        candidates: [], 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  },
+
+  /**
+   * Delete specific duplicate trades by ID (requires explicit confirmation)
+   */
+  async deleteDuplicates(tradeIds: string[]): Promise<{ success: boolean; deleted: number; error?: string }> {
+    if (tradeIds.length === 0) return { success: true, deleted: 0 };
+
+    try {
+      const { error } = await supabase
+        .from('trades')
+        .delete()
+        .in('id', tradeIds);
+
+      if (error) throw error;
+      return { success: true, deleted: tradeIds.length };
+    } catch (error) {
+      console.error('Error deleting duplicates:', error);
       return { 
         success: false, 
         deleted: 0, 
         error: error instanceof Error ? error.message : 'Unknown error' 
       };
+    }
+  },
+
+  /**
+   * Get trades that need reconciliation (missing open_side, close_order_id, etc.)
+   */
+  async getTradesNeedingReconciliation(): Promise<TradeRecord[]> {
+    try {
+      const { data, error } = await supabase
+        .from('trades')
+        .select('*')
+        .eq('needs_reconcile', true)
+        .order('exit_time', { ascending: false });
+
+      if (error) throw error;
+      return data || [];
+    } catch (error) {
+      console.error('Error fetching trades needing reconciliation:', error);
+      return [];
     }
   },
 };
