@@ -18,6 +18,14 @@ export interface TradeRecord {
   exit_reason?: string;
   notes?: string;
   trade_group_id?: string;
+  // New audit columns
+  open_side?: string;
+  close_side?: string;
+  open_order_id?: string;
+  close_order_id?: string;
+  fees?: number;
+  multiplier?: number;
+  pnl_formula?: string;
 }
 
 export interface TradeGroup {
@@ -31,9 +39,71 @@ export interface TradeGroup {
   exitReason?: string;
 }
 
+export interface TradeStats {
+  totalTrades: number;      // Number of trade groups (strategies)
+  totalLegs: number;        // Number of individual legs
+  winningTrades: number;    // Groups with pnl > 0
+  losingTrades: number;     // Groups with pnl < 0
+  totalPnl: number;         // Sum of all realized P&L
+  winRate: number;          // % of winning groups
+  avgWinner: number;
+  avgLoser: number;
+}
+
+/**
+ * Calculate P&L based on fills-derived entry/exit prices
+ * open_side = 'sell_to_open': pnl = (open_price - close_price) * qty * multiplier - fees
+ * open_side = 'buy_to_open': pnl = (close_price - open_price) * qty * multiplier - fees
+ */
+export function calculatePnl(
+  openSide: string,
+  openPrice: number,
+  closePrice: number,
+  quantity: number,
+  multiplier: number = 100,
+  fees: number = 0
+): { pnl: number; pnlPercent: number; formula: string } {
+  let pnl: number;
+  let formula: string;
+  
+  if (openSide === 'sell_to_open' || openSide === 'sell') {
+    // Credit trade: profit when close price < open price
+    pnl = (openPrice - closePrice) * quantity * multiplier - fees;
+    formula = `(${openPrice.toFixed(4)} - ${closePrice.toFixed(4)}) × ${quantity} × ${multiplier} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
+  } else {
+    // Debit trade: profit when close price > open price
+    pnl = (closePrice - openPrice) * quantity * multiplier - fees;
+    formula = `(${closePrice.toFixed(4)} - ${openPrice.toFixed(4)}) × ${quantity} × ${multiplier} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
+  }
+  
+  const cost = openPrice * quantity * multiplier;
+  const pnlPercent = cost > 0 ? (pnl / cost) * 100 : 0;
+  
+  return { pnl, pnlPercent, formula };
+}
+
 export const tradeJournal = {
   async saveTrade(trade: Omit<TradeRecord, 'id'>): Promise<{ success: boolean; error?: string; id?: string }> {
     try {
+      // Calculate P&L from fills if we have the data
+      let pnl = trade.pnl;
+      let pnlPercent = trade.pnl_percent;
+      let pnlFormula = trade.pnl_formula;
+      
+      if (trade.open_side && trade.entry_price && trade.exit_price) {
+        const calc = calculatePnl(
+          trade.open_side,
+          trade.entry_price,
+          trade.exit_price,
+          trade.quantity,
+          trade.multiplier || 100,
+          trade.fees || 0
+        );
+        pnl = calc.pnl;
+        pnlPercent = calc.pnlPercent;
+        pnlFormula = calc.formula;
+      }
+
       const { data, error } = await supabase
         .from('trades')
         .insert({
@@ -48,16 +118,30 @@ export const tradeJournal = {
           exit_price: trade.exit_price,
           entry_credit: trade.entry_credit,
           exit_debit: trade.exit_debit,
-          pnl: trade.pnl,
-          pnl_percent: trade.pnl_percent,
+          pnl,
+          pnl_percent: pnlPercent,
           exit_reason: trade.exit_reason,
           notes: trade.notes,
           trade_group_id: trade.trade_group_id,
+          open_side: trade.open_side,
+          close_side: trade.close_side,
+          open_order_id: trade.open_order_id,
+          close_order_id: trade.close_order_id,
+          fees: trade.fees || 0,
+          multiplier: trade.multiplier || 100,
+          pnl_formula: pnlFormula,
         })
         .select('id')
         .single();
 
-      if (error) throw error;
+      if (error) {
+        // Check for unique constraint violation (duplicate)
+        if (error.code === '23505') {
+          console.warn('Duplicate trade detected, skipping:', trade.symbol, trade.close_order_id);
+          return { success: true, id: undefined }; // Treat as success but no new record
+        }
+        throw error;
+      }
       return { success: true, id: data?.id };
     } catch (error) {
       console.error('Error saving trade:', error);
@@ -73,9 +157,26 @@ export const tradeJournal = {
     const groupId = crypto.randomUUID();
     
     try {
-      const { error } = await supabase
-        .from('trades')
-        .insert(trades.map(trade => ({
+      const tradesWithPnl = trades.map(trade => {
+        let pnl = trade.pnl;
+        let pnlPercent = trade.pnl_percent;
+        let pnlFormula = trade.pnl_formula;
+        
+        if (trade.open_side && trade.entry_price && trade.exit_price) {
+          const calc = calculatePnl(
+            trade.open_side,
+            trade.entry_price,
+            trade.exit_price,
+            trade.quantity,
+            trade.multiplier || 100,
+            trade.fees || 0
+          );
+          pnl = calc.pnl;
+          pnlPercent = calc.pnlPercent;
+          pnlFormula = calc.formula;
+        }
+        
+        return {
           symbol: trade.symbol,
           underlying: trade.underlying,
           strategy_name: trade.strategy_name,
@@ -87,14 +188,32 @@ export const tradeJournal = {
           exit_price: trade.exit_price,
           entry_credit: trade.entry_credit,
           exit_debit: trade.exit_debit,
-          pnl: trade.pnl,
-          pnl_percent: trade.pnl_percent,
+          pnl,
+          pnl_percent: pnlPercent,
           exit_reason: trade.exit_reason,
           notes: trade.notes,
           trade_group_id: groupId,
-        })));
+          open_side: trade.open_side,
+          close_side: trade.close_side,
+          open_order_id: trade.open_order_id,
+          close_order_id: trade.close_order_id,
+          fees: trade.fees || 0,
+          multiplier: trade.multiplier || 100,
+          pnl_formula: pnlFormula,
+        };
+      });
 
-      if (error) throw error;
+      const { error } = await supabase
+        .from('trades')
+        .insert(tradesWithPnl);
+
+      if (error) {
+        if (error.code === '23505') {
+          console.warn('Duplicate trade group detected, some legs may have been skipped');
+          return { success: true, groupId };
+        }
+        throw error;
+      }
       return { success: true, groupId };
     } catch (error) {
       console.error('Error saving trade group:', error);
@@ -178,40 +297,48 @@ export const tradeJournal = {
     }
   },
 
-  async getTradeStats(): Promise<{
-    totalTrades: number;
-    winningTrades: number;
-    losingTrades: number;
-    totalPnl: number;
-    winRate: number;
-    avgWinner: number;
-    avgLoser: number;
-  }> {
+  // Get stats based on trade groups (strategies) not individual legs
+  async getTradeStats(): Promise<TradeStats> {
     try {
       const { data, error } = await supabase
         .from('trades')
-        .select('pnl');
+        .select('pnl, trade_group_id');
 
       if (error) throw error;
 
       const trades = data || [];
-      const winners = trades.filter(t => t.pnl > 0);
-      const losers = trades.filter(t => t.pnl < 0);
       
-      const totalPnl = trades.reduce((sum, t) => sum + Number(t.pnl), 0);
+      // Group trades by trade_group_id
+      const grouped = new Map<string | null, number>();
+      let totalLegs = 0;
+      
+      trades.forEach(t => {
+        totalLegs++;
+        const groupKey = t.trade_group_id || `single_${totalLegs}`; // Treat ungrouped as individual
+        const currentPnl = grouped.get(groupKey) || 0;
+        grouped.set(groupKey, currentPnl + Number(t.pnl));
+      });
+
+      // Calculate stats from groups
+      const groupPnls = Array.from(grouped.values());
+      const winners = groupPnls.filter(pnl => pnl > 0);
+      const losers = groupPnls.filter(pnl => pnl < 0);
+      
+      const totalPnl = groupPnls.reduce((sum, pnl) => sum + pnl, 0);
       const avgWinner = winners.length > 0 
-        ? winners.reduce((sum, t) => sum + Number(t.pnl), 0) / winners.length 
+        ? winners.reduce((sum, pnl) => sum + pnl, 0) / winners.length 
         : 0;
       const avgLoser = losers.length > 0 
-        ? losers.reduce((sum, t) => sum + Number(t.pnl), 0) / losers.length 
+        ? losers.reduce((sum, pnl) => sum + pnl, 0) / losers.length 
         : 0;
 
       return {
-        totalTrades: trades.length,
+        totalTrades: groupPnls.length,
+        totalLegs,
         winningTrades: winners.length,
         losingTrades: losers.length,
         totalPnl,
-        winRate: trades.length > 0 ? (winners.length / trades.length) * 100 : 0,
+        winRate: groupPnls.length > 0 ? (winners.length / groupPnls.length) * 100 : 0,
         avgWinner,
         avgLoser,
       };
@@ -219,6 +346,7 @@ export const tradeJournal = {
       console.error('Error fetching trade stats:', error);
       return {
         totalTrades: 0,
+        totalLegs: 0,
         winningTrades: 0,
         losingTrades: 0,
         totalPnl: 0,
@@ -241,6 +369,113 @@ export const tradeJournal = {
     } catch (error) {
       console.error('Error updating trade notes:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  },
+
+  // Recalculate P&L for all trades using stored open_side, prices, qty
+  async recalculatePnl(): Promise<{ success: boolean; updated: number; errors: string[] }> {
+    try {
+      const { data: trades, error } = await supabase
+        .from('trades')
+        .select('*');
+
+      if (error) throw error;
+
+      let updated = 0;
+      const errors: string[] = [];
+
+      for (const trade of trades || []) {
+        if (!trade.open_side) {
+          errors.push(`Trade ${trade.id} (${trade.symbol}): missing open_side`);
+          continue;
+        }
+
+        const calc = calculatePnl(
+          trade.open_side,
+          Number(trade.entry_price),
+          Number(trade.exit_price),
+          Number(trade.quantity),
+          Number(trade.multiplier) || 100,
+          Number(trade.fees) || 0
+        );
+
+        const { error: updateError } = await supabase
+          .from('trades')
+          .update({
+            pnl: calc.pnl,
+            pnl_percent: calc.pnlPercent,
+            pnl_formula: calc.formula,
+          })
+          .eq('id', trade.id);
+
+        if (updateError) {
+          errors.push(`Trade ${trade.id}: ${updateError.message}`);
+        } else {
+          updated++;
+        }
+      }
+
+      return { success: true, updated, errors };
+    } catch (error) {
+      console.error('Error recalculating P&L:', error);
+      return { 
+        success: false, 
+        updated: 0, 
+        errors: [error instanceof Error ? error.message : 'Unknown error'] 
+      };
+    }
+  },
+
+  // Delete duplicate trades keeping only the earliest per symbol within a time window
+  async deduplicateTrades(windowMinutes: number = 2): Promise<{ success: boolean; deleted: number; error?: string }> {
+    try {
+      const { data: trades, error } = await supabase
+        .from('trades')
+        .select('id, symbol, exit_time')
+        .order('exit_time', { ascending: true });
+
+      if (error) throw error;
+
+      const seen = new Map<string, { id: string; time: Date }>();
+      const toDelete: string[] = [];
+
+      for (const trade of trades || []) {
+        const exitTime = new Date(trade.exit_time);
+        const key = trade.symbol;
+        
+        const existing = seen.get(key);
+        if (existing) {
+          const diffMs = Math.abs(exitTime.getTime() - existing.time.getTime());
+          const diffMinutes = diffMs / (1000 * 60);
+          
+          if (diffMinutes <= windowMinutes) {
+            // This is a duplicate - mark for deletion (keep the earlier one)
+            toDelete.push(trade.id);
+            continue;
+          }
+        }
+        
+        // Update seen with this trade
+        seen.set(key, { id: trade.id, time: exitTime });
+      }
+
+      if (toDelete.length > 0) {
+        const { error: deleteError } = await supabase
+          .from('trades')
+          .delete()
+          .in('id', toDelete);
+
+        if (deleteError) throw deleteError;
+      }
+
+      return { success: true, deleted: toDelete.length };
+    } catch (error) {
+      console.error('Error deduplicating trades:', error);
+      return { 
+        success: false, 
+        deleted: 0, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
     }
   },
 };

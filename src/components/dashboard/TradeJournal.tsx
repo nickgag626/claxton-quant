@@ -4,9 +4,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord, TradeGroup } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup, TradeStats } from '@/services/tradeJournal';
 import { format } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Trash2, RefreshCw } from 'lucide-react';
+import { toast } from 'sonner';
 
 // Type guard to check if item is a TradeGroup
 const isTradeGroup = (item: TradeRecord | TradeGroup): item is TradeGroup => {
@@ -91,11 +92,11 @@ const TradeDetailsRow = ({
               <div className="space-y-1 text-xs">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Entry Price:</span>
-                  <span className="font-mono">${Number(trade.entry_price).toFixed(2)}</span>
+                  <span className="font-mono">${Number(trade.entry_price).toFixed(4)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Exit Price:</span>
-                  <span className="font-mono">${Number(trade.exit_price).toFixed(2)}</span>
+                  <span className="font-mono">${Number(trade.exit_price).toFixed(4)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Quantity:</span>
@@ -159,6 +160,69 @@ const TradeDetailsRow = ({
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Audit Columns Section */}
+          <div className="space-y-2 border-t border-border pt-3">
+            <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground uppercase tracking-wide">
+              <Calculator className="h-3 w-3" />
+              Audit Details
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Qty:</span>
+                  <span className="font-mono">{trade.quantity}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Multiplier:</span>
+                  <span className="font-mono">×{trade.multiplier || 100}</span>
+                </div>
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Open Side:</span>
+                  <span className={cn("font-mono", trade.open_side?.includes('sell') ? "text-trading-green" : "text-bloomberg-amber")}>
+                    {trade.open_side || '--'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Open Price:</span>
+                  <span className="font-mono">${Number(trade.entry_price).toFixed(4)}</span>
+                </div>
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Close Side:</span>
+                  <span className={cn("font-mono", trade.close_side?.includes('buy') ? "text-panic-red" : "text-bloomberg-amber")}>
+                    {trade.close_side || '--'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Close Price:</span>
+                  <span className="font-mono">${Number(trade.exit_price).toFixed(4)}</span>
+                </div>
+              </div>
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Fees:</span>
+                  <span className="font-mono">${Number(trade.fees || 0).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Order IDs:</span>
+                  <span className="font-mono text-[9px] truncate max-w-[80px]" title={`Open: ${trade.open_order_id || 'N/A'}, Close: ${trade.close_order_id || 'N/A'}`}>
+                    {trade.close_order_id ? trade.close_order_id.slice(-6) : '--'}
+                  </span>
+                </div>
+              </div>
+            </div>
+            {/* P&L Formula */}
+            {trade.pnl_formula && (
+              <div className="mt-2 p-2 bg-background/50 rounded text-[10px] font-mono text-muted-foreground">
+                <span className="text-bloomberg-amber">Formula: </span>
+                {trade.pnl_formula}
+              </div>
+            )}
           </div>
 
           {/* Full Symbol */}
@@ -297,10 +361,16 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                     <span className="text-muted-foreground text-[10px] w-4">{idx + 1}.</span>
                     <span className="font-mono">{leg.symbol}</span>
                     <span className="text-muted-foreground">×{leg.quantity}</span>
+                    <span className={cn(
+                      "text-[9px] px-1 rounded",
+                      leg.open_side?.includes('sell') ? "bg-trading-green/20 text-trading-green" : "bg-bloomberg-amber/20 text-bloomberg-amber"
+                    )}>
+                      {leg.open_side || '?'}
+                    </span>
                   </div>
                   <div className="flex items-center gap-4">
                     <span className="text-muted-foreground">
-                      ${Number(leg.entry_price).toFixed(2)} → ${Number(leg.exit_price).toFixed(2)}
+                      ${Number(leg.entry_price).toFixed(4)} → ${Number(leg.exit_price).toFixed(4)}
                     </span>
                     <span className={cn(
                       "font-mono",
@@ -330,8 +400,9 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
 
 export const TradeJournal = () => {
   const [trades, setTrades] = useState<(TradeRecord | TradeGroup)[]>([]);
-  const [stats, setStats] = useState({
+  const [stats, setStats] = useState<TradeStats>({
     totalTrades: 0,
+    totalLegs: 0,
     winningTrades: 0,
     losingTrades: 0,
     totalPnl: 0,
@@ -344,6 +415,8 @@ export const TradeJournal = () => {
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editNotes, setEditNotes] = useState('');
+  const [isRecalculating, setIsRecalculating] = useState(false);
+  const [isDeduplicating, setIsDeduplicating] = useState(false);
 
   useEffect(() => {
     loadTrades();
@@ -393,6 +466,46 @@ export const TradeJournal = () => {
     }
   };
 
+  const handleRecalculatePnl = async () => {
+    setIsRecalculating(true);
+    try {
+      const result = await tradeJournal.recalculatePnl();
+      if (result.success) {
+        toast.success(`Recalculated P&L for ${result.updated} trades`);
+        if (result.errors.length > 0) {
+          console.warn('P&L recalculation warnings:', result.errors);
+          toast.warning(`${result.errors.length} trades had issues - check console`);
+        }
+        loadTrades();
+      } else {
+        toast.error('Failed to recalculate P&L');
+      }
+    } catch (error) {
+      console.error('Error recalculating P&L:', error);
+      toast.error('Error recalculating P&L');
+    } finally {
+      setIsRecalculating(false);
+    }
+  };
+
+  const handleDeduplicateTrades = async () => {
+    setIsDeduplicating(true);
+    try {
+      const result = await tradeJournal.deduplicateTrades(2);
+      if (result.success) {
+        toast.success(`Removed ${result.deleted} duplicate trades`);
+        loadTrades();
+      } else {
+        toast.error(result.error || 'Failed to deduplicate');
+      }
+    } catch (error) {
+      console.error('Error deduplicating:', error);
+      toast.error('Error deduplicating trades');
+    } finally {
+      setIsDeduplicating(false);
+    }
+  };
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -410,7 +523,8 @@ export const TradeJournal = () => {
         <div className="flex items-center gap-4">
           <div className="flex gap-3 text-[10px]">
             <span className="text-muted-foreground">
-              Trades: <span className="text-foreground">{stats.totalTrades}</span>
+              Strategies: <span className="text-foreground">{stats.totalTrades}</span>
+              <span className="text-muted-foreground/60 ml-0.5">({stats.totalLegs}L)</span>
             </span>
             <span className="text-muted-foreground">
               Win Rate: <span className={cn(
@@ -455,6 +569,44 @@ export const TradeJournal = () => {
               <div className="text-[10px] text-muted-foreground uppercase">Avg Loss</div>
               <div className="text-sm font-mono text-panic-red">${stats.avgLoser.toFixed(2)}</div>
             </div>
+          </div>
+
+          {/* Maintenance Actions */}
+          <div className="flex gap-2 mb-4">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleRecalculatePnl();
+              }}
+              disabled={isRecalculating}
+            >
+              {isRecalculating ? (
+                <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+              ) : (
+                <Calculator className="h-3 w-3 mr-1" />
+              )}
+              Recompute P&L
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDeduplicateTrades();
+              }}
+              disabled={isDeduplicating}
+            >
+              {isDeduplicating ? (
+                <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+              ) : (
+                <Trash2 className="h-3 w-3 mr-1" />
+              )}
+              Remove Duplicates
+            </Button>
           </div>
 
           {/* Trades Table */}

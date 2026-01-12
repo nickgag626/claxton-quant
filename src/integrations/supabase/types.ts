@@ -91,6 +91,8 @@ export type Database = {
       }
       trades: {
         Row: {
+          close_order_id: string | null
+          close_side: string | null
           created_at: string
           entry_credit: number | null
           entry_price: number
@@ -99,9 +101,14 @@ export type Database = {
           exit_price: number
           exit_reason: string | null
           exit_time: string
+          fees: number | null
           id: string
+          multiplier: number | null
           notes: string | null
+          open_order_id: string | null
+          open_side: string | null
           pnl: number
+          pnl_formula: string | null
           pnl_percent: number | null
           quantity: number
           strategy_name: string | null
@@ -111,6 +118,8 @@ export type Database = {
           underlying: string
         }
         Insert: {
+          close_order_id?: string | null
+          close_side?: string | null
           created_at?: string
           entry_credit?: number | null
           entry_price: number
@@ -119,9 +128,14 @@ export type Database = {
           exit_price: number
           exit_reason?: string | null
           exit_time?: string
+          fees?: number | null
           id?: string
+          multiplier?: number | null
           notes?: string | null
+          open_order_id?: string | null
+          open_side?: string | null
           pnl: number
+          pnl_formula?: string | null
           pnl_percent?: number | null
           quantity: number
           strategy_name?: string | null
@@ -131,6 +145,8 @@ export type Database = {
           underlying: string
         }
         Update: {
+          close_order_id?: string | null
+          close_side?: string | null
           created_at?: string
           entry_credit?: number | null
           entry_price?: number
@@ -139,9 +155,14 @@ export type Database = {
           exit_price?: number
           exit_reason?: string | null
           exit_time?: string
+          fees?: number | null
           id?: string
+          multiplier?: number | null
           notes?: string | null
+          open_order_id?: string | null
+          open_side?: string | null
           pnl?: number
+          pnl_formula?: string | null
           pnl_percent?: number | null
           quantity?: number
           strategy_name?: string | null
