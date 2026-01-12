@@ -568,20 +568,7 @@ export const TradeJournal = () => {
     }
   };
 
-  const handleManualOverride = async (tradeId: string, openSide: string, closeSide: string) => {
-    try {
-      const result = await tradeJournal.manualOverride(tradeId, openSide, closeSide);
-      if (result.success) {
-        toast.success('Direction updated and P&L recalculated');
-        loadTrades();
-      } else {
-        toast.error(result.error || 'Failed to update direction');
-      }
-    } catch (error) {
-      console.error('Error in manual override:', error);
-      toast.error('Error updating direction');
-    }
-  };
+  // Manual override removed - direction is inferred automatically from Tradier executions
 
   const handleRecalculatePnl = async () => {
     setIsRecalculating(true);
@@ -943,7 +930,6 @@ export const TradeJournal = () => {
                                 onSaveNotes={handleSaveNotes}
                                 onCancelEdit={() => setEditingId(null)}
                                 onNotesChange={setEditNotes}
-                                onManualOverride={handleManualOverride}
                               />
                             )}
                           </>
