@@ -89,6 +89,62 @@ export type Database = {
         }
         Relationships: []
       }
+      strategy_evaluations: {
+        Row: {
+          client_request_id: string | null
+          config_json: Json
+          created_at: string
+          decision: string
+          event_type: string
+          gates_json: Json
+          id: string
+          inputs_json: Json
+          proposed_order_json: Json | null
+          reason: string | null
+          strategy_id: string
+          trade_group_id: string | null
+          underlying: string
+        }
+        Insert: {
+          client_request_id?: string | null
+          config_json?: Json
+          created_at?: string
+          decision: string
+          event_type: string
+          gates_json?: Json
+          id?: string
+          inputs_json?: Json
+          proposed_order_json?: Json | null
+          reason?: string | null
+          strategy_id: string
+          trade_group_id?: string | null
+          underlying: string
+        }
+        Update: {
+          client_request_id?: string | null
+          config_json?: Json
+          created_at?: string
+          decision?: string
+          event_type?: string
+          gates_json?: Json
+          id?: string
+          inputs_json?: Json
+          proposed_order_json?: Json | null
+          reason?: string | null
+          strategy_id?: string
+          trade_group_id?: string | null
+          underlying?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "strategy_evaluations_strategy_id_fkey"
+            columns: ["strategy_id"]
+            isOneToOne: false
+            referencedRelation: "strategies"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       trades: {
         Row: {
           close_avg_fill_price: number | null
