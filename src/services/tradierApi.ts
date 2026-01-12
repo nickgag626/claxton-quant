@@ -377,6 +377,55 @@ export const tradierApi = {
       throw error;
     }
   },
+
+  /**
+   * Get order status from Tradier - used for close lifecycle tracking
+   */
+  async getOrderStatus(orderId: string): Promise<{
+    success: boolean;
+    orderId: string;
+    closeStatus: 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired';
+    rejectReason?: string;
+    avgFillPrice?: number;
+    filledQty?: number;
+    closeSide?: string;
+    tradierStatus?: string;
+    error?: string;
+  }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('tradier-api', {
+        body: { action: 'order_status', orderId },
+      });
+
+      if (error) {
+        console.error('Order status fetch error:', error);
+        return { success: false, orderId, closeStatus: 'submitted', error: error.message };
+      }
+
+      if (data?.error) {
+        return { success: false, orderId, closeStatus: 'submitted', error: data.error };
+      }
+
+      return {
+        success: true,
+        orderId,
+        closeStatus: data.closeStatus || 'submitted',
+        rejectReason: data.rejectReason,
+        avgFillPrice: data.avgFillPrice,
+        filledQty: data.filledQty,
+        closeSide: data.closeSide,
+        tradierStatus: data.tradierStatus,
+      };
+    } catch (error) {
+      console.error('Failed to fetch order status:', error);
+      return { 
+        success: false, 
+        orderId, 
+        closeStatus: 'submitted', 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  },
 };
 
 // Parse OCC option symbol (e.g., SPY260112C00700000)

@@ -91,8 +91,14 @@ export type Database = {
       }
       trades: {
         Row: {
+          close_avg_fill_price: number | null
+          close_filled_at: string | null
+          close_filled_qty: number | null
           close_order_id: string | null
+          close_reject_reason: string | null
           close_side: string | null
+          close_status: string | null
+          close_submitted_at: string | null
           created_at: string
           entry_credit: number | null
           entry_price: number
@@ -119,8 +125,14 @@ export type Database = {
           underlying: string
         }
         Insert: {
+          close_avg_fill_price?: number | null
+          close_filled_at?: string | null
+          close_filled_qty?: number | null
           close_order_id?: string | null
+          close_reject_reason?: string | null
           close_side?: string | null
+          close_status?: string | null
+          close_submitted_at?: string | null
           created_at?: string
           entry_credit?: number | null
           entry_price: number
@@ -147,8 +159,14 @@ export type Database = {
           underlying: string
         }
         Update: {
+          close_avg_fill_price?: number | null
+          close_filled_at?: string | null
+          close_filled_qty?: number | null
           close_order_id?: string | null
+          close_reject_reason?: string | null
           close_side?: string | null
+          close_status?: string | null
+          close_submitted_at?: string | null
           created_at?: string
           entry_credit?: number | null
           entry_price?: number
