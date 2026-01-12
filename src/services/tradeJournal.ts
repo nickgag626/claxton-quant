@@ -423,6 +423,65 @@ export const tradeJournal = {
   },
 
   /**
+   * Get "today" start boundary in America/New_York timezone
+   * Returns ISO string for midnight ET today
+   */
+  getTodayStartET(): string {
+    const now = new Date();
+    // Format in ET to get today's date
+    const etDateStr = now.toLocaleDateString('en-US', { timeZone: 'America/New_York' });
+    // Parse back and get midnight
+    const [month, day, year] = etDateStr.split('/');
+    // Create midnight ET as ISO
+    // Construct a date string and use the fact that ET is UTC-5 or UTC-4 depending on DST
+    const etMidnight = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T00:00:00`);
+    // Get the offset for ET timezone
+    const etOffset = new Date().toLocaleString('en-US', { timeZone: 'America/New_York', timeZoneName: 'short' });
+    const isDST = etOffset.includes('EDT');
+    const offsetHours = isDST ? 4 : 5;
+    // Convert ET midnight to UTC
+    const utcMidnight = new Date(Date.UTC(
+      parseInt(year),
+      parseInt(month) - 1,
+      parseInt(day),
+      offsetHours, 0, 0, 0
+    ));
+    return utcMidnight.toISOString();
+  },
+
+  /**
+   * Get realized P&L for TODAY in America/New_York timezone
+   * HARD FILTERS:
+   * - close_status = 'filled'
+   * - needs_reconcile = false  
+   * - pnl IS NOT NULL
+   * - close_filled_at >= today midnight ET
+   */
+  async getRealizedTodayPnl(): Promise<{ realized: number; tradeCount: number }> {
+    try {
+      const todayStart = this.getTodayStartET();
+      
+      const { data, error } = await supabase
+        .from('trades')
+        .select('pnl, close_filled_at, close_status, needs_reconcile')
+        .eq('close_status', 'filled')
+        .eq('needs_reconcile', false)
+        .not('pnl', 'is', null)
+        .gte('close_filled_at', todayStart);
+
+      if (error) throw error;
+
+      const trades = data || [];
+      const realized = trades.reduce((sum, t) => sum + Number(t.pnl), 0);
+      
+      return { realized, tradeCount: trades.length };
+    } catch (error) {
+      console.error('Error fetching realized today PnL:', error);
+      return { realized: 0, tradeCount: 0 };
+    }
+  },
+
+  /**
    * Get stats - ONLY includes FULLY FINALIZED trades
    * HARD FILTERS:
    * - close_status = 'filled'

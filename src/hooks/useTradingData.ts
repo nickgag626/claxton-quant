@@ -100,6 +100,8 @@ export const useTradingData = () => {
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [riskStatus, setRiskStatus] = useState<RiskStatus>({
     dailyPnl: 0,
+    realizedPnl: 0,
+    unrealizedPnl: 0,
     maxDailyLoss: 1000,
     tradeCount: 0,
     maxPositions: 5,
@@ -188,18 +190,23 @@ export const useTradingData = () => {
       });
       setPositions(enrichedPositions);
       
-      // Fetch balances for open/closed P&L (authoritative)
+      // Fetch unrealized P&L from broker (current positions)
       const balances = await tradierApi.getBalances();
-      const openPnl = balances?.open_pl || 0;
-      const closedPnl = balances?.close_pl || 0;
-
-      // Total daily P&L = realized (close_pl) + unrealized (open_pl)
-      // This avoids double-counting / duplicates from the local trade journal.
-      const totalDailyPnl = closedPnl + openPnl;
+      const unrealizedPnl = balances?.open_pl || 0;
+      
+      // Fetch realized P&L from trade journal (finalized trades today in America/New_York)
+      // This is the authoritative source for realized P&L - same calculation as journal header
+      const { realized: realizedPnl, tradeCount } = await tradeJournal.getRealizedTodayPnl();
+      
+      // Total daily P&L = realized (from DB) + unrealized (from broker)
+      const totalDailyPnl = realizedPnl + unrealizedPnl;
       
       setRiskStatus(prev => ({
         ...prev,
         dailyPnl: totalDailyPnl,
+        realizedPnl,
+        unrealizedPnl,
+        tradeCount,
       }));
       
       // Track P&L history (max 100 points for the day)

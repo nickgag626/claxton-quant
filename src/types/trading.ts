@@ -76,6 +76,8 @@ export interface ExitConditions {
 
 export interface RiskStatus {
   dailyPnl: number;
+  realizedPnl: number;      // Sum of finalized trades (close_status='filled', needs_reconcile=false) for today ET
+  unrealizedPnl: number;    // From current positions (Tradier open_pl)
   maxDailyLoss: number;
   tradeCount: number;
   maxPositions: number;
