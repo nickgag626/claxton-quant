@@ -875,6 +875,20 @@ export const useTradingData = () => {
     }
   }, [strategyPositions, addActivity]);
 
+  // Get all positions that belong to the same trade group
+  // MUST be declared before requestClose, closePosition, closeGroup, etc.
+  const getGroupPositions = useCallback((tradeGroupId: string | undefined): Position[] => {
+    if (!tradeGroupId) return [];
+    return positions.filter(p => p.tradeGroupId === tradeGroupId);
+  }, [positions]);
+
+  // Check if a position is part of a multi-leg group
+  const isGroupedPosition = useCallback((position: Position): boolean => {
+    if (!position.tradeGroupId) return false;
+    const groupPositions = getGroupPositions(position.tradeGroupId);
+    return groupPositions.length > 1;
+  }, [getGroupPositions]);
+
   /**
    * SINGLE CHOKE POINT for ALL closes.
    * The ONLY place in the app allowed to call tradierApi.closePosition/closeGroup.
@@ -985,6 +999,11 @@ export const useTradingData = () => {
             journalIds.push({ symbol: p.symbol, id: journalId });
           }
 
+          // Clear DTBP rejection if applicable
+          if (dtbpRejection?.tradeGroupId === tradeGroupId) {
+            setDtbpRejection(null);
+          }
+
           logAttempt('submitted', { orderId: result.orderId, journal: journalIds });
           await fetchData();
           return true;
@@ -1018,8 +1037,6 @@ export const useTradingData = () => {
       });
       return false;
     }
-
-    // If grouped AND legOutMode ON, still apply broken-structure gate only when legOutMode is OFF (so allow here)
 
     if (pendingCloseSymbolsRef.current.has(position.symbol)) {
       logAttempt('blocked', { reason: 'Already pending close' });
@@ -1068,199 +1085,43 @@ export const useTradingData = () => {
         return true;
       }
 
-      logAttempt('rejected', { reason: result.error || 'Order failed', clientRequestId });
-      return false;
-    } finally {
-      (globalThis as any)[allowFlagKey] = false;
-    }
-  }, [addActivity, closeDebugOptions.debug, closeDebugOptions.dryRun, fetchData, getGroupPositions, journalClosedTrade, legOutModeEnabled, positions]);
-
-
-  // Get all positions that belong to the same trade group
-  const getGroupPositions = useCallback((tradeGroupId: string | undefined): Position[] => {
-    if (!tradeGroupId) return [];
-    return positions.filter(p => p.tradeGroupId === tradeGroupId);
-  }, [positions]);
-
-  // Check if a position is part of a multi-leg group
-  const isGroupedPosition = useCallback((position: Position): boolean => {
-    if (!position.tradeGroupId) return false;
-    const groupPositions = getGroupPositions(position.tradeGroupId);
-    return groupPositions.length > 1;
-  }, [getGroupPositions]);
-
-  /**
-   * Close a single position (single-leg)
-   * HARD ENFORCEMENT: For grouped positions, this will THROW unless legOutModeEnabled is true
-   */
-  const closePosition = useCallback(async (
-    positionId: string,
-    exitReason: string = 'manual',
-    options?: { forceLegOut?: boolean }
-  ): Promise<boolean> => {
-    const position = positions.find(p => p.id === positionId);
-    if (!position) return false;
-
-    // === HARD GROUP-CLOSE ENFORCEMENT ===
-    // BLOCK single-leg closes on grouped positions unless Leg Out Mode is enabled
-    // This prevents DTBP/margin issues from temporary naked exposure
-    if (position.tradeGroupId && !legOutModeEnabled && !options?.forceLegOut) {
-      const groupPositions = getGroupPositions(position.tradeGroupId);
-      
-      // Import strategy helpers for better messaging
-      const { expectedLegCount, strategyDisplayName } = await import('@/lib/strategyLegs');
-      const strategyType = position.strategyType;
-      const expectedLegs = expectedLegCount(strategyType);
-      const strategyName = strategyDisplayName(strategyType);
-      
-      const message = expectedLegs 
-        ? `BLOCKED: Cannot close single leg of ${strategyName} (${groupPositions.length}/${expectedLegs} legs). Enable "Leg Out Mode" or use "Close Group".`
-        : `BLOCKED: Cannot close single leg of ${groupPositions.length}-leg group. Enable "Leg Out Mode" or use "Close Group".`;
-      
-      addActivity('RISK', message);
-      
-      toast({
-        title: "⛔ Single-Leg Close Blocked",
-        description: message,
-        variant: "destructive",
-      });
-      
-      return false;
-    }
-
-    // Use ref to get current value (avoids stale closure)
-    if (pendingCloseSymbolsRef.current.has(position.symbol)) {
-      addActivity('SYSTEM', `SKIP: already pending close: ${position.symbol}`);
-      return false;
-    }
-
-    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    console.log('CLOSE_REQUEST', { source: 'manual_ui', clientRequestId, symbol: position.symbol, legOutMode: legOutModeEnabled });
-
-    addActivity('TRADE', `Closing position: ${position.symbol}${legOutModeEnabled && isGroupedPosition(position) ? ' (LEG OUT)' : ''}`);
-
-    const result = await tradierApi.closePosition(position.symbol, position.quantity, {
-      dryRun: closeDebugOptions.dryRun,
-      debug: closeDebugOptions.debug,
-      clientRequestId,
-      trade_group_id: position.tradeGroupId,
-      source: legOutModeEnabled ? 'manual_ui_legout' : 'manual_ui',
-    });
-
-    setLastCloseDebug({
-      source: 'manual_ui',
-      clientRequestId,
-      symbol: position.symbol,
-      result,
-      edgeDebug: result.debug,
-    });
-
-    if (result.skipped) {
-      addActivity('SYSTEM', `${result.error || 'SKIP: cooldown/lock'}`);
-      return false;
-    }
-
-    if (result.success && !result.dryRun) {
-      setPendingCloseSymbols(prev => new Set(prev).add(position.symbol));
-      addActivity('TRADE', `Close order accepted: ${position.symbol} (Order #${result.orderId})`);
-      await journalClosedTrade(position, result, exitReason, legOutModeEnabled ? 'manual_ui_legout' : 'manual_ui', clientRequestId);
-      await fetchData();
-      return true;
-    }
-
-    if (result.notFound) {
-      // Position doesn't exist at broker - already closed or stale data
-      addActivity('SYSTEM', `Position ${position.symbol} not found at broker (already closed)`);
-      await fetchData();
-      return true; // Treat as success - goal was to close and it's already closed
-    }
-
-    if (result.success && result.dryRun) {
-      addActivity('SYSTEM', `Dry run computed for ${position.symbol} (no order sent)`);
-      return true;
-    }
-
-    // === DTBP REJECTION DETECTION ===
-    // If rejected with margin/DTBP-related reason and this is a grouped position, offer retry
-    if (!result.success && result.error && position.tradeGroupId) {
-      if (isDtbpRejection(result.error)) {
+      // DTBP rejection detection
+      if (!result.success && result.error && position.tradeGroupId && isDtbpRejection(result.error)) {
         setDtbpRejection({
           symbol: position.symbol,
           tradeGroupId: position.tradeGroupId,
           rejectReason: result.error,
           timestamp: Date.now(),
         });
-        addActivity('RISK', 
-          `DTBP/Margin rejection for ${position.symbol}: ${result.error}. ` +
-          `Use "Close Group" to avoid naked exposure.`
-        );
-        return false;
       }
-    }
 
-    addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
-    return false;
-  }, [positions, addActivity, fetchData, closeDebugOptions, journalClosedTrade, legOutModeEnabled, isGroupedPosition, getGroupPositions]);
+      logAttempt('rejected', { reason: result.error || 'Order failed', clientRequestId });
+      return false;
+    } finally {
+      (globalThis as any)[allowFlagKey] = false;
+    }
+  }, [addActivity, closeDebugOptions.debug, closeDebugOptions.dryRun, dtbpRejection, fetchData, getGroupPositions, journalClosedTrade, legOutModeEnabled, positions]);
 
   /**
-   * Close all positions in a trade group as a single operation
-   * This is the SAFE way to close multi-leg strategies (avoids DTBP issues)
+   * Close a single position (single-leg) — delegates to requestClose
+   */
+  const closePosition = useCallback(async (
+    positionId: string,
+    exitReason: string = 'manual',
+    _options?: { forceLegOut?: boolean }
+  ): Promise<boolean> => {
+    const position = positions.find(p => p.id === positionId);
+    if (!position) return false;
+
+    return requestClose({ source: 'manual', exitReason, symbol: position.symbol });
+  }, [positions, requestClose]);
+
+  /**
+   * Close all positions in a trade group — delegates to requestClose
    */
   const closeGroup = useCallback(async (tradeGroupId: string, exitReason: string = 'manual'): Promise<boolean> => {
-    const groupPositions = getGroupPositions(tradeGroupId);
-    if (groupPositions.length === 0) {
-      addActivity('SYSTEM', `No positions found for group ${tradeGroupId}`);
-      return false;
-    }
-
-    addActivity('TRADE', `Closing ${groupPositions.length}-leg group: ${groupPositions.map(p => p.symbol).join(', ')}`);
-
-    // Mark all positions as pending close
-    setPendingCloseSymbols(prev => {
-      const next = new Set(prev);
-      groupPositions.forEach(p => next.add(p.symbol));
-      return next;
-    });
-
-    // Close each position in the group
-    // TODO: In future, this could be a single multi-leg order via Tradier's combo/spread API
-    // For now, we close them rapidly in sequence to minimize gap
-    let allSuccess = true;
-    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    for (const position of groupPositions) {
-      if (pendingCloseSymbolsRef.current.has(position.symbol)) {
-        continue; // Already pending from another request
-      }
-
-      const result = await tradierApi.closePosition(position.symbol, position.quantity, {
-        dryRun: closeDebugOptions.dryRun,
-        debug: closeDebugOptions.debug,
-        clientRequestId: `${clientRequestId}-${position.symbol}`,
-        trade_group_id: tradeGroupId,
-        source: 'manual_ui_group',
-      });
-
-      if (result.success && !result.dryRun) {
-        addActivity('TRADE', `Group leg closed: ${position.symbol} (Order #${result.orderId})`);
-        await journalClosedTrade(position, result, exitReason, 'manual_ui_group', `${clientRequestId}-${position.symbol}`);
-      } else if (result.notFound) {
-        // Position doesn't exist at broker - already closed or stale data, not an error
-        addActivity('SYSTEM', `Position ${position.symbol} not found at broker (already closed)`);
-      } else if (!result.success) {
-        allSuccess = false;
-        addActivity('RISK', `Failed to close group leg ${position.symbol}: ${result.error}`);
-      }
-    }
-
-    // Clear DTBP rejection if this was a retry
-    if (dtbpRejection?.tradeGroupId === tradeGroupId) {
-      setDtbpRejection(null);
-    }
-
-    await fetchData();
-    return allSuccess;
-  }, [getGroupPositions, addActivity, closeDebugOptions, journalClosedTrade, fetchData, dtbpRejection]);
+    return requestClose({ source: 'manual', exitReason, tradeGroupId });
+  }, [requestClose]);
 
   /**
    * Retry a failed close as a group close (for DTBP rejection recovery)
@@ -1270,37 +1131,43 @@ export const useTradingData = () => {
       addActivity('SYSTEM', 'No DTBP rejection to retry');
       return false;
     }
+    return requestClose({ source: 'manual', exitReason: 'dtbp_retry', tradeGroupId: dtbpRejection.tradeGroupId });
+  }, [dtbpRejection, addActivity, requestClose]);
 
-    addActivity('TRADE', `Retrying as group close after DTBP rejection...`);
-    return closeGroup(dtbpRejection.tradeGroupId, 'dtbp_retry');
-  }, [dtbpRejection, closeGroup, addActivity]);
-
+  /**
+   * Emergency close all positions — loops over unique groups + ungrouped positions and calls requestClose
+   */
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
     setIsBotRunning(false);
 
-    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    // Group positions by tradeGroupId
+    const groups = new Map<string, Position[]>();
+    const ungrouped: Position[] = [];
 
-    for (const position of positions) {
-      const result = await tradierApi.closePosition(position.symbol, position.quantity, {
-        clientRequestId: `${clientRequestId}-${position.symbol}`,
-        source: 'emergency_close',
-        trade_group_id: position.tradeGroupId,
-      });
-      if (result.success) {
-        addActivity('TRADE', `Position closed: ${position.symbol}`);
-        // Journal emergency closes
-        await journalClosedTrade(position, result, 'emergency_close', 'emergency_close', `${clientRequestId}-${position.symbol}`);
-      } else if (result.notFound) {
-        addActivity('SYSTEM', `Position ${position.symbol} already closed`);
+    positions.forEach(p => {
+      if (p.tradeGroupId) {
+        const arr = groups.get(p.tradeGroupId) || [];
+        arr.push(p);
+        groups.set(p.tradeGroupId, arr);
       } else {
-        addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
+        ungrouped.push(p);
       }
+    });
+
+    // Close each group with a single multileg order
+    for (const [groupId] of groups) {
+      await requestClose({ source: 'emergency', exitReason: 'emergency_close', tradeGroupId: groupId });
     }
 
-    fetchData();
+    // Close ungrouped positions individually
+    for (const p of ungrouped) {
+      await requestClose({ source: 'emergency', exitReason: 'emergency_close', symbol: p.symbol });
+    }
+
+    await fetchData();
     addActivity('EMERGENCY', 'Emergency close complete');
-  }, [positions, addActivity, fetchData, journalClosedTrade]);
+  }, [positions, addActivity, fetchData, requestClose]);
 
   const runStrategyEngine = useCallback(async () => {
     if (!isBotRunning || riskStatus.killSwitchActive) return;
@@ -1311,9 +1178,6 @@ export const useTradingData = () => {
 
     try {
       addActivity('SYSTEM', 'Strategy engine scanning...');
-
-      // Import strategy leg helpers for structure validation
-      const { expectedLegCount, strategyDisplayName } = await import('@/lib/strategyLegs');
 
       const exitResult = await strategyEngine.checkExits(strategies, positions);
 
@@ -1345,61 +1209,14 @@ export const useTradingData = () => {
         }
       }
 
-      // === PROCESS GROUPED EXITS: Close entire group or block ===
-      for (const [tradeGroupId, { signals, positions: signalPositions }] of groupExitSignals) {
+      // === PROCESS GROUPED EXITS via requestClose ===
+      for (const [tradeGroupId, { signals }] of groupExitSignals) {
         if (processedGroups.has(tradeGroupId)) continue;
         processedGroups.add(tradeGroupId);
 
-        const groupPositions = getGroupPositions(tradeGroupId);
         const exitReason = signals[0]?.reason || 'bot_exit';
-        
-        // Determine strategy type from first position that has it
-        const strategyType = signalPositions.find(p => p.strategyType)?.strategyType;
-        const expectedLegs = expectedLegCount(strategyType);
-        const observedLegs = groupPositions.length;
-
-        // === EXIT GATE: Block if structure is broken ===
-        if (expectedLegs !== null && observedLegs < expectedLegs) {
-          addActivity('RISK', 
-            `⛔ EXIT BLOCKED: ${strategyDisplayName(strategyType)} has ${observedLegs}/${expectedLegs} legs. ` +
-            `Broken structure — manual intervention required.`
-          );
-          continue; // Skip this group - don't close broken structures
-        }
-
-        addActivity('TRADE', `Bot exit signal: Closing ${groupPositions.length}-leg group (${exitReason})`);
-        
-        // Mark all group symbols as pending
-        setPendingCloseSymbols(prev => {
-          const next = new Set(prev);
-          groupPositions.forEach(p => next.add(p.symbol));
-          return next;
-        });
-
-        const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        
-        // Close ALL legs in the group (not just the ones with signals)
-        for (const groupPos of groupPositions) {
-          if (pendingCloseSymbolsRef.current.has(groupPos.symbol)) continue;
-          
-          const result = await tradierApi.closePosition(groupPos.symbol, groupPos.quantity, {
-            dryRun: closeDebugOptions.dryRun,
-            debug: closeDebugOptions.debug,
-            clientRequestId: `${clientRequestId}-${groupPos.symbol}`,
-            trade_group_id: tradeGroupId,
-            source: 'bot_engine_group',
-          });
-
-          if (result.success && !result.dryRun) {
-            placedAnyExitOrder = true;
-            addActivity('TRADE', `Bot closed group leg: ${groupPos.symbol} (Order #${result.orderId})`);
-            await journalClosedTrade(groupPos, result, exitReason, 'bot_engine_group', `${clientRequestId}-${groupPos.symbol}`);
-          } else if (result.notFound) {
-            addActivity('SYSTEM', `Position ${groupPos.symbol} already closed`);
-          } else if (!result.success) {
-            addActivity('RISK', `Bot failed to close group leg ${groupPos.symbol}: ${result.error}`);
-          }
-        }
+        const success = await requestClose({ source: 'bot', exitReason, tradeGroupId });
+        if (success) placedAnyExitOrder = true;
       }
 
       // === PROCESS UNGROUPED EXITS: Only for truly single-leg positions ===
@@ -1418,12 +1235,6 @@ export const useTradingData = () => {
 
         const key = exitSignal.symbol;
 
-        // Use ref to get current value
-        if (pendingCloseSymbolsRef.current.has(key)) {
-          addActivity('SYSTEM', `SKIP: already pending close: ${key}`);
-          continue;
-        }
-
         const nowTs = Date.now();
         const lastAttemptTs = lastCloseAttempt.current.get(key) || 0;
 
@@ -1433,43 +1244,8 @@ export const useTradingData = () => {
         }
         lastCloseAttempt.current.set(key, nowTs);
 
-        const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        console.log('CLOSE_REQUEST', { source: 'bot_engine_single', clientRequestId, symbol: exitSignal.symbol });
-
-        addActivity('TRADE', `Exit signal (single-leg): ${exitSignal.symbol} - ${exitSignal.reason}`);
-
-        const result = await tradierApi.closePosition(exitSignal.symbol, exitSignal.quantity, {
-          dryRun: closeDebugOptions.dryRun,
-          debug: closeDebugOptions.debug,
-          clientRequestId,
-          source: 'bot_engine_single',
-        });
-
-        setLastCloseDebug({
-          source: 'bot_engine_single',
-          clientRequestId,
-          symbol: exitSignal.symbol,
-          result,
-          edgeDebug: result.debug,
-        });
-
-        if (result.skipped) {
-          addActivity('SYSTEM', `${result.error || 'SKIP: cooldown/lock'}`);
-          continue;
-        }
-
-        if (result.success && !result.dryRun) {
-          placedAnyExitOrder = true;
-          setPendingCloseSymbols(prev => new Set(prev).add(exitSignal.symbol));
-          addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
-          await journalClosedTrade(position, result, exitSignal.reason, 'bot_engine_single', clientRequestId);
-        } else if (result.success && result.dryRun) {
-          addActivity('SYSTEM', `Dry run computed for ${exitSignal.symbol} (no order sent)`);
-        } else if (result.notFound) {
-          addActivity('SYSTEM', `Position ${exitSignal.symbol} already closed`);
-        } else {
-          addActivity('RISK', `Close order rejected: ${exitSignal.symbol} - ${result.error || 'Unknown error'}`);
-        }
+        const success = await requestClose({ source: 'bot', exitReason: exitSignal.reason, symbol: exitSignal.symbol });
+        if (success) placedAnyExitOrder = true;
       }
 
       if (placedAnyExitOrder) {
@@ -1508,7 +1284,6 @@ export const useTradingData = () => {
               variant: "destructive",
             });
           } else if (execResult.blocked === 'conflict') {
-            // Use new conflict_symbols field from STRICT mode
             const conflictSymbols = execResult.conflict_symbols?.join(', ') || 
               execResult.conflicts?.map(c => c.symbol).join(', ') || 'unknown';
             const conflictDetails = execResult.conflictDetails?.join('\n• ') || '';
@@ -1518,7 +1293,7 @@ export const useTradingData = () => {
               title: "⚠️ Entry Blocked - Position Conflict",
               description: `STRICT MODE: Cannot open ${signal.strategyName}.\n\nConflicting positions:\n• ${conflictDetails || conflictSymbols}\n\nClose or flatten existing positions first.`,
               variant: "destructive",
-              duration: 10000, // Show longer for important message
+              duration: 10000,
             });
           } else {
             addActivity('RISK', `Order failed: ${execResult.error}`);
@@ -1533,7 +1308,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade, getGroupPositions]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData, strategyPositions, requestClose, getGroupPositions]);
 
   const copyLastCloseDebug = useCallback(async () => {
     try {
