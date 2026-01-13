@@ -1509,11 +1509,183 @@ serve(async (req) => {
 
     if (action === 'check_exits') {
       // Check if any positions should be closed
+      // CRITICAL: Return group-level exit signals, not per-leg
       const exitSignals: any[] = [];
+      
+      // Helper: Get expected leg count for strategy type
+      function getExpectedLegCount(strategyType: string | null | undefined): number | null {
+        if (!strategyType) return null;
+        switch (strategyType) {
+          case 'iron_condor':
+          case 'iron_fly':
+            return 4;
+          case 'credit_put_spread':
+          case 'credit_call_spread':
+          case 'straddle':
+          case 'strangle':
+            return 2;
+          case 'butterfly':
+            return 3;
+          default:
+            return null;
+        }
+      }
+      
+      // Group positions by tradeGroupId first
+      const groupedPositions = new Map<string, any[]>();
+      const ungroupedPositions: any[] = [];
       
       for (const position of positions || []) {
         if (position.status !== 'open' || !position.strategyName) continue;
         
+        if (position.tradeGroupId) {
+          if (!groupedPositions.has(position.tradeGroupId)) {
+            groupedPositions.set(position.tradeGroupId, []);
+          }
+          groupedPositions.get(position.tradeGroupId)!.push(position);
+        } else {
+          ungroupedPositions.push(position);
+        }
+      }
+      
+      // Process grouped positions - evaluate as a group, emit one signal per group
+      for (const [tradeGroupId, groupLegs] of groupedPositions) {
+        // Get strategy from first leg
+        const firstLeg = groupLegs[0];
+        const strategy = (strategies as Strategy[]).find(s => s.name === firstLeg.strategyName);
+        if (!strategy) continue;
+        
+        const strategyType = firstLeg.strategyType || strategy.type;
+        const expectedLegs = getExpectedLegCount(strategyType);
+        const observedLegs = groupLegs.length;
+        
+        // === EXIT GATE: Block if structure is broken ===
+        if (expectedLegs !== null && observedLegs < expectedLegs) {
+          console.log(`[EXIT GATE] BLOCKED: ${tradeGroupId} has ${observedLegs}/${expectedLegs} legs - broken structure`);
+          
+          // Save evaluation record for visibility
+          if (strategy.id) {
+            await saveEvaluation(
+              supabase,
+              strategy.id,
+              firstLeg.underlying || strategy.underlying,
+              'exit_blocked',
+              {
+                decision: 'HOLD',
+                reason: `Broken structure — ${observedLegs}/${expectedLegs} legs present. Manual intervention required.`,
+                gates: [{
+                  name: 'Structure Integrity',
+                  expected: `${expectedLegs} legs`,
+                  actual: { observed: observedLegs, expected: expectedLegs, strategyType },
+                  pass: false,
+                  reason: 'Cannot auto-close broken multi-leg structure',
+                }],
+                inputs: { 
+                  market: { group_id: tradeGroupId, legs: groupLegs.map((l: any) => l.symbol) }, 
+                  account: {} 
+                },
+              },
+              { groupLegs, blocked: 'broken_structure' },
+              tradeGroupId
+            );
+          }
+          
+          continue; // Skip this group - don't generate exit signal
+        }
+        
+        // Calculate aggregate P&L for the group
+        let totalCostBasis = 0;
+        let totalCurrentValue = 0;
+        
+        for (const leg of groupLegs) {
+          totalCostBasis += Number(leg.costBasis ?? 0);
+          totalCurrentValue += Number(leg.currentValue ?? 0);
+        }
+        
+        const isShort = totalCostBasis < 0;
+        const pnl = isShort ? Math.abs(totalCostBasis) - totalCurrentValue : totalCurrentValue - totalCostBasis;
+        const pnlPercent = Math.abs(totalCostBasis) > 0 ? (pnl / Math.abs(totalCostBasis)) * 100 : 0;
+        
+        let exitReason: string | null = null;
+        
+        // Check profit target
+        if (pnlPercent >= strategy.exitConditions.profitTargetPercent) {
+          exitReason = 'profit_target';
+        }
+        // Check stop loss
+        else if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
+          exitReason = 'stop_loss';
+        }
+        // Check time stop (use earliest expiration in group)
+        else if (strategy.exitConditions.timeStopDte) {
+          let earliestDte = Infinity;
+          for (const leg of groupLegs) {
+            if (leg.expirationDate) {
+              const expDate = new Date(leg.expirationDate);
+              const dte = Math.ceil((expDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
+              earliestDte = Math.min(earliestDte, dte);
+            }
+          }
+          if (earliestDte <= strategy.exitConditions.timeStopDte) {
+            exitReason = 'time_stop';
+          }
+        }
+        
+        if (exitReason) {
+          // Save exit_attempt evaluation
+          if (strategy.id) {
+            await saveEvaluation(
+              supabase,
+              strategy.id,
+              firstLeg.underlying || strategy.underlying,
+              'exit_attempt',
+              {
+                decision: 'CLOSE',
+                reason: `Group exit triggered: ${exitReason} (P&L: ${pnlPercent.toFixed(2)}%)`,
+                gates: [{
+                  name: exitReason,
+                  expected: exitReason === 'profit_target' 
+                    ? `P&L >= ${strategy.exitConditions.profitTargetPercent}%`
+                    : exitReason === 'stop_loss'
+                    ? `P&L <= -${strategy.exitConditions.stopLossPercent}%`
+                    : `DTE <= ${strategy.exitConditions.timeStopDte}`,
+                  actual: { pnl_percent: pnlPercent, legs: observedLegs },
+                  pass: true,
+                }],
+                inputs: { 
+                  market: { 
+                    pnl_percent: pnlPercent, 
+                    total_cost_basis: totalCostBasis, 
+                    total_current_value: totalCurrentValue,
+                    leg_count: observedLegs,
+                  }, 
+                  account: {} 
+                },
+              },
+              { groupLegs, exitReason },
+              tradeGroupId
+            );
+          }
+          
+          // Emit ONE exit signal per group, include ALL leg symbols
+          // The frontend will close all legs when it receives this
+          for (const leg of groupLegs) {
+            exitSignals.push({
+              positionId: leg.id,
+              symbol: leg.symbol,
+              quantity: leg.quantity,
+              reason: exitReason,
+              pnlPercent,
+              tradeGroupId,
+              isGroupExit: true,
+              groupLegCount: observedLegs,
+            });
+          }
+        }
+      }
+      
+      // Process ungrouped positions individually
+      for (const position of ungroupedPositions) {
         const strategy = (strategies as Strategy[]).find(s => s.name === position.strategyName);
         if (!strategy) continue;
 
@@ -1544,43 +1716,14 @@ serve(async (req) => {
         }
         
         if (exitReason) {
-          // Save exit_attempt evaluation with trade_group_id
-          if (position.tradeGroupId && strategy.id) {
-            await saveEvaluation(
-              supabase,
-              strategy.id,
-              position.underlying || strategy.underlying,
-              'exit_attempt',
-              {
-                decision: 'CLOSE',
-                reason: `Exit triggered: ${exitReason} (P&L: ${pnlPercent.toFixed(2)}%)`,
-                gates: [{
-                  name: exitReason,
-                  expected: exitReason === 'profit_target' 
-                    ? `P&L >= ${strategy.exitConditions.profitTargetPercent}%`
-                    : exitReason === 'stop_loss'
-                    ? `P&L <= -${strategy.exitConditions.stopLossPercent}%`
-                    : `DTE <= ${strategy.exitConditions.timeStopDte}`,
-                  actual: { pnl_percent: pnlPercent },
-                  pass: true,
-                }],
-                inputs: { 
-                  market: { pnl_percent: pnlPercent, cost_basis: costBasis, current_value: currentValue }, 
-                  account: {} 
-                },
-              },
-              { position, exitReason },
-              position.tradeGroupId
-            );
-          }
-          
           exitSignals.push({
             positionId: position.id,
             symbol: position.symbol,
             quantity: position.quantity,
             reason: exitReason,
             pnlPercent,
-            tradeGroupId: position.tradeGroupId,
+            tradeGroupId: null,
+            isGroupExit: false,
           });
         }
       }
