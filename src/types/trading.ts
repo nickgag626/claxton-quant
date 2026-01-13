@@ -4,7 +4,9 @@ export interface Position {
   id: string;
   symbol: string;
   quantity: number;
+  /** Total dollar cost basis from Tradier (already includes qty × multiplier) */
   costBasis: number;
+  /** Total dollar current market value (already includes qty × multiplier) */
   currentValue: number;
   expirationDate?: string;
   strategyName?: string;
@@ -15,6 +17,12 @@ export interface Position {
   entryTime: Date;
   // Group-aware closing: positions with the same trade_group_id should be closed together
   tradeGroupId?: string;
+  // Debug: raw Tradier values for verification
+  _rawTradier?: {
+    cost_basis: number;
+    market_value?: number;
+    quantity: number;
+  };
 }
 
 // Rejection reasons that indicate DTBP/margin issues (case-insensitive substring match)
