@@ -436,11 +436,29 @@ serve(async (req) => {
         let avgFillPrice: number | undefined;
         let filledQty: number | undefined;
         let closeSide: string | undefined;
+        
+        // For multi-leg orders, extract per-leg fill prices
+        let legFills: Record<string, { avgFillPrice: number; filledQty: number; side: string }> | undefined;
 
         if (closeStatus === 'filled') {
           avgFillPrice = normalizeNumber(order.avg_fill_price);
           filledQty = normalizeNumber(order.exec_quantity) || normalizeNumber(order.quantity);
           closeSide = order.side;
+          
+          // Check for multi-leg order structure
+          if (order.leg) {
+            const legs = Array.isArray(order.leg) ? order.leg : [order.leg];
+            legFills = {};
+            for (const leg of legs) {
+              if (leg.option_symbol) {
+                legFills[leg.option_symbol] = {
+                  avgFillPrice: normalizeNumber(leg.avg_fill_price) || 0,
+                  filledQty: normalizeNumber(leg.exec_quantity) || normalizeNumber(leg.quantity) || 0,
+                  side: leg.side || '',
+                };
+              }
+            }
+          }
         }
 
         data = {
@@ -451,6 +469,7 @@ serve(async (req) => {
           avgFillPrice,
           filledQty,
           closeSide,
+          legFills, // Per-leg fill prices for multi-leg orders
           rawOrder: order,
         };
         break;

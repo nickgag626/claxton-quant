@@ -909,6 +909,7 @@ export const tradeJournal = {
 
   /**
    * Update close status after verifying with Tradier
+   * For multi-leg orders, legFills provides per-symbol fill prices
    */
   async updateCloseStatus(
     closeOrderId: string,
@@ -919,6 +920,8 @@ export const tradeJournal = {
       rejectReason?: string;
       open_side?: string;
       fees?: number;
+      /** Per-leg fill prices for multi-leg orders (keyed by OCC symbol) */
+      legFills?: Record<string, { avgFillPrice: number; filledQty: number; side: string }>;
     }
   ): Promise<{ success: boolean; error?: string }> {
     try {
@@ -940,13 +943,23 @@ export const tradeJournal = {
           updates.close_filled_at = new Date().toISOString();
           updates.exit_time = new Date().toISOString();
           
-          if (details?.avgFillPrice != null) {
-            updates.close_avg_fill_price = details.avgFillPrice;
-            updates.exit_price = details.avgFillPrice;
+          // For multi-leg orders, use per-leg fill price if available
+          const legFill = details?.legFills?.[trade.symbol];
+          const fillPrice = legFill?.avgFillPrice ?? details?.avgFillPrice;
+          const fillQty = legFill?.filledQty ?? details?.filledQty;
+          const fillSide = legFill?.side ?? details?.open_side;
+          
+          if (fillPrice != null) {
+            updates.close_avg_fill_price = fillPrice;
+            updates.exit_price = fillPrice;
           }
-          if (details?.filledQty != null) {
-            updates.close_filled_qty = details.filledQty;
-            updates.quantity = details.filledQty;
+          if (fillQty != null) {
+            updates.close_filled_qty = fillQty;
+            updates.quantity = fillQty;
+          }
+          if (fillSide) {
+            // close_side from Tradier leg
+            updates.close_side = fillSide;
           }
           if (details?.open_side) {
             updates.open_side = details.open_side;
@@ -958,8 +971,8 @@ export const tradeJournal = {
           // Compute P&L if we have all required data
           const openSide = details?.open_side || trade.open_side;
           const openPrice = trade.entry_price;
-          const closePrice = details?.avgFillPrice ?? trade.exit_price;
-          const qty = details?.filledQty ?? trade.quantity;
+          const closePrice = fillPrice ?? trade.exit_price;
+          const qty = fillQty ?? trade.quantity;
           const fees = details?.fees ?? trade.fees ?? 0;
 
           if (openSide && openPrice && closePrice && qty) {
