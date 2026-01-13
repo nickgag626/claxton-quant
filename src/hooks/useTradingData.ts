@@ -81,6 +81,68 @@ function extractUnderlyingFromSymbol(symbol: string): string {
 }
 
 /**
+ * Extract expiration (YYMMDD) from OCC symbol
+ */
+function extractExpirationFromSymbol(symbol: string): string | null {
+  const match = symbol.match(/^[A-Z]+(\d{6})[CP]/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Parse option type and strike from OCC symbol
+ */
+function parseOccSymbol(symbol: string): { type: 'C' | 'P'; strike: number } | null {
+  // OCC format: SYMBOL + YYMMDD + C/P + Strike (8 digits, e.g. 00580000 = 580.00)
+  const match = symbol.match(/^[A-Z]+\d{6}([CP])(\d{8})$/);
+  if (!match) return null;
+  return {
+    type: match[1] as 'C' | 'P',
+    strike: parseInt(match[2], 10) / 1000,
+  };
+}
+
+/**
+ * Validate iron condor signature: exactly 2 puts + 2 calls, 2 long + 2 short, proper strike ordering
+ * Returns true only if the 4-leg group forms a valid iron condor structure.
+ */
+function isValidIronCondorGroup(positions: Position[]): boolean {
+  if (positions.length !== 4) return false;
+  
+  const parsed = positions.map(p => {
+    const occ = parseOccSymbol(p.symbol);
+    return occ ? { ...occ, qty: p.quantity, symbol: p.symbol } : null;
+  });
+  
+  if (parsed.some(p => p === null)) return false;
+  
+  const puts = parsed.filter(p => p!.type === 'P');
+  const calls = parsed.filter(p => p!.type === 'C');
+  
+  // Must have exactly 2 puts and 2 calls
+  if (puts.length !== 2 || calls.length !== 2) return false;
+  
+  // Must have 2 long (qty > 0) and 2 short (qty < 0) overall
+  const longCount = parsed.filter(p => p!.qty > 0).length;
+  const shortCount = parsed.filter(p => p!.qty < 0).length;
+  if (longCount !== 2 || shortCount !== 2) return false;
+  
+  // Put side: one short (higher strike), one long (lower strike) 
+  const putStrikes = puts.map(p => ({ strike: p!.strike, qty: p!.qty })).sort((a, b) => a.strike - b.strike);
+  // Lower put = long (protection), higher put = short (sold)
+  if (!(putStrikes[0].qty > 0 && putStrikes[1].qty < 0)) return false;
+  
+  // Call side: one short (lower strike), one long (higher strike)
+  const callStrikes = calls.map(c => ({ strike: c!.strike, qty: c!.qty })).sort((a, b) => a.strike - b.strike);
+  // Lower call = short (sold), higher call = long (protection)
+  if (!(callStrikes[0].qty < 0 && callStrikes[1].qty > 0)) return false;
+  
+  // Short put strike < short call strike (otherwise it's not a valid condor)
+  if (putStrikes[1].strike >= callStrikes[0].strike) return false;
+  
+  return true;
+}
+
+/**
  * Generate a heuristic group key for a position based on:
  * - underlying symbol
  * - expiration date
@@ -102,84 +164,82 @@ function generateHeuristicGroupKey(pos: Position): string {
 }
 
 /**
- * Generate a deterministic UUID from a heuristic group key
- * This ensures the same group always gets the same UUID
- */
-function generateHeuristicGroupId(pos: Position): string | null {
-  const key = generateHeuristicGroupKey(pos);
-  if (key.startsWith('ungrouped-')) return null;
-  return deterministicUUID(key);
-}
-
-/**
- * Apply trade_group_id from database trades to broker positions
- * Falls back to heuristic grouping if no DB match found
+ * Apply trade_group_id from position_group_map (source of truth).
+ * Falls back to STRICT heuristic grouping only if group forms valid 4L iron condor.
+ * Otherwise marks positions as ungrouped (requires reconcile).
  */
 async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Position[]> {
   if (positions.length === 0) return positions;
 
-  // First, try to match positions to open trades in DB by symbol
   const symbols = positions.map(p => p.symbol);
   
   try {
-    // Query trades that are still open (close_status is null or 'submitted')
-    // and have trade_group_id populated
-    const { data: trades, error } = await supabase
-      .from('trades')
-      .select('symbol, trade_group_id')
-      .in('symbol', symbols)
-      .not('trade_group_id', 'is', null);
+    // === SOURCE OF TRUTH: Fetch from position_group_map (set at entry time) ===
+    const { data: groupMaps, error: mapError } = await supabase
+      .from('position_group_map')
+      .select('symbol, trade_group_id, strategy_name, strategy_type')
+      .in('symbol', symbols);
 
-    if (error) {
-      console.error('Error fetching trade groups:', error);
+    if (mapError) {
+      console.error('Error fetching position_group_map:', mapError);
     }
 
-    // Build symbol -> trade_group_id map from DB
-    const symbolToGroupId = new Map<string, string>();
-    if (trades) {
-      trades.forEach((t: { symbol: string; trade_group_id: string | null }) => {
-        if (t.trade_group_id) {
-          symbolToGroupId.set(t.symbol, t.trade_group_id);
+    // Build symbol -> group info map from position_group_map
+    const symbolToGroupInfo = new Map<string, { tradeGroupId: string; strategyName?: string; strategyType?: string }>();
+    if (groupMaps) {
+      groupMaps.forEach((row: any) => {
+        if (row.trade_group_id) {
+          symbolToGroupInfo.set(row.symbol, {
+            tradeGroupId: row.trade_group_id,
+            strategyName: row.strategy_name,
+            strategyType: row.strategy_type,
+          });
         }
       });
     }
+    console.log(`[enrichPositionsWithGroupIds] Found ${symbolToGroupInfo.size}/${symbols.length} symbols in position_group_map`);
 
-    // Apply DB-based group IDs first
+    // Apply DB-first grouping
     const enrichedPositions = positions.map(pos => {
-      const dbGroupId = symbolToGroupId.get(pos.symbol);
-      if (dbGroupId) {
-        return { ...pos, tradeGroupId: dbGroupId };
+      const dbInfo = symbolToGroupInfo.get(pos.symbol);
+      if (dbInfo) {
+        return { 
+          ...pos, 
+          tradeGroupId: dbInfo.tradeGroupId,
+          strategyName: pos.strategyName || dbInfo.strategyName,
+          strategyType: pos.strategyType || dbInfo.strategyType,
+        };
       }
       return pos;
     });
 
-    // For positions without DB group ID, apply heuristic grouping
-    // Group positions by heuristic key
-    const heuristicGroups = new Map<string, Position[]>();
+    // === STRICT HEURISTIC FALLBACK: Only for positions not in DB ===
+    // Group ungrouped positions by heuristic key
+    const ungroupedByHeuristic = new Map<string, Position[]>();
     
     enrichedPositions.forEach(pos => {
       if (!pos.tradeGroupId) {
         const key = generateHeuristicGroupKey(pos);
-        const existing = heuristicGroups.get(key) || [];
-        heuristicGroups.set(key, [...existing, pos]);
+        const existing = ungroupedByHeuristic.get(key) || [];
+        ungroupedByHeuristic.set(key, [...existing, pos]);
       }
     });
 
-    // Assign heuristic group IDs only to groups with 2+ positions
-    // Use deterministic UUIDs for database compatibility
+    // Only assign heuristic group IDs if group is EXACTLY a valid 4L iron condor
     const heuristicGroupIds = new Map<string, string>();
-    heuristicGroups.forEach((groupPositions, key) => {
-      if (groupPositions.length >= 2) {
-        // Generate a deterministic UUID from the heuristic key
-        const firstPos = groupPositions[0];
-        const uuid = generateHeuristicGroupId(firstPos);
-        if (uuid) {
-          heuristicGroupIds.set(key, uuid);
-        }
+    ungroupedByHeuristic.forEach((groupPositions, key) => {
+      // STRICT: Only group if valid 4L iron condor signature
+      if (groupPositions.length === 4 && isValidIronCondorGroup(groupPositions)) {
+        const uuid = deterministicUUID(key);
+        heuristicGroupIds.set(key, uuid);
+        console.log(`[enrichPositionsWithGroupIds] Heuristic group accepted (valid 4L IC): ${key}`);
+      } else if (groupPositions.length > 1) {
+        // Log rejection for visibility
+        console.log(`[enrichPositionsWithGroupIds] Heuristic group REJECTED: ${key} has ${groupPositions.length} legs, not valid IC structure`);
       }
     });
 
-    // Apply heuristic group IDs
+    // Apply heuristic group IDs only to valid 4L groups
     return enrichedPositions.map(pos => {
       if (pos.tradeGroupId) return pos; // Already has DB group ID
       
@@ -190,6 +250,7 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
         return { ...pos, tradeGroupId: heuristicGroupId };
       }
       
+      // Not in DB and not part of valid heuristic group → stays ungrouped
       return pos;
     });
   } catch (err) {

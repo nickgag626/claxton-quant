@@ -1805,7 +1805,7 @@ serve(async (req) => {
         ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
         : signal;
 
-      const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signalToExecute);
+      const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signalToExecute, effectiveTradeGroupId, supabase);
       
       // If order succeeded, set in-flight to prevent duplicate entries
       if (orderResponse.success) {
@@ -2123,7 +2123,14 @@ serve(async (req) => {
   }
 });
 
-async function placeOrder(baseUrl: string, accountId: string, apiToken: string, signal: any) {
+async function placeOrder(
+  baseUrl: string, 
+  accountId: string, 
+  apiToken: string, 
+  signal: any, 
+  tradeGroupId: string,
+  supabaseClient: any
+) {
   const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
   
   // For multi-leg orders, use combo order
@@ -2157,9 +2164,25 @@ async function placeOrder(baseUrl: string, accountId: string, apiToken: string, 
     const data = await response.json();
     console.log('Order response:', JSON.stringify(data));
     
+    const orderId = data?.order?.id;
+    const success = !!orderId;
+    
+    // === CRITICAL: Persist leg -> trade_group_id mapping on entry ===
+    if (success && orderId) {
+      await persistPositionGroupMap(supabaseClient, {
+        tradeGroupId,
+        openOrderId: String(orderId),
+        underlying: signal.underlying,
+        expiration: signal.expiration || null,
+        strategyName: signal.strategyName || null,
+        strategyType: signal.type || null,
+        legs: signal.legs.map((leg: any) => leg.symbol),
+      });
+    }
+    
     return {
-      success: !!data?.order?.id,
-      orderId: data?.order?.id,
+      success,
+      orderId,
       error: data?.errors?.error,
       signal,
     };
@@ -2186,10 +2209,69 @@ async function placeOrder(baseUrl: string, accountId: string, apiToken: string, 
   });
 
   const data = await response.json();
+  const orderId = data?.order?.id;
+  const success = !!orderId;
+  
+  // Persist single-leg mapping too
+  if (success && orderId) {
+    await persistPositionGroupMap(supabaseClient, {
+      tradeGroupId,
+      openOrderId: String(orderId),
+      underlying: signal.underlying,
+      expiration: signal.expiration || null,
+      strategyName: signal.strategyName || null,
+      strategyType: signal.type || null,
+      legs: [leg.symbol],
+    });
+  }
+  
   return {
-    success: !!data?.order?.id,
-    orderId: data?.order?.id,
+    success,
+    orderId,
     error: data?.errors?.error,
     signal,
   };
+}
+
+/**
+ * Persist symbol -> trade_group_id mapping when an entry order is placed.
+ * This is the SOURCE OF TRUTH for position grouping.
+ */
+async function persistPositionGroupMap(
+  supabaseClient: any,
+  params: {
+    tradeGroupId: string;
+    openOrderId: string;
+    underlying: string;
+    expiration: string | null;
+    strategyName: string | null;
+    strategyType: string | null;
+    legs: string[];
+  }
+): Promise<void> {
+  const { tradeGroupId, openOrderId, underlying, expiration, strategyName, strategyType, legs } = params;
+  
+  const records = legs.map(symbol => ({
+    trade_group_id: tradeGroupId,
+    open_order_id: openOrderId,
+    symbol,
+    underlying,
+    expiration,
+    strategy_name: strategyName,
+    strategy_type: strategyType,
+  }));
+  
+  try {
+    const { error } = await supabaseClient
+      .from('position_group_map')
+      .upsert(records, { onConflict: 'open_order_id,symbol', ignoreDuplicates: true });
+    
+    if (error) {
+      console.error('[persistPositionGroupMap] Error inserting:', error);
+    } else {
+      console.log(`[persistPositionGroupMap] Saved ${legs.length} leg mappings for order ${openOrderId}, group ${tradeGroupId}`);
+    }
+  } catch (err) {
+    console.error('[persistPositionGroupMap] Exception:', err);
+  }
 }
