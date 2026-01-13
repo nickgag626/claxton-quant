@@ -33,15 +33,28 @@ interface PositionConflict {
   proposedSide: string;
   existingQty: number;
   conflict: 'long_vs_sell_open' | 'short_vs_buy_open';
-  resolution: 'convert_to_close' | 'block';
+  resolution: 'block' | 'netting_applied';
   convertedQty?: number;
 }
 
+interface ConflictCheckResult {
+  hasConflict: boolean;
+  entryConflict: boolean;
+  conflictSymbols: string[];
+  conflicts: PositionConflict[];
+  canProceed: boolean;
+  adjustedLegs: any[];
+  nettingApplied: boolean;
+}
+
 // Check for position conflicts before entry
+// STRICT MODE (default): Block on ANY overlap - no auto-conversion
+// NETTING MODE: Only enabled when allowNetting=true explicitly
 function checkEntryConflicts(
   proposedLegs: any[],
-  brokerPositions: Array<{ symbol: string; quantity: number }>
-): { conflicts: PositionConflict[]; canProceed: boolean; adjustedLegs: any[] } {
+  brokerPositions: Array<{ symbol: string; quantity: number }>,
+  allowNetting: boolean = false // Default: STRICT mode - no netting
+): ConflictCheckResult {
   const positionMap = new Map<string, number>();
   for (const pos of brokerPositions) {
     const existing = positionMap.get(pos.symbol) || 0;
@@ -49,8 +62,10 @@ function checkEntryConflicts(
   }
   
   const conflicts: PositionConflict[] = [];
+  const conflictSymbols: string[] = [];
   const adjustedLegs = proposedLegs.map(leg => ({ ...leg }));
-  let canProceed = true;
+  let hasConflict = false;
+  let nettingApplied = false;
   
   for (let i = 0; i < adjustedLegs.length; i++) {
     const leg = adjustedLegs[i];
@@ -59,21 +74,28 @@ function checkEntryConflicts(
     
     if (existingQty === 0) continue;
     
+    // ANY overlap with existing position = conflict
+    hasConflict = true;
+    if (!conflictSymbols.includes(optionSymbol)) {
+      conflictSymbols.push(optionSymbol);
+    }
+    
     // Long position exists + sell_to_open = conflict
     if (existingQty > 0 && leg.side === 'sell_to_open') {
-      if (existingQty >= leg.quantity) {
-        // Can convert entirely to sell_to_close
+      if (allowNetting && existingQty >= leg.quantity) {
+        // NETTING MODE: Convert to sell_to_close
         conflicts.push({
           symbol: optionSymbol,
           proposedSide: leg.side,
           existingQty,
           conflict: 'long_vs_sell_open',
-          resolution: 'convert_to_close',
+          resolution: 'netting_applied',
           convertedQty: leg.quantity,
         });
         adjustedLegs[i] = { ...leg, side: 'sell_to_close' };
+        nettingApplied = true;
       } else {
-        // Not enough to close, block the entry
+        // STRICT MODE: Block entry
         conflicts.push({
           symbol: optionSymbol,
           proposedSide: leg.side,
@@ -81,24 +103,26 @@ function checkEntryConflicts(
           conflict: 'long_vs_sell_open',
           resolution: 'block',
         });
-        canProceed = false;
       }
     }
     
     // Short position exists + buy_to_open = conflict
     if (existingQty < 0 && leg.side === 'buy_to_open') {
       const absExisting = Math.abs(existingQty);
-      if (absExisting >= leg.quantity) {
+      if (allowNetting && absExisting >= leg.quantity) {
+        // NETTING MODE: Convert to buy_to_close
         conflicts.push({
           symbol: optionSymbol,
           proposedSide: leg.side,
           existingQty,
           conflict: 'short_vs_buy_open',
-          resolution: 'convert_to_close',
+          resolution: 'netting_applied',
           convertedQty: leg.quantity,
         });
         adjustedLegs[i] = { ...leg, side: 'buy_to_close' };
+        nettingApplied = true;
       } else {
+        // STRICT MODE: Block entry
         conflicts.push({
           symbol: optionSymbol,
           proposedSide: leg.side,
@@ -106,12 +130,35 @@ function checkEntryConflicts(
           conflict: 'short_vs_buy_open',
           resolution: 'block',
         });
-        canProceed = false;
       }
+    }
+    
+    // Also catch any position overlap even if sides don't match the patterns above
+    // (e.g., existing long and trying to buy more - still a potential structure issue)
+    if (existingQty !== 0 && !conflicts.some(c => c.symbol === optionSymbol)) {
+      conflicts.push({
+        symbol: optionSymbol,
+        proposedSide: leg.side,
+        existingQty,
+        conflict: existingQty > 0 ? 'long_vs_sell_open' : 'short_vs_buy_open',
+        resolution: 'block',
+      });
     }
   }
   
-  return { conflicts, canProceed, adjustedLegs };
+  // In STRICT mode, any conflict blocks entry
+  // In NETTING mode, only blocks if netting couldn't fully resolve
+  const canProceed = !hasConflict || (allowNetting && conflicts.every(c => c.resolution === 'netting_applied'));
+  
+  return { 
+    hasConflict,
+    entryConflict: hasConflict && !canProceed,
+    conflictSymbols,
+    conflicts, 
+    canProceed, 
+    adjustedLegs,
+    nettingApplied,
+  };
 }
 
 // Types
@@ -1321,29 +1368,41 @@ serve(async (req) => {
       }
       
       // Build position map for conflict check
+      // STRICT MODE by default (allowNetting = false)
+      // Only allow netting if signal explicitly enables it
       const proposedLegs = signal.proposedOrder?.legs || signal.legs;
-      const conflictResult = checkEntryConflicts(proposedLegs, brokerPositions);
+      const allowNetting = signal.allowEntryNetting === true; // Default: false (STRICT mode)
+      const conflictResult = checkEntryConflicts(proposedLegs, brokerPositions, allowNetting);
       
       gates.push({
         name: 'Entry Conflict',
         expected: 'no conflicting positions',
         actual: {
+          entry_conflict: conflictResult.entryConflict,
+          conflict_symbols: conflictResult.conflictSymbols,
           conflicts: conflictResult.conflicts,
           brokerPositionCount: brokerPositions.length,
           canProceed: conflictResult.canProceed,
+          allow_entry_netting: allowNetting,
+          netting_applied: conflictResult.nettingApplied,
         },
         pass: conflictResult.canProceed,
         reason: !conflictResult.canProceed 
-          ? `Entry blocked: ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => `${c.symbol} has ${c.existingQty > 0 ? 'long' : 'short'} position, cannot ${c.proposedSide}`).join('; ')}`
-          : conflictResult.conflicts.length > 0
-          ? `Adjusted ${conflictResult.conflicts.filter(c => c.resolution === 'convert_to_close').length} leg(s) to close instead of open`
+          ? `STRICT MODE: Entry blocked due to overlapping positions [${conflictResult.conflictSymbols.join(', ')}]. Close/flatten existing positions first.`
+          : conflictResult.nettingApplied
+          ? `Netting applied: ${conflictResult.conflicts.filter(c => c.resolution === 'netting_applied').length} leg(s) converted to close. WARNING: May create broken structure.`
           : undefined,
       });
       
       if (!conflictResult.canProceed) {
-        console.log(`[PREFLIGHT] Entry blocked by conflicts:`, conflictResult.conflicts);
+        console.log(`[PREFLIGHT] STRICT MODE: Entry blocked by conflicts:`, conflictResult.conflicts);
         // Set cooldown to prevent spam
         setEntryCooldown(cooldownKey);
+        
+        // Build detailed conflict description for UI
+        const conflictDetails = conflictResult.conflicts.map(c => 
+          `${c.symbol}: ${c.existingQty > 0 ? 'LONG' : 'SHORT'} ${Math.abs(c.existingQty)} vs proposed ${c.proposedSide}`
+        );
         
         if (signal.strategyId) {
           await saveEvaluation(
@@ -1353,21 +1412,32 @@ serve(async (req) => {
             'entry_attempt',
             {
               decision: 'FAIL',
-              reason: `Entry blocked: position conflicts on ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => c.symbol).join(', ')}`,
+              reason: `STRICT MODE: Entry blocked - overlapping positions on ${conflictResult.conflictSymbols.join(', ')}`,
               gates,
               inputs: { market: {}, account: {} },
               proposedOrder: signal.proposedOrder,
             },
-            { signal, blocked: 'conflict', conflicts: conflictResult.conflicts },
+            { 
+              signal, 
+              blocked: 'conflict', 
+              entry_conflict: true,
+              conflict_symbols: conflictResult.conflictSymbols,
+              conflicts: conflictResult.conflicts,
+              allow_entry_netting: allowNetting,
+            },
             effectiveTradeGroupId
           );
         }
         return new Response(
           JSON.stringify({ 
             success: false, 
-            error: `Entry blocked: conflicting positions. ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => `${c.symbol} has ${c.existingQty > 0 ? 'long' : 'short'} ${Math.abs(c.existingQty)} - close first`).join('; ')}`,
+            error: `STRICT MODE: Entry blocked due to overlapping positions. Close existing positions first.`,
             blocked: 'conflict',
+            entry_conflict: true,
+            conflict_symbols: conflictResult.conflictSymbols,
             conflicts: conflictResult.conflicts,
+            conflictDetails,
+            allow_entry_netting: allowNetting,
             tradeGroupId: effectiveTradeGroupId,
           }),
           { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -1383,20 +1453,24 @@ serve(async (req) => {
           'entry_attempt',
           {
             decision: 'OPEN',
-            reason: conflictResult.conflicts.length > 0 
-              ? `Executing entry with ${conflictResult.conflicts.length} leg(s) converted to close` 
-              : 'Executing entry order',
+            reason: conflictResult.nettingApplied 
+              ? `Entry proceeding with netting: ${conflictResult.conflicts.filter(c => c.resolution === 'netting_applied').length} leg(s) converted to close (WARNING: may create partial structure)` 
+              : 'Executing entry order (no conflicts)',
             gates,
             inputs: { market: {}, account: {} },
             proposedOrder: signal.proposedOrder,
           },
-          { signal, adjustments: conflictResult.conflicts.length > 0 ? conflictResult : undefined },
+          { 
+            signal, 
+            netting_applied: conflictResult.nettingApplied,
+            adjustments: conflictResult.nettingApplied ? conflictResult : undefined 
+          },
           effectiveTradeGroupId
         );
       }
       
-      // Use adjusted legs if any conflicts were resolved
-      const signalToExecute = conflictResult.conflicts.length > 0
+      // Use adjusted legs if netting was applied
+      const signalToExecute = conflictResult.nettingApplied
         ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
         : signal;
 
