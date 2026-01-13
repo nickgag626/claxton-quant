@@ -50,6 +50,7 @@ const Index = () => {
     dtbpRejection,
     isGroupedPosition,
     getGroupPositions,
+    clearHistory,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -149,7 +150,7 @@ const Index = () => {
             <OptionsChain />
           </TabsContent>
           <TabsContent value="activity" className="mt-4">
-            <ActivityLog events={activity} />
+            <ActivityLog events={activity} onClearHistory={clearHistory} />
           </TabsContent>
         </Tabs>
       </div>

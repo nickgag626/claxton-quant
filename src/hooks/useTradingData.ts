@@ -303,6 +303,17 @@ export const useTradingData = () => {
     ]);
   }, []);
 
+  // Clear all history (activity log, P&L history, delta history)
+  const clearHistory = useCallback(() => {
+    setActivity([]);
+    setPnlHistory([]);
+    setDeltaHistory([]);
+    toast({
+      title: 'History Cleared',
+      description: 'Activity log and chart history have been reset.',
+    });
+  }, []);
+
   // === FAST LOOP: Clock + Quotes only ===
   const fetchFastData = useCallback(async () => {
     if (fastLoopInFlight.current) return;
@@ -1447,6 +1458,7 @@ export const useTradingData = () => {
     riskStatus,
     safeguards,
     activity,
+    clearHistory,
     marketState,
     isApiConnected,
     isBotRunning,
