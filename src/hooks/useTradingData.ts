@@ -672,6 +672,13 @@ export const useTradingData = () => {
     await settingsService.deleteStrategy(strategyId);
   }, [strategies, addActivity]);
 
+  /**
+   * Journal a closed trade - CORRECT FLOW:
+   * 1. Save as 'submitted' with pnl=NULL, exit_price=NULL (no guessing)
+   * 2. Immediately poll Tradier for order status
+   * 3. If filled: update with real fill price and compute P&L
+   * 4. If rejected/canceled/expired: mark terminal status
+   */
   const journalClosedTrade = useCallback(async (
     position: Position,
     closeResult: {
@@ -689,10 +696,16 @@ export const useTradingData = () => {
     source: string,
     clientRequestId: string
   ) => {
+    if (!closeResult.orderId) {
+      console.error('journalClosedTrade: No orderId provided, cannot journal');
+      return;
+    }
+
     try {
       const stratInfo = strategyPositions.get(position.symbol);
       const underlying = extractUnderlyingFromSymbol(position.symbol);
 
+      // Determine open side from position data
       const positionSide = closeResult.positionDetails?.side;
       let openSide: string | undefined;
       if (positionSide === 'short') {
@@ -708,49 +721,10 @@ export const useTradingData = () => {
       const quantity = closeResult.closeQty || position.quantity;
       const multiplier = 100;
       const entryPrice = Math.abs(position.costBasis) / (quantity * multiplier);
-      
-      // Estimate exit price from position's current market value
-      // currentValue is the mark-to-market value of the position
-      const exitPrice = Math.abs(position.currentValue) / (quantity * multiplier);
-      
-      // Calculate estimated P&L based on position type
-      // For options: P&L = (exitPrice - entryPrice) * qty * 100 for longs
-      //              P&L = (entryPrice - exitPrice) * qty * 100 for shorts
-      let estimatedPnl: number | null = null;
-      let pnlFormula: string | null = null;
-      
-      if (openSide && entryPrice > 0) {
-        if (openSide === 'buy_to_open') {
-          // Long position: profit when exit > entry
-          estimatedPnl = (exitPrice - entryPrice) * quantity * multiplier;
-          pnlFormula = `(${exitPrice.toFixed(4)} - ${entryPrice.toFixed(4)}) × ${quantity} × ${multiplier} = ${estimatedPnl.toFixed(2)}`;
-        } else if (openSide === 'sell_to_open') {
-          // Short position: profit when exit < entry
-          estimatedPnl = (entryPrice - exitPrice) * quantity * multiplier;
-          pnlFormula = `(${entryPrice.toFixed(4)} - ${exitPrice.toFixed(4)}) × ${quantity} × ${multiplier} = ${estimatedPnl.toFixed(2)}`;
-        }
-      }
-      
-      // If we can't determine direction, use the simple difference
-      if (estimatedPnl === null && position.costBasis !== 0 && position.currentValue !== 0) {
-        // costBasis is negative for credits (short), positive for debits (long)
-        // currentValue is always the current market value (positive)
-        // For shorts: costBasis is negative (credit received), currentValue is what we'd pay to close
-        // P&L = -costBasis - currentValue (credit received minus cost to close)
-        // For longs: costBasis is positive (debit paid), currentValue is what we'd get
-        // P&L = currentValue - costBasis
-        if (position.costBasis < 0) {
-          // Short: credit received = -costBasis, cost to close = currentValue
-          estimatedPnl = -position.costBasis - position.currentValue;
-          pnlFormula = `credit(${(-position.costBasis).toFixed(2)}) - close(${position.currentValue.toFixed(2)}) = ${estimatedPnl.toFixed(2)}`;
-        } else {
-          // Long: debit paid = costBasis, sale proceeds = currentValue  
-          estimatedPnl = position.currentValue - position.costBasis;
-          pnlFormula = `sale(${position.currentValue.toFixed(2)}) - cost(${position.costBasis.toFixed(2)}) = ${estimatedPnl.toFixed(2)}`;
-        }
-      }
-
       const now = new Date().toISOString();
+
+      // STEP 1: Save trade as 'submitted' with NULL pnl/exit_price
+      // Tradier 'ok' status != filled - order may still be rejected
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
         underlying,
@@ -758,15 +732,13 @@ export const useTradingData = () => {
         strategy_type: position.strategyType,
         quantity,
         entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || now,
-        exit_time: now,
+        exit_time: undefined, // Set when filled
         entry_price: entryPrice,
-        exit_price: exitPrice,
+        exit_price: undefined, // Set when filled from Tradier avg_fill_price
         entry_credit: stratInfo?.entryCredit,
-        pnl: estimatedPnl,
-        pnl_percent: entryPrice > 0 && estimatedPnl !== null 
-          ? (estimatedPnl / (entryPrice * quantity * multiplier)) * 100 
-          : null,
-        pnl_formula: pnlFormula,
+        pnl: null, // NEVER guess - wait for fill confirmation
+        pnl_percent: null,
+        pnl_formula: undefined,
         exit_reason: exitReason,
         trade_group_id: position.tradeGroupId,
         open_side: openSide,
@@ -774,29 +746,68 @@ export const useTradingData = () => {
         close_order_id: closeResult.orderId,
         multiplier,
         fees: 0,
-        // Set needs_reconcile to false if we have estimated P&L, true otherwise
-        needs_reconcile: estimatedPnl === null,
-        // CRITICAL: Set close lifecycle fields for P&L display
-        close_status: 'filled',
-        close_filled_at: now,
+        needs_reconcile: true, // Always true until Tradier confirms fill
+        close_status: 'submitted',
         close_submitted_at: now,
-        close_filled_qty: quantity,
-        close_avg_fill_price: exitPrice,
+        close_filled_at: undefined,
+        close_filled_qty: undefined,
+        close_avg_fill_price: undefined,
       };
 
       const saveResult = await tradeJournal.saveTrade(tradeRecord);
 
       if (saveResult.duplicate) {
-        console.log('Trade already journaled (duplicate close_order_id):', position.symbol, closeResult.orderId);
-      } else if (saveResult.success) {
-        console.log('Trade journaled:', position.symbol, saveResult.id);
+        console.log('[journalClosedTrade] Duplicate (already exists):', position.symbol, closeResult.orderId);
+        return;
+      }
+      
+      if (!saveResult.success) {
+        console.error('[journalClosedTrade] Failed to save submitted trade:', saveResult.error);
+        return;
+      }
+
+      console.log('[journalClosedTrade] Saved as submitted:', position.symbol, closeResult.orderId);
+
+      // STEP 2: Immediately check order status with Tradier
+      // Small delay to allow order to process
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      const orderStatus = await tradierApi.getOrderStatus(closeResult.orderId);
+      console.log('[journalClosedTrade] Order status:', closeResult.orderId, orderStatus);
+
+      if (!orderStatus.success) {
+        console.warn('[journalClosedTrade] Could not fetch order status, will retry later:', orderStatus.error);
+        return;
+      }
+
+      // STEP 3: Update trade based on order status
+      const updateResult = await tradeJournal.updateCloseStatus(
+        closeResult.orderId,
+        orderStatus.closeStatus,
+        {
+          avgFillPrice: orderStatus.avgFillPrice,
+          filledQty: orderStatus.filledQty,
+          rejectReason: orderStatus.rejectReason,
+          open_side: openSide,
+          fees: 0,
+        }
+      );
+
+      if (updateResult.success) {
+        console.log('[journalClosedTrade] Updated to', orderStatus.closeStatus, ':', position.symbol);
+        
+        if (orderStatus.closeStatus === 'filled') {
+          addActivity('TRADE', `Trade filled: ${position.symbol} @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'}`);
+        } else if (orderStatus.closeStatus === 'rejected' || orderStatus.closeStatus === 'canceled' || orderStatus.closeStatus === 'expired') {
+          addActivity('RISK', `Close ${orderStatus.closeStatus}: ${position.symbol} - ${orderStatus.rejectReason || 'Unknown reason'}`);
+        }
       } else {
-        console.error('Failed to journal trade:', saveResult.error);
+        console.error('[journalClosedTrade] Failed to update close status:', updateResult.error);
       }
     } catch (error) {
-      console.error('Error journaling trade:', error);
+      console.error('[journalClosedTrade] Error:', error);
     }
-  }, [strategyPositions]);
+  }, [strategyPositions, addActivity]);
 
   // Get all positions that belong to the same trade group
   const getGroupPositions = useCallback((tradeGroupId: string | undefined): Position[] => {
@@ -1329,6 +1340,64 @@ export const useTradingData = () => {
 
     return () => clearInterval(engineInterval);
   }, [isBotRunning, runStrategyEngine]);
+
+  // Background task: Poll pending close orders and update their status
+  useEffect(() => {
+    const reconcilePendingCloses = async () => {
+      try {
+        // Get trades with pending close status
+        const pendingTrades = await tradeJournal.getTradesWithPendingClose();
+        
+        if (pendingTrades.length === 0) return;
+        
+        console.log('[reconcilePendingCloses] Found', pendingTrades.length, 'pending close orders');
+        
+        for (const trade of pendingTrades) {
+          if (!trade.close_order_id) continue;
+          
+          const orderStatus = await tradierApi.getOrderStatus(trade.close_order_id);
+          
+          if (!orderStatus.success) {
+            console.warn('[reconcilePendingCloses] Could not fetch status for', trade.close_order_id);
+            continue;
+          }
+          
+          // Only update if status has changed from 'submitted'
+          if (orderStatus.closeStatus !== 'submitted') {
+            const updateResult = await tradeJournal.updateCloseStatus(
+              trade.close_order_id,
+              orderStatus.closeStatus,
+              {
+                avgFillPrice: orderStatus.avgFillPrice,
+                filledQty: orderStatus.filledQty,
+                rejectReason: orderStatus.rejectReason,
+                open_side: trade.open_side,
+                fees: 0,
+              }
+            );
+            
+            if (updateResult.success) {
+              console.log('[reconcilePendingCloses] Updated', trade.close_order_id, 'to', orderStatus.closeStatus);
+              
+              if (orderStatus.closeStatus === 'filled') {
+                addActivity('TRADE', `Trade filled: ${trade.symbol} @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'}`);
+              } else if (orderStatus.closeStatus === 'rejected' || orderStatus.closeStatus === 'canceled' || orderStatus.closeStatus === 'expired') {
+                addActivity('RISK', `Close ${orderStatus.closeStatus}: ${trade.symbol} - ${orderStatus.rejectReason || 'Unknown'}`);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('[reconcilePendingCloses] Error:', error);
+      }
+    };
+    
+    // Run immediately then every 10 seconds
+    reconcilePendingCloses();
+    const interval = setInterval(reconcilePendingCloses, 10000);
+    
+    return () => clearInterval(interval);
+  }, [addActivity]);
 
   const copyLastCloseDebug = useCallback(async () => {
     try {
