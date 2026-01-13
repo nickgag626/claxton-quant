@@ -52,6 +52,8 @@ export type Database = {
           created_at: string
           expiration: string | null
           id: string
+          leg_qty: number
+          leg_side: string | null
           open_order_id: string
           strategy_name: string | null
           strategy_type: string | null
@@ -63,6 +65,8 @@ export type Database = {
           created_at?: string
           expiration?: string | null
           id?: string
+          leg_qty?: number
+          leg_side?: string | null
           open_order_id: string
           strategy_name?: string | null
           strategy_type?: string | null
@@ -74,6 +78,8 @@ export type Database = {
           created_at?: string
           expiration?: string | null
           id?: string
+          leg_qty?: number
+          leg_side?: string | null
           open_order_id?: string
           strategy_name?: string | null
           strategy_type?: string | null
