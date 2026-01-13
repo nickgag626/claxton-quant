@@ -28,6 +28,7 @@ import type {
 interface StrategyBuilderProps {
   onSaveStrategy: (strategy: Omit<Strategy, 'id'>) => void;
   onClose?: () => void;
+  editingStrategy?: Strategy;
 }
 
 interface StrategyLeg {
@@ -220,7 +221,9 @@ function supportsLongDelta(type: StrategyType): boolean {
   return ['iron_condor', 'iron_fly', 'credit_put_spread', 'credit_call_spread', 'butterfly'].includes(type);
 }
 
-export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProps) => {
+export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: StrategyBuilderProps) => {
+  const isEditing = !!editingStrategy;
+  
   // Basic info
   const [name, setName] = useState('');
   const [strategyType, setStrategyType] = useState<StrategyType>('iron_condor');
@@ -281,6 +284,73 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
   const [newLegSide, setNewLegSide] = useState<'buy' | 'sell'>('sell');
   const [newLegOffset, setNewLegOffset] = useState(0);
   const [newLegQty, setNewLegQty] = useState(1);
+  
+  // Populate form when editing
+  useEffect(() => {
+    if (!editingStrategy) return;
+    
+    const s = editingStrategy;
+    const entry = s.entryConditions;
+    const exit = s.exitConditions;
+    const sizing = s.sizing;
+    
+    setName(s.name);
+    setStrategyType(s.type);
+    setUnderlying(s.underlying);
+    setMaxPositions(s.maxPositions);
+    setPositionSize(s.positionSize);
+    
+    // Entry conditions
+    setMinDte(entry.minDte);
+    setMaxDte(entry.maxDte);
+    setIs0dte(entry.minDte === 0 && entry.maxDte === 0);
+    setShortDeltaTarget(entry.shortDeltaTarget ?? entry.maxDelta ?? 0.10);
+    setLongDeltaTarget(entry.longDeltaTarget ?? 0.05);
+    setMinPremium(entry.minPremium ?? 0);
+    setUseIvFilter(!!(entry.minIvRank || entry.maxIvRank));
+    setMinIvRank(entry.minIvRank ?? 20);
+    setMaxIvRank(entry.maxIvRank ?? 80);
+    setMarketHoursOnly(entry.marketHoursOnly ?? true);
+    setStartTime(entry.startTime ?? '09:45');
+    setEndTime(entry.endTime ?? '15:30');
+    
+    // MA Filter
+    if (entry.maFilter?.enabled) {
+      setUseMaFilter(true);
+      setMaFilter(entry.maFilter);
+    }
+    
+    // Exit conditions
+    setProfitTarget(exit.profitTargetPercent);
+    setStopLoss(exit.stopLossPercent);
+    setTimeStopDte(exit.timeStopDte ?? 0);
+    setTimeStopTime(exit.timeStopTime ?? '15:45');
+    
+    // Trailing stop
+    if (exit.trailingStop?.enabled) {
+      setUseTrailingStop(true);
+      setTrailingStopType(exit.trailingStop.type);
+      setTrailingStopAmount(exit.trailingStop.amount);
+      setTrailingStopActivation(exit.trailingStop.activationProfit);
+      setTrailingStopBasis(exit.trailingStop.basis ?? 'group');
+    }
+    
+    // Sizing
+    if (sizing) {
+      setSizingMode(sizing.mode);
+      if (sizing.mode === 'risk') {
+        setRiskPerTrade(sizing.riskPerTrade ?? 100);
+        setMaxContracts(sizing.maxContracts ?? 10);
+      } else {
+        setPositionSize(sizing.fixedContracts ?? s.positionSize);
+      }
+    }
+    
+    // Tracked legs
+    if (s.trackedLegs) {
+      setTrackedLegs(s.trackedLegs);
+    }
+  }, [editingStrategy]);
 
   // Update tracked legs when strategy type changes
   useEffect(() => {
@@ -461,8 +531,12 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
     >
       <div className="flex items-center justify-between border-b border-border pb-3 mb-4">
         <div>
-          <h3 className="text-lg font-semibold text-foreground">Strategy Factory</h3>
-          <p className="text-xs text-muted-foreground">Build custom strategies by selecting a template and adjusting parameters</p>
+          <h3 className="text-lg font-semibold text-foreground">
+            {isEditing ? `Edit Strategy: ${editingStrategy?.name}` : 'Strategy Factory'}
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {isEditing ? 'Modify strategy parameters and save changes' : 'Build custom strategies by selecting a template and adjusting parameters'}
+          </p>
         </div>
         <Button variant="ghost" size="sm" onClick={onClose}>×</Button>
       </div>
@@ -1027,7 +1101,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
               className="w-full bg-trading-green hover:bg-trading-green/90 text-black font-semibold"
             >
               <Save className="w-4 h-4 mr-2" />
-              Create Strategy
+              {isEditing ? 'Save Changes' : 'Create Strategy'}
             </Button>
           </div>
         </TabsContent>
@@ -1156,7 +1230,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose }: StrategyBuilderProp
                 className="w-full bg-trading-green hover:bg-trading-green/90 text-black font-semibold"
               >
                 <Save className="w-4 h-4 mr-2" />
-                Create Custom Strategy
+                {isEditing ? 'Save Custom Strategy' : 'Create Custom Strategy'}
               </Button>
             </div>
           )}

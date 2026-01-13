@@ -760,6 +760,19 @@ export const useTradingData = () => {
     }
   }, [addActivity]);
 
+  const updateStrategy = useCallback(async (strategyId: string, strategy: Omit<Strategy, 'id'>) => {
+    const updatedStrategy = await settingsService.updateStrategy(strategyId, strategy);
+    
+    if (updatedStrategy) {
+      setStrategies(prev => prev.map(s => s.id === strategyId ? updatedStrategy : s));
+      addActivity('SYSTEM', `Strategy "${strategy.name}" updated`);
+    } else {
+      // Fallback to local update if DB fails
+      setStrategies(prev => prev.map(s => s.id === strategyId ? { ...strategy, id: strategyId } : s));
+      addActivity('SYSTEM', `Strategy "${strategy.name}" updated (local only)`);
+    }
+  }, [addActivity]);
+
   const deleteStrategy = useCallback(async (strategyId: string) => {
     const strategy = strategies.find(s => s.id === strategyId);
     if (strategy) {
@@ -1630,6 +1643,7 @@ export const useTradingData = () => {
     updateSafeguards,
     toggleStrategy,
     addStrategy,
+    updateStrategy,
     deleteStrategy,
     closePosition,
     emergencyCloseAll,

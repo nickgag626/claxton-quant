@@ -35,6 +35,7 @@ const Index = () => {
     updateSafeguards,
     toggleStrategy,
     addStrategy,
+    updateStrategy,
     deleteStrategy,
     closePosition,
     emergencyCloseAll,
@@ -122,6 +123,7 @@ const Index = () => {
           strategies={strategies} 
           onToggleStrategy={toggleStrategy}
           onAddStrategy={addStrategy}
+          onUpdateStrategy={updateStrategy}
           onDeleteStrategy={deleteStrategy}
         />
         
