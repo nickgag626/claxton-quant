@@ -842,7 +842,7 @@ serve(async (req) => {
 
     if (action === 'execute') {
       // Execute a trade signal
-      const { signal } = body;
+      const { signal, tradeGroupId } = body;
       
       if (!signal || !signal.legs) {
         return new Response(
@@ -851,7 +851,10 @@ serve(async (req) => {
         );
       }
 
-      // Save entry_attempt evaluation
+      // Generate trade_group_id if not provided
+      const effectiveTradeGroupId = tradeGroupId || crypto.randomUUID();
+
+      // Save entry_attempt evaluation with trade_group_id
       if (signal.strategyId) {
         await saveEvaluation(
           supabase,
@@ -865,13 +868,14 @@ serve(async (req) => {
             inputs: { market: {}, account: {} },
             proposedOrder: signal.proposedOrder,
           },
-          { signal }
+          { signal },
+          effectiveTradeGroupId
         );
       }
 
       const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signal);
       
-      // Save entry_submitted or entry_filled based on result
+      // Save entry_submitted or entry_rejected based on result
       if (signal.strategyId) {
         await saveEvaluation(
           supabase,
@@ -885,12 +889,13 @@ serve(async (req) => {
             inputs: { market: {}, account: {} },
             proposedOrder: { ...signal.proposedOrder, order_id: orderResponse.orderId },
           },
-          { signal, orderResponse }
+          { signal, orderResponse },
+          effectiveTradeGroupId
         );
       }
       
       return new Response(
-        JSON.stringify(orderResponse),
+        JSON.stringify({ ...orderResponse, tradeGroupId: effectiveTradeGroupId }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -912,48 +917,106 @@ serve(async (req) => {
         const pnl = isShort ? Math.abs(costBasis) - currentValue : currentValue - costBasis;
         const pnlPercent = Math.abs(costBasis) > 0 ? (pnl / Math.abs(costBasis)) * 100 : 0;
         
+        let exitReason: string | null = null;
+        
         // Check profit target
         if (pnlPercent >= strategy.exitConditions.profitTargetPercent) {
-          exitSignals.push({
-            positionId: position.id,
-            symbol: position.symbol,
-            quantity: position.quantity,
-            reason: 'profit_target',
-            pnlPercent,
-          });
-          continue;
+          exitReason = 'profit_target';
         }
-
         // Check stop loss
-        if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
-          exitSignals.push({
-            positionId: position.id,
-            symbol: position.symbol,
-            quantity: position.quantity,
-            reason: 'stop_loss',
-            pnlPercent,
-          });
-          continue;
+        else if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
+          exitReason = 'stop_loss';
         }
-
         // Check time stop
-        if (strategy.exitConditions.timeStopDte && position.expirationDate) {
+        else if (strategy.exitConditions.timeStopDte && position.expirationDate) {
           const expDate = new Date(position.expirationDate);
           const dte = Math.ceil((expDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
           if (dte <= strategy.exitConditions.timeStopDte) {
-            exitSignals.push({
-              positionId: position.id,
-              symbol: position.symbol,
-              quantity: position.quantity,
-              reason: 'time_stop',
-              dte,
-            });
+            exitReason = 'time_stop';
           }
+        }
+        
+        if (exitReason) {
+          // Save exit_attempt evaluation with trade_group_id
+          if (position.tradeGroupId && strategy.id) {
+            await saveEvaluation(
+              supabase,
+              strategy.id,
+              position.underlying || strategy.underlying,
+              'exit_attempt',
+              {
+                decision: 'CLOSE',
+                reason: `Exit triggered: ${exitReason} (P&L: ${pnlPercent.toFixed(2)}%)`,
+                gates: [{
+                  name: exitReason,
+                  expected: exitReason === 'profit_target' 
+                    ? `P&L >= ${strategy.exitConditions.profitTargetPercent}%`
+                    : exitReason === 'stop_loss'
+                    ? `P&L <= -${strategy.exitConditions.stopLossPercent}%`
+                    : `DTE <= ${strategy.exitConditions.timeStopDte}`,
+                  actual: { pnl_percent: pnlPercent },
+                  pass: true,
+                }],
+                inputs: { 
+                  market: { pnl_percent: pnlPercent, cost_basis: costBasis, current_value: currentValue }, 
+                  account: {} 
+                },
+              },
+              { position, exitReason },
+              position.tradeGroupId
+            );
+          }
+          
+          exitSignals.push({
+            positionId: position.id,
+            symbol: position.symbol,
+            quantity: position.quantity,
+            reason: exitReason,
+            pnlPercent,
+            tradeGroupId: position.tradeGroupId,
+          });
         }
       }
 
       return new Response(
         JSON.stringify({ exitSignals, marketState }),
+        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+    
+    if (action === 'close_position') {
+      // Close a specific position and save exit evaluation
+      const { position, reason, strategyId, tradeGroupId } = body;
+      
+      if (!position) {
+        return new Response(
+          JSON.stringify({ error: 'Position required' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // Save exit_attempt evaluation
+      if (strategyId && tradeGroupId) {
+        await saveEvaluation(
+          supabase,
+          strategyId,
+          position.underlying || 'SPY',
+          'exit_attempt',
+          {
+            decision: 'CLOSE',
+            reason: reason || 'Manual close',
+            gates: [],
+            inputs: { market: {}, account: {} },
+          },
+          { position, reason },
+          tradeGroupId
+        );
+      }
+      
+      // TODO: Actually place close order via Tradier
+      // For now, return success indicator
+      return new Response(
+        JSON.stringify({ success: true, message: 'Exit evaluation saved' }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }

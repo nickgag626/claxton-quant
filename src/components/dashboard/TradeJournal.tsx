@@ -10,7 +10,8 @@ import { cn } from '@/lib/utils';
 import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection, isClosePending, isCloseRejected, CloseStatus } from '@/services/tradeJournal';
 import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
 import { format, subDays } from 'date-fns';
-import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle, Loader2, Ban } from 'lucide-react';
+import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle, Loader2, Ban, Activity } from 'lucide-react';
+import { DecisionTraceLink } from './DecisionTraceLink';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -434,6 +435,9 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
             {group.needsReconcile && (
               <AlertTriangle className="h-3 w-3 text-bloomberg-amber" />
             )}
+            <span title="Has Decision Trace">
+              <Activity className="h-3 w-3 text-bloomberg-blue" />
+            </span>
             <ChevronRight 
               className={cn(
                 "h-4 w-4 text-muted-foreground transition-transform",
@@ -463,7 +467,9 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
           {pnlDisplay != null ? `${pnlDisplay >= 0 ? '+' : ''}$${Number(pnlDisplay).toFixed(2)}` : '--'}
         </TableCell>
         <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
-          {group.exitReason || '--'}
+          <div className="flex items-center gap-2">
+            <span>{group.exitReason || '--'}</span>
+          </div>
         </TableCell>
       </TableRow>
       {isExpanded && (
@@ -527,9 +533,12 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                 );
               })}
               <div className="flex justify-between items-center pt-2 border-t border-border mt-2">
-                <span className="text-[10px] text-muted-foreground uppercase">
-                  Combined P&L {group.needsReconcile && '(partial)'}
-                </span>
+                <div className="flex items-center gap-3">
+                  <span className="text-[10px] text-muted-foreground uppercase">
+                    Combined P&L {group.needsReconcile && '(partial)'}
+                  </span>
+                  <DecisionTraceLink tradeGroupId={group.groupId} />
+                </div>
                 {pnlDisplay != null ? (
                   <span className={cn(
                     "font-mono font-semibold",
