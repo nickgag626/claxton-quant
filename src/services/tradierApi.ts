@@ -139,10 +139,13 @@ export const tradierApi = {
       
       return posArray.map((p: TradierPosition) => {
         const quote = liveQuotes[p.symbol];
-        // Use mid price if available, otherwise fall back to cost basis
-        const currentPrice = quote ? (quote.bid + quote.ask) / 2 || quote.last : 0;
-        // Current value = current price * quantity * 100 (options multiplier)
-        const currentValue = currentPrice * Math.abs(p.quantity) * 100;
+        // Tradier cost_basis is TOTAL DOLLARS (already includes qty × 100 multiplier)
+        // For current market value: per-contract price × |qty| × 100 
+        const perContractPrice = quote ? (quote.bid + quote.ask) / 2 || quote.last : 0;
+        // Compute total market value in dollars
+        const marketValue = perContractPrice * Math.abs(p.quantity) * 100;
+        // Use sign convention matching Tradier: short positions have negative values
+        const signedMarketValue = p.quantity < 0 ? -marketValue : marketValue;
         
         // Parse option symbol to extract expiration date
         const parsed = parseOptionSymbol(p.symbol);
@@ -151,12 +154,20 @@ export const tradierApi = {
           id: String(p.id),
           symbol: p.symbol,
           quantity: p.quantity,
+          // costBasis from Tradier is already total dollars (e.g., -38 for short position)
           costBasis: p.cost_basis,
-          currentValue: currentValue || p.cost_basis, // Fall back to cost basis if no quote
+          // currentValue is total dollars (sign matches position direction)
+          currentValue: perContractPrice > 0 ? signedMarketValue : p.cost_basis,
           status: 'open' as const,
           entryTime: new Date(p.date_acquired),
           expirationDate: parsed?.expiration,
           underlying: parsed?.underlying,
+          // Include raw Tradier values for debugging
+          _rawTradier: {
+            cost_basis: p.cost_basis,
+            market_value: perContractPrice > 0 ? signedMarketValue : undefined,
+            quantity: p.quantity,
+          },
         };
       });
     } catch (error) {

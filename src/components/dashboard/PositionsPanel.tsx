@@ -74,11 +74,27 @@ const computeDte = (expirationDate?: string): number | null => {
   return diffDays;
 };
 
+/**
+ * Compute unrealized P&L for a position.
+ * Tradier's cost_basis and our currentValue are TOTAL DOLLARS (already include qty × multiplier).
+ * For short positions: both values are negative, so pnl = cost_basis - currentValue
+ *   e.g., sold for -$38, now worth -$34.50 → pnl = -38 - (-34.50) = -$3.50... 
+ *   But Tradier convention: sold at $38 credit, now costs $34.50 to close = +$3.50 gain
+ * Canonical formula: pnl = -(currentValue - costBasis) for shorts, = currentValue - costBasis for longs
+ * Since Tradier uses signed values, simpler: pnl = costBasis - currentValue (works for both)
+ *   Short: costBasis=-38, currentValue=-34.50 → -38 - (-34.50) = -3.50 (loss? no...)
+ * Actually for shorts: we RECEIVED credit (positive economic value), current liability is market value
+ *   Gain = |costBasis| - |currentValue| when short
+ * Let's use: for shorts, gain when currentValue < costBasis (both negative means |cv| < |cb|)
+ */
 const computePnl = (position: Position): number => {
-  const cost = position.costBasis * Math.abs(position.quantity) * 100;
-  const current = position.currentValue * Math.abs(position.quantity) * 100;
-  // For short positions, profit is cost - current
-  return position.quantity < 0 ? cost - current : current - cost;
+  // costBasis and currentValue are signed total dollars from Tradier
+  // Short: costBasis negative (credit received), currentValue negative (cost to close)
+  // Long: costBasis positive (debit paid), currentValue positive (current worth)
+  // P&L = currentValue - costBasis works correctly:
+  //   Short sold at -38, now -34.50: -34.50 - (-38) = +3.50 gain ✓
+  //   Long bought at +50, now +60: 60 - 50 = +10 gain ✓
+  return position.currentValue - position.costBasis;
 };
 
 export const PositionsPanel = ({ 
@@ -551,6 +567,7 @@ export const PositionsPanel = ({
                         {isExpanded && group.positions.map((pos) => {
                           const dte = computeDte(pos.expirationDate);
                           const legPnl = computePnl(pos);
+                          const raw = pos._rawTradier;
                           
                           return (
                             <TableRow 
@@ -566,24 +583,51 @@ export const PositionsPanel = ({
                                   )}>
                                     {pos.quantity > 0 ? '+' : ''}{pos.quantity}
                                   </span>
-                                  <span className="truncate max-w-40" title={pos.symbol}>
-                                    {pos.symbol}
-                                  </span>
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="truncate max-w-40 cursor-help underline decoration-dotted underline-offset-2" title={pos.symbol}>
+                                          {pos.symbol}
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent side="right" className="font-mono text-[10px] max-w-xs">
+                                        <div className="space-y-1">
+                                          <div className="font-semibold text-bloomberg-amber">Raw Tradier Values</div>
+                                          <div>cost_basis: ${raw?.cost_basis?.toFixed(2) ?? 'N/A'}</div>
+                                          <div>market_value: ${raw?.market_value?.toFixed(2) ?? 'N/A'}</div>
+                                          <div>quantity: {raw?.quantity ?? 'N/A'}</div>
+                                          <div className="border-t border-border pt-1 mt-1">
+                                            <span className="text-muted-foreground">Computed P&L:</span> ${legPnl.toFixed(2)}
+                                          </div>
+                                        </div>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
                                 </div>
                               </TableCell>
                               <TableCell className={cn(
                                 "font-mono text-[10px] text-right py-1",
                                 legPnl >= 0 ? "text-trading-green" : "text-panic-red"
                               )}>
-                                {legPnl >= 0 ? '+' : ''}${legPnl.toFixed(0)}
+                                {legPnl >= 0 ? '+' : ''}${legPnl.toFixed(2)}
                               </TableCell>
                               <TableCell className="font-mono text-[10px] text-right text-muted-foreground py-1">
                                 {dte !== null ? dte : '--'}
                               </TableCell>
                               <TableCell className="font-mono text-[10px] text-center py-1">
-                                <span className="text-muted-foreground">
-                                  ${pos.costBasis.toFixed(2)}
-                                </span>
+                                <TooltipProvider>
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="text-muted-foreground cursor-help">
+                                        ${pos.costBasis.toFixed(2)}
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top" className="font-mono text-[10px]">
+                                      <div>Cost: ${pos.costBasis.toFixed(2)}</div>
+                                      <div>Current: ${pos.currentValue.toFixed(2)}</div>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                </TooltipProvider>
                               </TableCell>
                               <TableCell className="py-1 text-center">
                                 {renderLegCloseButton(pos)}
