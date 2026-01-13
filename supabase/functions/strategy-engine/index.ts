@@ -6,6 +6,114 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Entry cooldown cache: key -> expiry timestamp (prevents spam on rejected entries)
+// Key format: strategyId:underlying:expiration:sortedStrikes
+const entryCooldownCache = new Map<string, number>();
+const ENTRY_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+
+function generateEntryCooldownKey(strategyId: string, underlying: string, expiration: string, legs: any[]): string {
+  const strikes = legs.map(l => l.strike).sort((a, b) => a - b).join('-');
+  return `${strategyId}:${underlying}:${expiration}:${strikes}`;
+}
+
+function isEntryCoolingDown(key: string): boolean {
+  const expiry = entryCooldownCache.get(key);
+  if (!expiry) return false;
+  if (Date.now() < expiry) return true;
+  entryCooldownCache.delete(key);
+  return false;
+}
+
+function setEntryCooldown(key: string): void {
+  entryCooldownCache.set(key, Date.now() + ENTRY_COOLDOWN_MS);
+}
+
+interface PositionConflict {
+  symbol: string;
+  proposedSide: string;
+  existingQty: number;
+  conflict: 'long_vs_sell_open' | 'short_vs_buy_open';
+  resolution: 'convert_to_close' | 'block';
+  convertedQty?: number;
+}
+
+// Check for position conflicts before entry
+function checkEntryConflicts(
+  proposedLegs: any[],
+  brokerPositions: Array<{ symbol: string; quantity: number }>
+): { conflicts: PositionConflict[]; canProceed: boolean; adjustedLegs: any[] } {
+  const positionMap = new Map<string, number>();
+  for (const pos of brokerPositions) {
+    const existing = positionMap.get(pos.symbol) || 0;
+    positionMap.set(pos.symbol, existing + pos.quantity);
+  }
+  
+  const conflicts: PositionConflict[] = [];
+  const adjustedLegs = proposedLegs.map(leg => ({ ...leg }));
+  let canProceed = true;
+  
+  for (let i = 0; i < adjustedLegs.length; i++) {
+    const leg = adjustedLegs[i];
+    const optionSymbol = leg.option_symbol || leg.symbol;
+    const existingQty = positionMap.get(optionSymbol) || 0;
+    
+    if (existingQty === 0) continue;
+    
+    // Long position exists + sell_to_open = conflict
+    if (existingQty > 0 && leg.side === 'sell_to_open') {
+      if (existingQty >= leg.quantity) {
+        // Can convert entirely to sell_to_close
+        conflicts.push({
+          symbol: optionSymbol,
+          proposedSide: leg.side,
+          existingQty,
+          conflict: 'long_vs_sell_open',
+          resolution: 'convert_to_close',
+          convertedQty: leg.quantity,
+        });
+        adjustedLegs[i] = { ...leg, side: 'sell_to_close' };
+      } else {
+        // Not enough to close, block the entry
+        conflicts.push({
+          symbol: optionSymbol,
+          proposedSide: leg.side,
+          existingQty,
+          conflict: 'long_vs_sell_open',
+          resolution: 'block',
+        });
+        canProceed = false;
+      }
+    }
+    
+    // Short position exists + buy_to_open = conflict
+    if (existingQty < 0 && leg.side === 'buy_to_open') {
+      const absExisting = Math.abs(existingQty);
+      if (absExisting >= leg.quantity) {
+        conflicts.push({
+          symbol: optionSymbol,
+          proposedSide: leg.side,
+          existingQty,
+          conflict: 'short_vs_buy_open',
+          resolution: 'convert_to_close',
+          convertedQty: leg.quantity,
+        });
+        adjustedLegs[i] = { ...leg, side: 'buy_to_close' };
+      } else {
+        conflicts.push({
+          symbol: optionSymbol,
+          proposedSide: leg.side,
+          existingQty,
+          conflict: 'short_vs_buy_open',
+          resolution: 'block',
+        });
+        canProceed = false;
+      }
+    }
+  }
+  
+  return { conflicts, canProceed, adjustedLegs };
+}
+
 // Types
 interface Strategy {
   id: string;
@@ -1133,7 +1241,7 @@ serve(async (req) => {
     }
 
     if (action === 'execute') {
-      // Execute a trade signal
+      // Execute a trade signal with preflight checks
       const { signal, tradeGroupId } = body;
       
       if (!signal || !signal.legs) {
@@ -1145,8 +1253,128 @@ serve(async (req) => {
 
       // Generate trade_group_id if not provided
       const effectiveTradeGroupId = tradeGroupId || crypto.randomUUID();
+      const gates: Gate[] = [];
+      
+      // PREFLIGHT 1: Entry cooldown check
+      const cooldownKey = generateEntryCooldownKey(
+        signal.strategyId || 'unknown',
+        signal.underlying,
+        signal.expiration || '',
+        signal.proposedOrder?.legs || signal.legs
+      );
+      
+      const isCoolingDown = isEntryCoolingDown(cooldownKey);
+      gates.push({
+        name: 'Entry Cooldown',
+        expected: 'no recent rejected entry',
+        actual: { coolingDown: isCoolingDown, key: cooldownKey },
+        pass: !isCoolingDown,
+        reason: isCoolingDown ? 'Entry blocked - recent rejection, wait 2 minutes' : undefined,
+      });
+      
+      if (isCoolingDown) {
+        console.log(`[PREFLIGHT] Entry blocked by cooldown: ${cooldownKey}`);
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: 'Entry blocked by cooldown (recent rejection)',
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            { signal, blocked: 'cooldown' },
+            effectiveTradeGroupId
+          );
+        }
+        return new Response(
+          JSON.stringify({ 
+            success: false, 
+            error: 'Entry blocked by cooldown (recent rejection, wait 2 minutes)',
+            blocked: 'cooldown',
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // PREFLIGHT 2: Fetch current broker positions and check for conflicts
+      let brokerPositions: Array<{ symbol: string; quantity: number }> = [];
+      try {
+        const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
+        const posResponse = await fetch(posUrl, {
+          headers: { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' },
+        });
+        const posData = await posResponse.json();
+        const rawPositions = posData?.positions?.position;
+        if (rawPositions) {
+          brokerPositions = (Array.isArray(rawPositions) ? rawPositions : [rawPositions])
+            .map((p: any) => ({ symbol: p.symbol, quantity: p.quantity }));
+        }
+        console.log(`[PREFLIGHT] Fetched ${brokerPositions.length} broker positions`);
+      } catch (err) {
+        console.error('[PREFLIGHT] Failed to fetch positions:', err);
+      }
+      
+      // Build position map for conflict check
+      const proposedLegs = signal.proposedOrder?.legs || signal.legs;
+      const conflictResult = checkEntryConflicts(proposedLegs, brokerPositions);
+      
+      gates.push({
+        name: 'Entry Conflict',
+        expected: 'no conflicting positions',
+        actual: {
+          conflicts: conflictResult.conflicts,
+          brokerPositionCount: brokerPositions.length,
+          canProceed: conflictResult.canProceed,
+        },
+        pass: conflictResult.canProceed,
+        reason: !conflictResult.canProceed 
+          ? `Entry blocked: ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => `${c.symbol} has ${c.existingQty > 0 ? 'long' : 'short'} position, cannot ${c.proposedSide}`).join('; ')}`
+          : conflictResult.conflicts.length > 0
+          ? `Adjusted ${conflictResult.conflicts.filter(c => c.resolution === 'convert_to_close').length} leg(s) to close instead of open`
+          : undefined,
+      });
+      
+      if (!conflictResult.canProceed) {
+        console.log(`[PREFLIGHT] Entry blocked by conflicts:`, conflictResult.conflicts);
+        // Set cooldown to prevent spam
+        setEntryCooldown(cooldownKey);
+        
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: `Entry blocked: position conflicts on ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => c.symbol).join(', ')}`,
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            { signal, blocked: 'conflict', conflicts: conflictResult.conflicts },
+            effectiveTradeGroupId
+          );
+        }
+        return new Response(
+          JSON.stringify({ 
+            success: false, 
+            error: `Entry blocked: conflicting positions. ${conflictResult.conflicts.filter(c => c.resolution === 'block').map(c => `${c.symbol} has ${c.existingQty > 0 ? 'long' : 'short'} ${Math.abs(c.existingQty)} - close first`).join('; ')}`,
+            blocked: 'conflict',
+            conflicts: conflictResult.conflicts,
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
 
-      // Save entry_attempt evaluation with trade_group_id
+      // Save entry_attempt evaluation with trade_group_id (including preflight gates)
       if (signal.strategyId) {
         await saveEvaluation(
           supabase,
@@ -1155,17 +1383,30 @@ serve(async (req) => {
           'entry_attempt',
           {
             decision: 'OPEN',
-            reason: 'Executing entry order',
-            gates: [],
+            reason: conflictResult.conflicts.length > 0 
+              ? `Executing entry with ${conflictResult.conflicts.length} leg(s) converted to close` 
+              : 'Executing entry order',
+            gates,
             inputs: { market: {}, account: {} },
             proposedOrder: signal.proposedOrder,
           },
-          { signal },
+          { signal, adjustments: conflictResult.conflicts.length > 0 ? conflictResult : undefined },
           effectiveTradeGroupId
         );
       }
+      
+      // Use adjusted legs if any conflicts were resolved
+      const signalToExecute = conflictResult.conflicts.length > 0
+        ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
+        : signal;
 
-      const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signal);
+      const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signalToExecute);
+      
+      // If order was rejected, set cooldown
+      if (!orderResponse.success) {
+        setEntryCooldown(cooldownKey);
+        console.log(`[PREFLIGHT] Order rejected, setting cooldown: ${cooldownKey}`);
+      }
       
       // Save entry_submitted or entry_rejected based on result
       if (signal.strategyId) {
@@ -1177,7 +1418,7 @@ serve(async (req) => {
           {
             decision: orderResponse.success ? 'OPEN' : 'FAIL',
             reason: orderResponse.success ? `Order submitted: ${orderResponse.orderId}` : orderResponse.error || 'Order failed',
-            gates: [],
+            gates,
             inputs: { market: {}, account: {} },
             proposedOrder: { ...signal.proposedOrder, order_id: orderResponse.orderId },
           },
