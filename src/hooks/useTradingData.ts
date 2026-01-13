@@ -43,6 +43,35 @@ const BACKOFF_MAX_INTERVAL = 120_000;  // 2min max backoff
 const HEURISTIC_GROUP_TIME_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
+ * Generate a deterministic UUID v4-like string from a seed string.
+ * Uses a simple hash algorithm to produce a consistent UUID for the same input.
+ * Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx where y is 8, 9, a, or b
+ */
+function deterministicUUID(seed: string): string {
+  // Simple hash function
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    const char = seed.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  
+  // Generate more entropy by hashing with different seeds
+  const hash2 = Math.abs(hash * 31 + seed.length);
+  const hash3 = Math.abs(hash * 37 + hash2);
+  const hash4 = Math.abs(hash2 * 41 + hash3);
+  
+  // Convert to hex strings and pad
+  const hex1 = Math.abs(hash).toString(16).padStart(8, '0').slice(0, 8);
+  const hex2 = Math.abs(hash2).toString(16).padStart(4, '0').slice(0, 4);
+  const hex3 = Math.abs(hash3).toString(16).padStart(4, '0').slice(0, 4);
+  const hex4 = Math.abs(hash4).toString(16).padStart(12, '0').slice(0, 12);
+  
+  // Format: xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx (UUID v4 format)
+  return `${hex1}-${hex2}-4${hex3.slice(1)}-8${hex3.slice(0, 3)}-${hex4}`;
+}
+
+/**
  * Extract underlying symbol from OCC option symbol
  * e.g., SPY260112P00693000 -> SPY
  */
@@ -56,6 +85,7 @@ function extractUnderlyingFromSymbol(symbol: string): string {
  * - underlying symbol
  * - expiration date
  * - entry time window (rounded to 5-min bucket)
+ * Returns a valid UUID for database compatibility.
  */
 function generateHeuristicGroupKey(pos: Position): string {
   const parsed = parseOptionSymbol(pos.symbol);
@@ -69,6 +99,16 @@ function generateHeuristicGroupKey(pos: Position): string {
   const timeBucket = Math.floor(entryTime.getTime() / HEURISTIC_GROUP_TIME_WINDOW_MS);
   
   return `heuristic-${underlying}-${expiration}-${timeBucket}`;
+}
+
+/**
+ * Generate a deterministic UUID from a heuristic group key
+ * This ensures the same group always gets the same UUID
+ */
+function generateHeuristicGroupId(pos: Position): string | null {
+  const key = generateHeuristicGroupKey(pos);
+  if (key.startsWith('ungrouped-')) return null;
+  return deterministicUUID(key);
 }
 
 /**
@@ -126,11 +166,16 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
     });
 
     // Assign heuristic group IDs only to groups with 2+ positions
+    // Use deterministic UUIDs for database compatibility
     const heuristicGroupIds = new Map<string, string>();
     heuristicGroups.forEach((groupPositions, key) => {
       if (groupPositions.length >= 2) {
-        // Generate a stable group ID from the key
-        heuristicGroupIds.set(key, `hg-${key}`);
+        // Generate a deterministic UUID from the heuristic key
+        const firstPos = groupPositions[0];
+        const uuid = generateHeuristicGroupId(firstPos);
+        if (uuid) {
+          heuristicGroupIds.set(key, uuid);
+        }
       }
     });
 
@@ -778,8 +823,7 @@ export const useTradingData = () => {
       // STEP 1: Save trade as 'submitted' with NULL pnl/exit_price
       // Tradier 'ok' status != filled - order may still be rejected
 
-      // trade_group_id must be a valid UUID - check if it looks like one
-      // Human-readable IDs like "hg-heuristic-SPY-..." are NOT valid UUIDs
+      // trade_group_id must be a valid UUID for database compatibility
       const isValidUUID = (str: string | undefined): boolean => {
         if (!str) return false;
         const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -787,6 +831,11 @@ export const useTradingData = () => {
       };
 
       const tradeGroupId = isValidUUID(position.tradeGroupId) ? position.tradeGroupId : undefined;
+      
+      // Log if we're discarding a group ID (shouldn't happen now with UUID-based heuristic IDs)
+      if (position.tradeGroupId && !tradeGroupId) {
+        console.warn('[journalClosedTrade] Discarding invalid group ID:', position.tradeGroupId);
+      }
 
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
