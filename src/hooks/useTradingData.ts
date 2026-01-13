@@ -1163,6 +1163,17 @@ export const useTradingData = () => {
     }
   }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade, getGroupPositions]);
 
+  const copyLastCloseDebug = useCallback(async () => {
+    try {
+      if (!lastCloseDebug) return;
+      await navigator.clipboard.writeText(JSON.stringify(lastCloseDebug, null, 2));
+      addActivity('SYSTEM', 'Close debug copied to clipboard');
+    } catch (e) {
+      console.error('Failed to copy close debug:', e);
+      addActivity('SYSTEM', 'Failed to copy close debug');
+    }
+  }, [lastCloseDebug, addActivity]);
+
   // === ALL useEffect DECLARATIONS START HERE ===
 
   // Sync pendingCloseSymbols to ref for stable closure access
@@ -1398,17 +1409,6 @@ export const useTradingData = () => {
     
     return () => clearInterval(interval);
   }, [addActivity]);
-
-  const copyLastCloseDebug = useCallback(async () => {
-    try {
-      if (!lastCloseDebug) return;
-      await navigator.clipboard.writeText(JSON.stringify(lastCloseDebug, null, 2));
-      addActivity('SYSTEM', 'Close debug copied to clipboard');
-    } catch (e) {
-      console.error('Failed to copy close debug:', e);
-      addActivity('SYSTEM', 'Failed to copy close debug');
-    }
-  }, [lastCloseDebug, addActivity]);
 
   return {
     positions,
