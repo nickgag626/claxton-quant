@@ -283,6 +283,22 @@ export const tradierApi = {
     const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
     const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/tradier-api`;
 
+    // DEV-ONLY ASSERTION GUARD:
+    // All broker closes MUST go through requestClose() in useTradingData.
+    // requestClose temporarily sets a global allow-flag around broker calls.
+    if (import.meta.env.DEV) {
+      const allow = (globalThis as any).__ALLOW_BROKER_CLOSE__ === true;
+      if (!allow) {
+        console.error('[tradierApi.closePosition] FORBIDDEN direct call (must use requestClose)', {
+          symbol,
+          quantity,
+          source: opts?.source,
+          clientRequestId,
+        });
+        throw new Error('Direct broker closePosition call forbidden. Use requestClose().');
+      }
+    }
+
     console.log('[tradierApi.closePosition] Request', {
       url,
       symbol,
@@ -393,6 +409,126 @@ export const tradierApi = {
     } catch (err) {
       const isCors = err instanceof TypeError && String(err).includes('Failed to fetch');
       console.error('[tradierApi.closePosition] Network/CORS error:', { error: err, isCors, clientRequestId });
+      return {
+        success: false,
+        error: isCors ? 'CORS/network error - edge function unreachable' : String(err),
+        debug: { isCors, raw: String(err) },
+        clientRequestId,
+      };
+    }
+  },
+
+  async closeGroup(
+    symbols: string[],
+    opts?: {
+      dryRun?: boolean;
+      debug?: boolean;
+      clientRequestId?: string;
+      trade_group_id?: string;
+      source?: 'manual_ui_group' | 'bot_engine_group' | 'emergency_close' | string;
+    }
+  ): Promise<{
+    success: boolean;
+    dryRun?: boolean;
+    skipped?: boolean;
+    notFound?: boolean;
+    orderId?: string;
+    error?: string;
+    debug?: any;
+    clientRequestId?: string;
+    legs?: Array<{ symbol: string; closeSide: string; closeQty: number; positionSide?: string }>;
+  }> {
+    const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
+
+    // Same dev-only guard as closePosition
+    if (import.meta.env.DEV) {
+      const allow = (globalThis as any).__ALLOW_BROKER_CLOSE__ === true;
+      if (!allow) {
+        console.error('[tradierApi.closeGroup] FORBIDDEN direct call (must use requestClose)', {
+          symbols,
+          source: opts?.source,
+          clientRequestId,
+        });
+        throw new Error('Direct broker closeGroup call forbidden. Use requestClose().');
+      }
+    }
+
+    try {
+      const { data, error } = await supabase.functions.invoke('tradier-api', {
+        body: {
+          action: 'close_group',
+          positionSymbols: symbols,
+          dryRun: opts?.dryRun,
+          debug: opts?.debug,
+          clientRequestId,
+          trade_group_id: opts?.trade_group_id,
+          source: opts?.source,
+        },
+        headers: { 'x-client-request-id': clientRequestId },
+      });
+
+      if (error) {
+        let parsedBody: any = null;
+        try {
+          if (error.context && typeof error.context.json === 'function') {
+            parsedBody = await error.context.json();
+          }
+        } catch {
+          // ignore
+        }
+
+        if (parsedBody?.error === 'Position not found') {
+          return { success: false, notFound: true, error: 'Position not found at broker', debug: { parsedBody }, clientRequestId };
+        }
+
+        const isCors = error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError');
+        return {
+          success: false,
+          error: isCors ? 'CORS/network error - edge function unreachable' : error.message,
+          debug: { isCors, raw: error },
+          clientRequestId,
+        };
+      }
+
+      if (data?.skipped) {
+        return {
+          success: false,
+          skipped: true,
+          error: `SKIP: ${data?.reason || 'cooldown/lock'}`,
+          debug: data?.debug,
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
+      }
+
+      if (data?.dry_run) {
+        return {
+          success: true,
+          dryRun: true,
+          orderId: undefined,
+          legs: data?.legs,
+          debug: data?.debug || { planned_order: data?.planned_order },
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
+      }
+
+      if (data?.order?.id) {
+        return {
+          success: true,
+          orderId: data.order.id,
+          legs: data?.legs,
+          debug: data?.debug,
+          clientRequestId: data?.clientRequestId || clientRequestId,
+        };
+      }
+
+      return {
+        success: false,
+        error: data?.errors?.error || data?.error || 'Order failed',
+        debug: data?.debug,
+        clientRequestId: data?.clientRequestId || clientRequestId,
+      };
+    } catch (err) {
+      const isCors = err instanceof TypeError && String(err).includes('Failed to fetch');
       return {
         success: false,
         error: isCors ? 'CORS/network error - edge function unreachable' : String(err),
