@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Settings, ChevronRight, Plus, Trash2, Activity, RefreshCw } from 'lucide-react';
+import { Settings, ChevronRight, Plus, Trash2, Activity, RefreshCw, Pencil } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { StrategyBuilder } from './StrategyBuilder';
 import { StrategyEvaluationPanel } from './StrategyEvaluationPanel';
@@ -16,6 +16,7 @@ interface StrategiesPanelProps {
   strategies: Strategy[];
   onToggleStrategy: (id: string) => void;
   onAddStrategy?: (strategy: Omit<Strategy, 'id'>) => void;
+  onUpdateStrategy?: (strategyId: string, strategy: Omit<Strategy, 'id'>) => void;
   onDeleteStrategy?: (id: string) => void;
 }
 
@@ -34,9 +35,11 @@ export const StrategiesPanel = ({
   strategies, 
   onToggleStrategy, 
   onAddStrategy,
+  onUpdateStrategy,
   onDeleteStrategy 
 }: StrategiesPanelProps) => {
   const [showBuilder, setShowBuilder] = useState(false);
+  const [editingStrategy, setEditingStrategy] = useState<Strategy | null>(null);
   const [expandedStrategy, setExpandedStrategy] = useState<string | null>(null);
   const [latestEvaluations, setLatestEvaluations] = useState<Record<string, StrategyEvaluation>>({});
 
@@ -56,8 +59,23 @@ export const StrategiesPanel = ({
   }, [strategies]);
 
   const handleSaveStrategy = (strategy: Omit<Strategy, 'id'>) => {
-    onAddStrategy?.(strategy);
+    if (editingStrategy) {
+      onUpdateStrategy?.(editingStrategy.id, strategy);
+      setEditingStrategy(null);
+    } else {
+      onAddStrategy?.(strategy);
+    }
     setShowBuilder(false);
+  };
+  
+  const handleEditStrategy = (strategy: Strategy) => {
+    setEditingStrategy(strategy);
+    setShowBuilder(true);
+  };
+  
+  const handleCloseBuilder = () => {
+    setShowBuilder(false);
+    setEditingStrategy(null);
   };
 
   const getDecisionBadge = (decision: string) => {
@@ -89,7 +107,14 @@ export const StrategiesPanel = ({
           <Button 
             variant="secondary" 
             size="sm" 
-            onClick={() => setShowBuilder(!showBuilder)}
+            onClick={() => {
+              if (showBuilder) {
+                handleCloseBuilder();
+              } else {
+                setEditingStrategy(null);
+                setShowBuilder(true);
+              }
+            }}
             className="text-xs"
           >
             <Plus className="w-3 h-3 mr-1" />
@@ -102,7 +127,8 @@ export const StrategiesPanel = ({
       {showBuilder && (
         <StrategyBuilder 
           onSaveStrategy={handleSaveStrategy}
-          onClose={() => setShowBuilder(false)}
+          onClose={handleCloseBuilder}
+          editingStrategy={editingStrategy ?? undefined}
         />
       )}
 
@@ -281,17 +307,36 @@ export const StrategiesPanel = ({
                             )}
                           </div>
                           
-                          {onDeleteStrategy && (
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              onClick={() => onDeleteStrategy(strategy.id)}
-                              className="mt-3 text-panic-red hover:bg-panic-red/20"
-                            >
-                              <Trash2 className="w-3 h-3 mr-1" />
-                              Delete
-                            </Button>
-                          )}
+                          <div className="flex gap-2 mt-3">
+                            {onUpdateStrategy && (
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleEditStrategy(strategy);
+                                }}
+                                className="text-bloomberg-blue hover:bg-bloomberg-blue/20"
+                              >
+                                <Pencil className="w-3 h-3 mr-1" />
+                                Edit
+                              </Button>
+                            )}
+                            {onDeleteStrategy && (
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onDeleteStrategy(strategy.id);
+                                }}
+                                className="text-panic-red hover:bg-panic-red/20"
+                              >
+                                <Trash2 className="w-3 h-3 mr-1" />
+                                Delete
+                              </Button>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </motion.div>

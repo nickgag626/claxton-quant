@@ -87,6 +87,45 @@ export const settingsService = {
     return true;
   },
 
+  // Update a strategy
+  async updateStrategy(strategyId: string, strategy: Omit<Strategy, 'id'>): Promise<Strategy | null> {
+    const { data, error } = await supabase
+      .from('strategies')
+      .update({
+        name: strategy.name,
+        type: strategy.type,
+        underlying: strategy.underlying,
+        enabled: strategy.enabled,
+        max_positions: strategy.maxPositions,
+        position_size: strategy.positionSize,
+        entry_conditions: strategy.entryConditions as unknown as Json,
+        exit_conditions: strategy.exitConditions as unknown as Json,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', strategyId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating strategy:', error);
+      return null;
+    }
+
+    if (!data) return null;
+
+    return {
+      id: data.id,
+      name: data.name,
+      type: data.type as StrategyType,
+      underlying: data.underlying,
+      enabled: data.enabled,
+      maxPositions: data.max_positions,
+      positionSize: data.position_size,
+      entryConditions: data.entry_conditions as unknown as EntryConditions,
+      exitConditions: data.exit_conditions as unknown as ExitConditions,
+    };
+  },
+
   // Delete a strategy
   async deleteStrategy(strategyId: string): Promise<boolean> {
     const { error } = await supabase
