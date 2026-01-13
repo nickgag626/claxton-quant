@@ -388,11 +388,19 @@ export const useTradingData = () => {
       const balances = await tradierApi.getBalances();
       const unrealizedPnl = balances?.open_pl || 0;
 
+      // Debug: log unrealized P&L from broker vs computed from positions
+      const computedUnrealizedPnl = enrichedPositions.reduce((sum, p) => {
+        return sum + (p.currentValue - p.costBasis);
+      }, 0);
+      console.log('[P&L Debug] Broker open_pl:', unrealizedPnl, 'Computed from positions:', computedUnrealizedPnl);
+
       // Fetch realized P&L from trade journal (finalized trades today in America/New_York)
       const { realized: realizedPnl, tradeCount } = await tradeJournal.getRealizedTodayPnl();
 
       // Total daily P&L = realized (from DB) + unrealized (from broker)
       const totalDailyPnl = realizedPnl + unrealizedPnl;
+
+      console.log('[P&L Debug] Realized:', realizedPnl, 'Unrealized:', unrealizedPnl, 'Total:', totalDailyPnl);
 
       setRiskStatus(prev => ({
         ...prev,
