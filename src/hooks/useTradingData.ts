@@ -37,6 +37,9 @@ const HIDDEN_POLL_INTERVAL = 120_000;  // 2min when tab is hidden
 const CLOSED_POLL_INTERVAL = 60_000;   // 1min when market closed
 const BACKOFF_MAX_INTERVAL = 120_000;  // 2min max backoff
 
+// Heuristic grouping window: positions opened within this many minutes are considered same group
+const HEURISTIC_GROUP_TIME_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 /**
  * Extract underlying symbol from OCC option symbol
  * e.g., SPY260112P00693000 -> SPY
@@ -44,6 +47,108 @@ const BACKOFF_MAX_INTERVAL = 120_000;  // 2min max backoff
 function extractUnderlyingFromSymbol(symbol: string): string {
   const match = symbol.match(/^([A-Z]+)\d/);
   return match ? match[1] : symbol;
+}
+
+/**
+ * Generate a heuristic group key for a position based on:
+ * - underlying symbol
+ * - expiration date
+ * - entry time window (rounded to 5-min bucket)
+ */
+function generateHeuristicGroupKey(pos: Position): string {
+  const parsed = parseOptionSymbol(pos.symbol);
+  if (!parsed) return `ungrouped-${pos.symbol}`;
+  
+  const underlying = parsed.underlying;
+  const expiration = parsed.expiration;
+  
+  // Round entry time to 5-minute bucket
+  const entryTime = pos.entryTime instanceof Date ? pos.entryTime : new Date(pos.entryTime);
+  const timeBucket = Math.floor(entryTime.getTime() / HEURISTIC_GROUP_TIME_WINDOW_MS);
+  
+  return `heuristic-${underlying}-${expiration}-${timeBucket}`;
+}
+
+/**
+ * Apply trade_group_id from database trades to broker positions
+ * Falls back to heuristic grouping if no DB match found
+ */
+async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Position[]> {
+  if (positions.length === 0) return positions;
+
+  // First, try to match positions to open trades in DB by symbol
+  const symbols = positions.map(p => p.symbol);
+  
+  try {
+    // Query trades that are still open (close_status is null or 'submitted')
+    // and have trade_group_id populated
+    const { data: trades, error } = await supabase
+      .from('trades')
+      .select('symbol, trade_group_id')
+      .in('symbol', symbols)
+      .not('trade_group_id', 'is', null);
+
+    if (error) {
+      console.error('Error fetching trade groups:', error);
+    }
+
+    // Build symbol -> trade_group_id map from DB
+    const symbolToGroupId = new Map<string, string>();
+    if (trades) {
+      trades.forEach((t: { symbol: string; trade_group_id: string | null }) => {
+        if (t.trade_group_id) {
+          symbolToGroupId.set(t.symbol, t.trade_group_id);
+        }
+      });
+    }
+
+    // Apply DB-based group IDs first
+    const enrichedPositions = positions.map(pos => {
+      const dbGroupId = symbolToGroupId.get(pos.symbol);
+      if (dbGroupId) {
+        return { ...pos, tradeGroupId: dbGroupId };
+      }
+      return pos;
+    });
+
+    // For positions without DB group ID, apply heuristic grouping
+    // Group positions by heuristic key
+    const heuristicGroups = new Map<string, Position[]>();
+    
+    enrichedPositions.forEach(pos => {
+      if (!pos.tradeGroupId) {
+        const key = generateHeuristicGroupKey(pos);
+        const existing = heuristicGroups.get(key) || [];
+        heuristicGroups.set(key, [...existing, pos]);
+      }
+    });
+
+    // Assign heuristic group IDs only to groups with 2+ positions
+    const heuristicGroupIds = new Map<string, string>();
+    heuristicGroups.forEach((groupPositions, key) => {
+      if (groupPositions.length >= 2) {
+        // Generate a stable group ID from the key
+        heuristicGroupIds.set(key, `hg-${key}`);
+      }
+    });
+
+    // Apply heuristic group IDs
+    return enrichedPositions.map(pos => {
+      if (pos.tradeGroupId) return pos; // Already has DB group ID
+      
+      const heuristicKey = generateHeuristicGroupKey(pos);
+      const heuristicGroupId = heuristicGroupIds.get(heuristicKey);
+      
+      if (heuristicGroupId) {
+        return { ...pos, tradeGroupId: heuristicGroupId };
+      }
+      
+      return pos;
+    });
+  } catch (err) {
+    console.error('Error enriching positions with group IDs:', err);
+    return positions;
+  }
 }
 
 // Default strategies (would come from database in production)
@@ -238,11 +343,15 @@ export const useTradingData = () => {
       // Fetch positions and enrich with strategy info
       const positionsData = await tradierApi.getPositions();
 
+      // === CRITICAL: Enrich positions with trade_group_id ===
+      // First from DB trades, then fallback to heuristic grouping
+      const positionsWithGroups = await enrichPositionsWithGroupIds(positionsData);
+
       // Use ref for current pendingCloseSymbols to avoid stale closure
       const currentPendingClose = pendingCloseSymbolsRef.current;
 
       // Reconcile pending_close set: remove symbols that no longer exist at broker
-      const brokerSymbols = new Set(positionsData.map(p => p.symbol));
+      const brokerSymbols = new Set(positionsWithGroups.map(p => p.symbol));
       setPendingCloseSymbols(prev => {
         const next = new Set<string>();
         prev.forEach(sym => {
@@ -252,7 +361,7 @@ export const useTradingData = () => {
       });
 
       // Enrich positions with strategy info + pending_close state
-      const enrichedPositions = positionsData.map(pos => {
+      const enrichedPositions = positionsWithGroups.map(pos => {
         const stratInfo = strategyPositions.get(pos.symbol);
         const isPending = currentPendingClose.has(pos.symbol);
 
@@ -374,8 +483,11 @@ export const useTradingData = () => {
       setQuotes(quotesData);
 
       const positionsData = await tradierApi.getPositions();
+      
+      // === CRITICAL: Enrich positions with trade_group_id ===
+      const positionsWithGroups = await enrichPositionsWithGroupIds(positionsData);
 
-      const brokerSymbols = new Set(positionsData.map(p => p.symbol));
+      const brokerSymbols = new Set(positionsWithGroups.map(p => p.symbol));
       setPendingCloseSymbols(prev => {
         const next = new Set<string>();
         prev.forEach(sym => {
@@ -384,7 +496,7 @@ export const useTradingData = () => {
         return next;
       });
 
-      const enrichedPositions = positionsData.map(pos => {
+      const enrichedPositions = positionsWithGroups.map(pos => {
         const stratInfo = strategyPositions.get(pos.symbol);
         const isPending = pendingCloseSymbols.has(pos.symbol);
         const base = {
@@ -836,8 +948,57 @@ export const useTradingData = () => {
       const exitResult = await strategyEngine.checkExits(strategies, positions);
 
       let placedAnyExitOrder = false;
+      
+      // Track which groups we've already processed to avoid duplicate closes
+      const processedGroups = new Set<string>();
 
       for (const exitSignal of exitResult.exitSignals) {
+        const position = positions.find(p => p.symbol === exitSignal.symbol);
+        if (!position) continue;
+
+        // === BOT GROUP-AWARE CLOSING ===
+        // If this position is part of a group, close the entire group
+        // This prevents DTBP/margin issues from temporary naked exposure
+        if (position.tradeGroupId && !processedGroups.has(position.tradeGroupId)) {
+          processedGroups.add(position.tradeGroupId);
+          
+          const groupPositions = getGroupPositions(position.tradeGroupId);
+          addActivity('TRADE', `Bot exit signal: Closing ${groupPositions.length}-leg group (${exitSignal.reason})`);
+          
+          // Mark all group symbols as pending
+          setPendingCloseSymbols(prev => {
+            const next = new Set(prev);
+            groupPositions.forEach(p => next.add(p.symbol));
+            return next;
+          });
+
+          const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          
+          // Close each leg in the group
+          for (const groupPos of groupPositions) {
+            if (pendingCloseSymbolsRef.current.has(groupPos.symbol)) continue;
+            
+            const result = await tradierApi.closePosition(groupPos.symbol, groupPos.quantity, {
+              dryRun: closeDebugOptions.dryRun,
+              debug: closeDebugOptions.debug,
+              clientRequestId: `${clientRequestId}-${groupPos.symbol}`,
+              trade_group_id: position.tradeGroupId,
+              source: 'bot_engine_group',
+            });
+
+            if (result.success && !result.dryRun) {
+              placedAnyExitOrder = true;
+              addActivity('TRADE', `Bot closed group leg: ${groupPos.symbol} (Order #${result.orderId})`);
+              await journalClosedTrade(groupPos, result, exitSignal.reason, 'bot_engine_group', `${clientRequestId}-${groupPos.symbol}`);
+            } else if (!result.success) {
+              addActivity('RISK', `Bot failed to close group leg ${groupPos.symbol}: ${result.error}`);
+            }
+          }
+          
+          continue; // Skip individual leg processing
+        }
+
+        // Non-grouped position: close individually
         const key = exitSignal.symbol;
 
         // Use ref to get current value
@@ -885,7 +1046,6 @@ export const useTradingData = () => {
           setPendingCloseSymbols(prev => new Set(prev).add(exitSignal.symbol));
           addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
 
-          const position = positions.find(p => p.symbol === exitSignal.symbol);
           if (position) {
             await journalClosedTrade(position, result, exitSignal.reason, 'bot_engine', clientRequestId);
           }
@@ -937,7 +1097,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade, getGroupPositions]);
 
   // === ALL useEffect DECLARATIONS START HERE ===
 

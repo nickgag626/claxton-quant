@@ -144,6 +144,9 @@ export const tradierApi = {
         // Current value = current price * quantity * 100 (options multiplier)
         const currentValue = currentPrice * Math.abs(p.quantity) * 100;
         
+        // Parse option symbol to extract expiration date
+        const parsed = parseOptionSymbol(p.symbol);
+        
         return {
           id: String(p.id),
           symbol: p.symbol,
@@ -152,6 +155,8 @@ export const tradierApi = {
           currentValue: currentValue || p.cost_basis, // Fall back to cost basis if no quote
           status: 'open' as const,
           entryTime: new Date(p.date_acquired),
+          expirationDate: parsed?.expiration,
+          underlying: parsed?.underlying,
         };
       });
     } catch (error) {
