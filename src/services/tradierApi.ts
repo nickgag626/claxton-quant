@@ -571,6 +571,8 @@ export const tradierApi = {
     filledQty?: number;
     closeSide?: string;
     tradierStatus?: string;
+    /** Per-leg fill prices for multi-leg orders (keyed by OCC symbol) */
+    legFills?: Record<string, { avgFillPrice: number; filledQty: number; side: string }>;
     error?: string;
   }> {
     try {
@@ -596,6 +598,7 @@ export const tradierApi = {
         filledQty: data.filledQty,
         closeSide: data.closeSide,
         tradierStatus: data.tradierStatus,
+        legFills: data.legFills,
       };
     } catch (error) {
       console.error('Failed to fetch order status:', error);

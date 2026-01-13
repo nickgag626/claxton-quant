@@ -853,6 +853,7 @@ export const useTradingData = () => {
           rejectReason: orderStatus.rejectReason,
           open_side: openSide,
           fees: 0,
+          legFills: orderStatus.legFills, // Per-leg fill prices for multi-leg orders
         }
       );
 
