@@ -14,7 +14,15 @@ import type {
   MarketState,
   TradeSafeguards 
 } from '@/types/trading';
+import { DTBP_REJECTION_PATTERNS } from '@/types/trading';
 import type { DeltaDataPoint } from '@/components/dashboard/GreeksChart';
+
+// Check if a rejection reason indicates DTBP/margin issues
+function isDtbpRejection(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const lower = reason.toLowerCase();
+  return DTBP_REJECTION_PATTERNS.some(pattern => lower.includes(pattern));
+}
 
 // ============================================================================
 // STABILITY_MODE: When true, uses split polling cadences + visibility gating
@@ -151,6 +159,19 @@ export const useTradingData = () => {
   });
   const [lastCloseDebug, setLastCloseDebug] = useState<any>(null);
   const [pendingCloseSymbols, setPendingCloseSymbols] = useState<Set<string>>(new Set());
+
+  // === GROUP-AWARE CLOSING: Leg Out Mode ===
+  // When OFF (default), single-leg closes on grouped positions are blocked
+  // When ON, user can close individual legs (with DTBP risk warning)
+  const [legOutModeEnabled, setLegOutModeEnabled] = useState(false);
+
+  // Track rejected closes that might benefit from group-close retry
+  const [dtbpRejection, setDtbpRejection] = useState<{
+    symbol: string;
+    tradeGroupId: string;
+    rejectReason: string;
+    timestamp: number;
+  } | null>(null);
 
   // === ALL useRef DECLARATIONS (grouped together for hook order stability) ===
   const pendingCloseSymbolsRef = useRef<Set<string>>(new Set());
@@ -612,9 +633,41 @@ export const useTradingData = () => {
     }
   }, [strategyPositions]);
 
-  const closePosition = useCallback(async (positionId: string, exitReason: string = 'manual') => {
+  // Get all positions that belong to the same trade group
+  const getGroupPositions = useCallback((tradeGroupId: string | undefined): Position[] => {
+    if (!tradeGroupId) return [];
+    return positions.filter(p => p.tradeGroupId === tradeGroupId);
+  }, [positions]);
+
+  // Check if a position is part of a multi-leg group
+  const isGroupedPosition = useCallback((position: Position): boolean => {
+    if (!position.tradeGroupId) return false;
+    const groupPositions = getGroupPositions(position.tradeGroupId);
+    return groupPositions.length > 1;
+  }, [getGroupPositions]);
+
+  /**
+   * Close a single position (single-leg)
+   * IMPORTANT: For grouped positions, this will be blocked unless legOutModeEnabled is true
+   */
+  const closePosition = useCallback(async (
+    positionId: string,
+    exitReason: string = 'manual',
+    options?: { forceLegOut?: boolean }
+  ): Promise<boolean> => {
     const position = positions.find(p => p.id === positionId);
     if (!position) return false;
+
+    // === GROUP-AWARE CLOSE PRECHECK ===
+    // Block single-leg closes on grouped positions unless Leg Out Mode is enabled
+    if (isGroupedPosition(position) && !legOutModeEnabled && !options?.forceLegOut) {
+      const groupPositions = getGroupPositions(position.tradeGroupId);
+      addActivity('RISK', 
+        `BLOCKED: Cannot close single leg of ${groupPositions.length}-leg group. ` +
+        `Enable "Leg Out Mode" or use "Close Group".`
+      );
+      return false;
+    }
 
     // Use ref to get current value (avoids stale closure)
     if (pendingCloseSymbolsRef.current.has(position.symbol)) {
@@ -623,14 +676,15 @@ export const useTradingData = () => {
     }
 
     const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    console.log('CLOSE_REQUEST', { source: 'manual_ui', clientRequestId, symbol: position.symbol });
+    console.log('CLOSE_REQUEST', { source: 'manual_ui', clientRequestId, symbol: position.symbol, legOutMode: legOutModeEnabled });
 
-    addActivity('TRADE', `Closing position: ${position.symbol}`);
+    addActivity('TRADE', `Closing position: ${position.symbol}${legOutModeEnabled && isGroupedPosition(position) ? ' (LEG OUT)' : ''}`);
 
     const result = await tradierApi.closePosition(position.symbol, position.quantity, {
       dryRun: closeDebugOptions.dryRun,
       debug: closeDebugOptions.debug,
       clientRequestId,
+      trade_group_id: position.tradeGroupId,
       source: 'manual_ui',
     });
 
@@ -660,9 +714,97 @@ export const useTradingData = () => {
       return true;
     }
 
+    // === DTBP REJECTION DETECTION ===
+    // If rejected with margin/DTBP-related reason and this is a grouped position, offer retry
+    if (!result.success && result.error && position.tradeGroupId) {
+      if (isDtbpRejection(result.error)) {
+        setDtbpRejection({
+          symbol: position.symbol,
+          tradeGroupId: position.tradeGroupId,
+          rejectReason: result.error,
+          timestamp: Date.now(),
+        });
+        addActivity('RISK', 
+          `DTBP/Margin rejection for ${position.symbol}: ${result.error}. ` +
+          `Use "Close Group" to avoid naked exposure.`
+        );
+        return false;
+      }
+    }
+
     addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
     return false;
-  }, [positions, addActivity, fetchData, closeDebugOptions, journalClosedTrade]);
+  }, [positions, addActivity, fetchData, closeDebugOptions, journalClosedTrade, legOutModeEnabled, isGroupedPosition, getGroupPositions]);
+
+  /**
+   * Close all positions in a trade group as a single operation
+   * This is the SAFE way to close multi-leg strategies (avoids DTBP issues)
+   */
+  const closeGroup = useCallback(async (tradeGroupId: string, exitReason: string = 'manual'): Promise<boolean> => {
+    const groupPositions = getGroupPositions(tradeGroupId);
+    if (groupPositions.length === 0) {
+      addActivity('SYSTEM', `No positions found for group ${tradeGroupId}`);
+      return false;
+    }
+
+    addActivity('TRADE', `Closing ${groupPositions.length}-leg group: ${groupPositions.map(p => p.symbol).join(', ')}`);
+
+    // Mark all positions as pending close
+    setPendingCloseSymbols(prev => {
+      const next = new Set(prev);
+      groupPositions.forEach(p => next.add(p.symbol));
+      return next;
+    });
+
+    // Close each position in the group
+    // TODO: In future, this could be a single multi-leg order via Tradier's combo/spread API
+    // For now, we close them rapidly in sequence to minimize gap
+    let allSuccess = true;
+    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    for (const position of groupPositions) {
+      if (pendingCloseSymbolsRef.current.has(position.symbol)) {
+        continue; // Already pending from another request
+      }
+
+      const result = await tradierApi.closePosition(position.symbol, position.quantity, {
+        dryRun: closeDebugOptions.dryRun,
+        debug: closeDebugOptions.debug,
+        clientRequestId: `${clientRequestId}-${position.symbol}`,
+        trade_group_id: tradeGroupId,
+        source: 'manual_ui_group',
+      });
+
+      if (result.success && !result.dryRun) {
+        addActivity('TRADE', `Group leg closed: ${position.symbol} (Order #${result.orderId})`);
+        await journalClosedTrade(position, result, exitReason, 'manual_ui_group', `${clientRequestId}-${position.symbol}`);
+      } else if (!result.success) {
+        allSuccess = false;
+        addActivity('RISK', `Failed to close group leg ${position.symbol}: ${result.error}`);
+      }
+    }
+
+    // Clear DTBP rejection if this was a retry
+    if (dtbpRejection?.tradeGroupId === tradeGroupId) {
+      setDtbpRejection(null);
+    }
+
+    await fetchData();
+    return allSuccess;
+  }, [getGroupPositions, addActivity, closeDebugOptions, journalClosedTrade, fetchData, dtbpRejection]);
+
+  /**
+   * Retry a failed close as a group close (for DTBP rejection recovery)
+   */
+  const retryCloseAsGroup = useCallback(async (): Promise<boolean> => {
+    if (!dtbpRejection) {
+      addActivity('SYSTEM', 'No DTBP rejection to retry');
+      return false;
+    }
+
+    addActivity('TRADE', `Retrying as group close after DTBP rejection...`);
+    return closeGroup(dtbpRejection.tradeGroupId, 'dtbp_retry');
+  }, [dtbpRejection, closeGroup, addActivity]);
 
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
@@ -1017,5 +1159,14 @@ export const useTradingData = () => {
     setCloseDebugOptions,
     lastCloseDebug,
     copyLastCloseDebug,
+
+    // === GROUP-AWARE CLOSING ===
+    legOutModeEnabled,
+    setLegOutModeEnabled,
+    closeGroup,
+    retryCloseAsGroup,
+    dtbpRejection,
+    isGroupedPosition,
+    getGroupPositions,
   };
 };
