@@ -13,7 +13,21 @@ export interface Position {
   entryCredit?: number;
   status: 'open' | 'pending_close' | 'closed';
   entryTime: Date;
+  // Group-aware closing: positions with the same trade_group_id should be closed together
+  tradeGroupId?: string;
 }
+
+// Rejection reasons that indicate DTBP/margin issues (case-insensitive substring match)
+export const DTBP_REJECTION_PATTERNS = [
+  'day trading',
+  'day-trading',
+  'buying power',
+  'margin',
+  'dtbp',
+  'insufficient',
+  'naked',
+  'uncovered',
+];
 
 export interface Greeks {
   delta: number;

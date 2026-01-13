@@ -42,6 +42,14 @@ const Index = () => {
     setCloseDebugOptions,
     lastCloseDebug,
     copyLastCloseDebug,
+    // Group-aware closing
+    legOutModeEnabled,
+    setLegOutModeEnabled,
+    closeGroup,
+    retryCloseAsGroup,
+    dtbpRejection,
+    isGroupedPosition,
+    getGroupPositions,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -79,6 +87,13 @@ const Index = () => {
               positions={positions} 
               isApiConnected={isApiConnected}
               onClosePosition={closePosition}
+              onCloseGroup={closeGroup}
+              legOutModeEnabled={legOutModeEnabled}
+              onLegOutModeChange={setLegOutModeEnabled}
+              isGroupedPosition={isGroupedPosition}
+              getGroupPositions={getGroupPositions}
+              dtbpRejection={dtbpRejection}
+              onRetryCloseAsGroup={retryCloseAsGroup}
             />
             <PnLChart dailyPnl={riskStatus.dailyPnl} pnlHistory={pnlHistory} />
             <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />
