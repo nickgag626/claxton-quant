@@ -1157,12 +1157,17 @@ export const useTradingData = () => {
               variant: "destructive",
             });
           } else if (execResult.blocked === 'conflict') {
-            const conflictSymbols = execResult.conflicts?.map(c => c.symbol).join(', ') || 'unknown';
-            addActivity('RISK', `Entry blocked (conflict): ${signal.strategyName} - ${conflictSymbols}`);
+            // Use new conflict_symbols field from STRICT mode
+            const conflictSymbols = execResult.conflict_symbols?.join(', ') || 
+              execResult.conflicts?.map(c => c.symbol).join(', ') || 'unknown';
+            const conflictDetails = execResult.conflictDetails?.join('\n• ') || '';
+            
+            addActivity('RISK', `STRICT MODE: Entry blocked - overlapping positions [${conflictSymbols}]`);
             toast({
-              title: "Entry Blocked - Position Conflict",
-              description: `Cannot open ${signal.strategyName}: existing positions on ${conflictSymbols}. Close/flatten first.`,
+              title: "⚠️ Entry Blocked - Position Conflict",
+              description: `STRICT MODE: Cannot open ${signal.strategyName}.\n\nConflicting positions:\n• ${conflictDetails || conflictSymbols}\n\nClose or flatten existing positions first.`,
               variant: "destructive",
+              duration: 10000, // Show longer for important message
             });
           } else {
             addActivity('RISK', `Order failed: ${execResult.error}`);

@@ -45,11 +45,14 @@ export const strategyEngine = {
     }
   },
 
-  async executeSignal(signal: TradeSignal): Promise<{
+  async executeSignal(signal: TradeSignal & { allowEntryNetting?: boolean }): Promise<{
     success: boolean;
     orderId?: string;
     error?: string;
     blocked?: 'cooldown' | 'conflict';
+    entry_conflict?: boolean;
+    conflict_symbols?: string[];
+    conflictDetails?: string[];
     conflicts?: Array<{
       symbol: string;
       proposedSide: string;
@@ -57,6 +60,7 @@ export const strategyEngine = {
       conflict: string;
       resolution: string;
     }>;
+    allow_entry_netting?: boolean;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
