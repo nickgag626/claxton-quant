@@ -705,30 +705,83 @@ export const useTradingData = () => {
         openSide = 'buy_to_open';
       }
 
-      const entryPrice = Math.abs(position.costBasis) / (position.quantity * 100);
-      const needsReconcile = true;
+      const quantity = closeResult.closeQty || position.quantity;
+      const multiplier = 100;
+      const entryPrice = Math.abs(position.costBasis) / (quantity * multiplier);
+      
+      // Estimate exit price from position's current market value
+      // currentValue is the mark-to-market value of the position
+      const exitPrice = Math.abs(position.currentValue) / (quantity * multiplier);
+      
+      // Calculate estimated P&L based on position type
+      // For options: P&L = (exitPrice - entryPrice) * qty * 100 for longs
+      //              P&L = (entryPrice - exitPrice) * qty * 100 for shorts
+      let estimatedPnl: number | null = null;
+      let pnlFormula: string | null = null;
+      
+      if (openSide && entryPrice > 0) {
+        if (openSide === 'buy_to_open') {
+          // Long position: profit when exit > entry
+          estimatedPnl = (exitPrice - entryPrice) * quantity * multiplier;
+          pnlFormula = `(${exitPrice.toFixed(4)} - ${entryPrice.toFixed(4)}) × ${quantity} × ${multiplier} = ${estimatedPnl.toFixed(2)}`;
+        } else if (openSide === 'sell_to_open') {
+          // Short position: profit when exit < entry
+          estimatedPnl = (entryPrice - exitPrice) * quantity * multiplier;
+          pnlFormula = `(${entryPrice.toFixed(4)} - ${exitPrice.toFixed(4)}) × ${quantity} × ${multiplier} = ${estimatedPnl.toFixed(2)}`;
+        }
+      }
+      
+      // If we can't determine direction, use the simple difference
+      if (estimatedPnl === null && position.costBasis !== 0 && position.currentValue !== 0) {
+        // costBasis is negative for credits (short), positive for debits (long)
+        // currentValue is always the current market value (positive)
+        // For shorts: costBasis is negative (credit received), currentValue is what we'd pay to close
+        // P&L = -costBasis - currentValue (credit received minus cost to close)
+        // For longs: costBasis is positive (debit paid), currentValue is what we'd get
+        // P&L = currentValue - costBasis
+        if (position.costBasis < 0) {
+          // Short: credit received = -costBasis, cost to close = currentValue
+          estimatedPnl = -position.costBasis - position.currentValue;
+          pnlFormula = `credit(${(-position.costBasis).toFixed(2)}) - close(${position.currentValue.toFixed(2)}) = ${estimatedPnl.toFixed(2)}`;
+        } else {
+          // Long: debit paid = costBasis, sale proceeds = currentValue  
+          estimatedPnl = position.currentValue - position.costBasis;
+          pnlFormula = `sale(${position.currentValue.toFixed(2)}) - cost(${position.costBasis.toFixed(2)}) = ${estimatedPnl.toFixed(2)}`;
+        }
+      }
 
+      const now = new Date().toISOString();
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
         underlying,
         strategy_name: stratInfo?.strategyName || position.strategyName,
         strategy_type: position.strategyType,
-        quantity: closeResult.closeQty || position.quantity,
-        entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || new Date().toISOString(),
-        exit_time: new Date().toISOString(),
+        quantity,
+        entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || now,
+        exit_time: now,
         entry_price: entryPrice,
-        exit_price: 0,
+        exit_price: exitPrice,
         entry_credit: stratInfo?.entryCredit,
-        pnl: 0,
-        pnl_percent: 0,
+        pnl: estimatedPnl,
+        pnl_percent: entryPrice > 0 && estimatedPnl !== null 
+          ? (estimatedPnl / (entryPrice * quantity * multiplier)) * 100 
+          : null,
+        pnl_formula: pnlFormula,
         exit_reason: exitReason,
-        trade_group_id: undefined,
+        trade_group_id: position.tradeGroupId,
         open_side: openSide,
         close_side: closeResult.closeSide,
         close_order_id: closeResult.orderId,
-        multiplier: 100,
+        multiplier,
         fees: 0,
-        needs_reconcile: needsReconcile,
+        // Set needs_reconcile to false if we have estimated P&L, true otherwise
+        needs_reconcile: estimatedPnl === null,
+        // CRITICAL: Set close lifecycle fields for P&L display
+        close_status: 'filled',
+        close_filled_at: now,
+        close_submitted_at: now,
+        close_filled_qty: quantity,
+        close_avg_fill_price: exitPrice,
       };
 
       const saveResult = await tradeJournal.saveTrade(tradeRecord);

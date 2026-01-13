@@ -244,6 +244,12 @@ export const tradeJournal = {
           multiplier: trade.multiplier || 100,
           pnl_formula: pnlFormula,
           needs_reconcile: needsReconcile,
+          // Include close lifecycle fields if provided
+          close_status: trade.close_status || 'filled',
+          close_filled_at: trade.close_filled_at || new Date().toISOString(),
+          close_submitted_at: trade.close_submitted_at,
+          close_avg_fill_price: trade.close_avg_fill_price,
+          close_filled_qty: trade.close_filled_qty,
         })
         .select('id')
         .single();
