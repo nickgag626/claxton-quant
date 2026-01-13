@@ -152,32 +152,18 @@ export const useTradingData = () => {
   const [lastCloseDebug, setLastCloseDebug] = useState<any>(null);
   const [pendingCloseSymbols, setPendingCloseSymbols] = useState<Set<string>>(new Set());
 
-  // === STABILITY FIX B: useRef mirror for pendingCloseSymbols to avoid stale closures ===
+  // === ALL useRef DECLARATIONS (grouped together for hook order stability) ===
   const pendingCloseSymbolsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    pendingCloseSymbolsRef.current = pendingCloseSymbols;
-  }, [pendingCloseSymbols]);
-
   const lastEngineRun = useRef<number>(0);
   const lastCloseAttempt = useRef<Map<string, number>>(new Map());
-
-  // === STABILITY FIX A: In-flight guards + backoff ===
   const fastLoopInFlight = useRef(false);
   const slowLoopInFlight = useRef(false);
   const backoffMultiplier = useRef(1);
   const lastSlowFetch = useRef(0);
   const marketStateRef = useRef<MarketState>('unknown');
-
-  // Track page visibility
   const isPageVisible = useRef(true);
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      isPageVisible.current = document.visibilityState === 'visible';
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, []);
 
+  // === ALL useCallback DECLARATIONS START HERE ===
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
     setActivity(prev => [
       {
@@ -810,6 +796,22 @@ export const useTradingData = () => {
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
   }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade]);
+
+  // === ALL useEffect DECLARATIONS START HERE ===
+
+  // Sync pendingCloseSymbols to ref for stable closure access
+  useEffect(() => {
+    pendingCloseSymbolsRef.current = pendingCloseSymbols;
+  }, [pendingCloseSymbols]);
+
+  // Track page visibility for polling optimization
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      isPageVisible.current = document.visibilityState === 'visible';
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
 
   // Load saved settings and strategies on mount
   useEffect(() => {
