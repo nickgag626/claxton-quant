@@ -464,28 +464,33 @@ async function evaluateStrategyWithTrace(
   };
   gates.push(longDeltaGate);
   
-  // GATE 7: Premium Filter
+  // GATE 7: Premium Filter (optional)
   const estimatedCredit = proposedOrder?.estimated_credit || 0;
+  const premiumEnabled = !!strategy.entryConditions.minPremium;
   let premiumPass = true;
   let premiumReason: string | undefined;
   
-  if (strategy.entryConditions.minPremium) {
-    if (hardStop) {
-      premiumPass = false;
-      premiumReason = `skipped_due_to_${hardStopReason}`;
-    } else if (estimatedCredit < strategy.entryConditions.minPremium) {
-      premiumPass = false;
-      premiumReason = `Credit $${estimatedCredit.toFixed(2)} below minimum $${strategy.entryConditions.minPremium}`;
-    }
+  if (!premiumEnabled) {
+    premiumPass = true;
+    premiumReason = 'disabled';
+  } else if (hardStop) {
+    premiumPass = false;
+    premiumReason = `skipped_due_to_${hardStopReason}`;
+  } else if (optionChain.length === 0 || estimatedCredit === 0) {
+    premiumPass = false;
+    premiumReason = 'data_unavailable';
+  } else if (estimatedCredit < strategy.entryConditions.minPremium!) {
+    premiumPass = false;
+    premiumReason = `Credit $${estimatedCredit.toFixed(2)} below minimum $${strategy.entryConditions.minPremium}`;
   }
   
   const premiumGate: Gate = {
     name: 'Premium Filter',
-    expected: strategy.entryConditions.minPremium 
+    expected: premiumEnabled 
       ? `credit ≥ $${strategy.entryConditions.minPremium}` 
-      : 'not configured',
+      : 'disabled',
     actual: { 
-      configured: !!strategy.entryConditions.minPremium,
+      enabled: premiumEnabled,
       minPremium: strategy.entryConditions.minPremium || null,
       estimated_credit: estimatedCredit 
     },
@@ -494,38 +499,40 @@ async function evaluateStrategyWithTrace(
   };
   gates.push(premiumGate);
   
-  if (!premiumPass && !hardStop && strategy.entryConditions.minPremium) {
+  if (!premiumPass && !hardStop && premiumEnabled && premiumReason !== 'data_unavailable') {
     hardStop = true;
     hardStopReason = 'premium_filter';
   }
   
-  // GATE 8: IV Rank Filter
+  // GATE 8: IV Rank Filter (optional)
+  const ivEnabled = strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined;
   let ivPass = true;
   let ivReason: string | undefined;
   
-  if (strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined) {
-    if (hardStop) {
-      ivPass = false;
-      ivReason = `skipped_due_to_${hardStopReason}`;
-    } else {
-      // IV rank requires historical data - not available from Tradier options endpoint
-      ivPass = false;
-      ivReason = 'IV rank data not available from broker API';
-    }
+  if (!ivEnabled) {
+    ivPass = true;
+    ivReason = 'disabled';
+  } else if (hardStop) {
+    ivPass = false;
+    ivReason = `skipped_due_to_${hardStopReason}`;
+  } else {
+    // IV rank requires historical data - not available from Tradier options endpoint
+    ivPass = false;
+    ivReason = 'data_unavailable';
   }
   
   const ivGate: Gate = {
     name: 'IV Rank Filter',
-    expected: strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined
+    expected: ivEnabled
       ? `${strategy.entryConditions.minIvRank ?? 0}% - ${strategy.entryConditions.maxIvRank ?? 100}%`
-      : 'not configured',
+      : 'disabled',
     actual: {
-      configured: strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined,
+      enabled: ivEnabled,
       minIvRank: strategy.entryConditions.minIvRank ?? null,
       maxIvRank: strategy.entryConditions.maxIvRank ?? null,
-      iv_data: 'unavailable',
+      iv_data: ivEnabled ? 'unavailable' : null,
     },
-    pass: strategy.entryConditions.minIvRank === undefined && strategy.entryConditions.maxIvRank === undefined ? true : ivPass,
+    pass: ivPass,
     reason: ivReason,
   };
   gates.push(ivGate);
@@ -588,33 +595,35 @@ async function evaluateStrategyWithTrace(
     });
   }
   
-  // GATE 10: MA Filter
+  // GATE 10: MA Filter (optional)
+  const maEnabled = !!strategy.entryConditions.maFilter?.enabled && (strategy.entryConditions.maFilter.rules?.length ?? 0) > 0;
   let maPass = true;
   let maReason: string | undefined;
   
-  if (strategy.entryConditions.maFilter?.enabled && strategy.entryConditions.maFilter.rules?.length) {
-    if (hardStop) {
-      maPass = false;
-      maReason = `skipped_due_to_${hardStopReason}`;
-    } else {
-      // MA calculation requires historical data
-      maPass = false;
-      maReason = 'MA filter requires historical price data not available from Tradier options endpoint';
-    }
+  if (!maEnabled) {
+    maPass = true;
+    maReason = 'disabled';
+  } else if (hardStop) {
+    maPass = false;
+    maReason = `skipped_due_to_${hardStopReason}`;
+  } else {
+    // MA calculation requires historical data - not available from Tradier
+    maPass = false;
+    maReason = 'data_unavailable';
   }
   
   const maGate: Gate = {
     name: 'MA Filter',
-    expected: strategy.entryConditions.maFilter?.enabled 
-      ? strategy.entryConditions.maFilter.rules?.map((r: any) => `${r.left} ${r.op} ${r.right}`).join(' AND ') || 'enabled'
-      : 'not configured',
+    expected: maEnabled 
+      ? strategy.entryConditions.maFilter!.rules?.map((r: any) => `${r.left} ${r.op} ${r.right}`).join(' AND ') || 'enabled'
+      : 'disabled',
     actual: {
-      configured: !!strategy.entryConditions.maFilter?.enabled,
+      enabled: maEnabled,
       rules: strategy.entryConditions.maFilter?.rules || [],
-      sma_data: 'unavailable',
+      sma_data: maEnabled ? 'unavailable' : null,
       underlying_price: underlyingPrice,
     },
-    pass: !strategy.entryConditions.maFilter?.enabled || maPass,
+    pass: maPass,
     reason: maReason,
   };
   gates.push(maGate);
