@@ -12,7 +12,7 @@ export interface TradeRecord {
   entry_time: string;
   exit_time?: string;
   entry_price: number;
-  exit_price: number;
+  exit_price?: number; // NULL/undefined for submitted trades, set when filled
   entry_credit?: number;
   exit_debit?: number;
   pnl: number | null; // NULL if direction unknown or close not filled
@@ -226,13 +226,16 @@ export const tradeJournal = {
           strategy_type: trade.strategy_type,
           quantity: trade.quantity,
           entry_time: trade.entry_time,
-          exit_time: trade.exit_time || new Date().toISOString(),
+          // exit_time should be null for submitted trades, set when filled
+          exit_time: trade.exit_time || null,
           entry_price: trade.entry_price,
-          exit_price: trade.exit_price,
+          // exit_price should be null for submitted trades, set when filled from avg_fill_price
+          exit_price: trade.exit_price ?? null,
           entry_credit: trade.entry_credit,
           exit_debit: trade.exit_debit,
-          pnl, // NULL if direction unknown
-          pnl_percent: pnlPercent,
+          // pnl should be null for submitted trades, computed when filled
+          pnl: trade.close_status === 'submitted' ? null : pnl,
+          pnl_percent: trade.close_status === 'submitted' ? null : pnlPercent,
           exit_reason: trade.exit_reason,
           notes: trade.notes,
           trade_group_id: trade.trade_group_id,
@@ -242,14 +245,14 @@ export const tradeJournal = {
           close_order_id: trade.close_order_id,
           fees: trade.fees || 0,
           multiplier: trade.multiplier || 100,
-          pnl_formula: pnlFormula,
-          needs_reconcile: needsReconcile,
-          // Include close lifecycle fields if provided
-          close_status: trade.close_status || 'filled',
-          close_filled_at: trade.close_filled_at || new Date().toISOString(),
-          close_submitted_at: trade.close_submitted_at,
-          close_avg_fill_price: trade.close_avg_fill_price,
-          close_filled_qty: trade.close_filled_qty,
+          pnl_formula: trade.close_status === 'submitted' ? null : pnlFormula,
+          needs_reconcile: trade.close_status === 'submitted' ? true : needsReconcile,
+          // Close lifecycle fields - use provided values, don't default
+          close_status: trade.close_status || 'submitted',
+          close_submitted_at: trade.close_submitted_at || new Date().toISOString(),
+          close_filled_at: trade.close_filled_at || null,
+          close_avg_fill_price: trade.close_avg_fill_price || null,
+          close_filled_qty: trade.close_filled_qty || null,
         })
         .select('id')
         .single();

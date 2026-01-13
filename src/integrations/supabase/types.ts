@@ -193,7 +193,7 @@ export type Database = {
           entry_price: number
           entry_time: string
           exit_debit: number | null
-          exit_price: number
+          exit_price: number | null
           exit_reason: string | null
           exit_time: string
           fees: number | null
@@ -203,7 +203,7 @@ export type Database = {
           notes: string | null
           open_order_id: string | null
           open_side: string | null
-          pnl: number
+          pnl: number | null
           pnl_formula: string | null
           pnl_percent: number | null
           quantity: number
@@ -227,7 +227,7 @@ export type Database = {
           entry_price: number
           entry_time: string
           exit_debit?: number | null
-          exit_price: number
+          exit_price?: number | null
           exit_reason?: string | null
           exit_time?: string
           fees?: number | null
@@ -237,7 +237,7 @@ export type Database = {
           notes?: string | null
           open_order_id?: string | null
           open_side?: string | null
-          pnl: number
+          pnl?: number | null
           pnl_formula?: string | null
           pnl_percent?: number | null
           quantity: number
@@ -261,7 +261,7 @@ export type Database = {
           entry_price?: number
           entry_time?: string
           exit_debit?: number | null
-          exit_price?: number
+          exit_price?: number | null
           exit_reason?: string | null
           exit_time?: string
           fees?: number | null
@@ -271,7 +271,7 @@ export type Database = {
           notes?: string | null
           open_order_id?: string | null
           open_side?: string | null
-          pnl?: number
+          pnl?: number | null
           pnl_formula?: string | null
           pnl_percent?: number | null
           quantity?: number
