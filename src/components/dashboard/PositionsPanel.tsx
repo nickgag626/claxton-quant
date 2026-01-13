@@ -40,7 +40,7 @@ interface PositionsPanelProps {
   positions: Position[];
   isApiConnected: boolean;
   onClosePosition?: (positionId: string) => Promise<boolean>;
-  onCloseGroup?: (tradeGroupId: string, exitReason?: string) => Promise<boolean>;
+  onCloseGroup?: (tradeGroupId: string, exitReason?: string, forceBrokenStructure?: boolean) => Promise<boolean>;
   legOutModeEnabled?: boolean;
   onLegOutModeChange?: (enabled: boolean) => void;
   isGroupedPosition?: (position: Position) => boolean;
@@ -135,11 +135,11 @@ export const PositionsPanel = ({
     });
   };
 
-  const handleCloseGroup = async (tradeGroupId: string) => {
+  const handleCloseGroup = async (tradeGroupId: string, forceBrokenStructure: boolean = false) => {
     if (!onCloseGroup) return;
     setClosingGroups(prev => new Set(prev).add(tradeGroupId));
     try {
-      await onCloseGroup(tradeGroupId);
+      await onCloseGroup(tradeGroupId, 'manual', forceBrokenStructure);
     } catch (err) {
       console.error('Error in onCloseGroup:', err);
     }
@@ -771,9 +771,10 @@ export const PositionsPanel = ({
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               className="bg-bloomberg-amber text-black hover:bg-bloomberg-amber/80"
-              onClick={() => {
-                if (brokenCloseConfirm) {
-                  handleCloseGroup(brokenCloseConfirm.tradeGroupId);
+              onClick={async () => {
+                if (brokenCloseConfirm && onCloseGroup) {
+                  // Pass forceBrokenStructure=true to allow closing broken structures
+                  await onCloseGroup(brokenCloseConfirm.tradeGroupId, 'broken_structure_close', true);
                 }
                 setBrokenCloseConfirm(null);
               }}

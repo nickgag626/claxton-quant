@@ -1130,8 +1130,9 @@ export const useTradingData = () => {
     exitReason: string;
     tradeGroupId?: string;
     symbol?: string;
+    forceBrokenStructure?: boolean; // Allow closing broken structures when explicitly confirmed
   }): Promise<boolean> => {
-    const { source, exitReason, tradeGroupId, symbol } = params;
+    const { source, exitReason, tradeGroupId, symbol, forceBrokenStructure } = params;
 
     const allowFlagKey = '__ALLOW_BROKER_CLOSE__';
 
@@ -1165,8 +1166,12 @@ export const useTradingData = () => {
       const expected = expectedLegCount(strategyType);
       const observed = groupPositions.length;
 
-      if (!legOutModeEnabled && expected !== null && observed < expected) {
-        logAttempt('blocked', { reason: 'Broken structure — manual intervention required', expected, observed });
+      // Block broken structures UNLESS:
+      // - legOutMode is enabled, OR
+      // - forceBrokenStructure is true (user explicitly confirmed), OR
+      // - source is 'emergency'
+      if (!legOutModeEnabled && !forceBrokenStructure && source !== 'emergency' && expected !== null && observed < expected) {
+        logAttempt('blocked', { reason: 'Broken structure — enable Leg Out Mode or confirm close', expected, observed });
         return false;
       }
 
@@ -1350,9 +1355,14 @@ export const useTradingData = () => {
 
   /**
    * Close all positions in a trade group — delegates to requestClose
+   * @param forceBrokenStructure - If true, allows closing even if structure is broken
    */
-  const closeGroup = useCallback(async (tradeGroupId: string, exitReason: string = 'manual'): Promise<boolean> => {
-    return requestClose({ source: 'manual', exitReason, tradeGroupId });
+  const closeGroup = useCallback(async (
+    tradeGroupId: string, 
+    exitReason: string = 'manual',
+    forceBrokenStructure: boolean = false
+  ): Promise<boolean> => {
+    return requestClose({ source: 'manual', exitReason, tradeGroupId, forceBrokenStructure });
   }, [requestClose]);
 
   /**
