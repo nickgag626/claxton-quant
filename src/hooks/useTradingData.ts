@@ -16,6 +16,19 @@ import type {
 } from '@/types/trading';
 import type { DeltaDataPoint } from '@/components/dashboard/GreeksChart';
 
+// ============================================================================
+// STABILITY_MODE: When true, uses split polling cadences + visibility gating
+// Default to true for safer production behavior
+// ============================================================================
+const STABILITY_MODE = import.meta.env.VITE_STABILITY_MODE !== 'false';
+
+// Polling intervals (in milliseconds)
+const FAST_POLL_INTERVAL = 5_000;      // 5s for clock + quotes
+const SLOW_POLL_INTERVAL = 30_000;     // 30s for positions + balances + chains
+const HIDDEN_POLL_INTERVAL = 120_000;  // 2min when tab is hidden
+const CLOSED_POLL_INTERVAL = 60_000;   // 1min when market closed
+const BACKOFF_MAX_INTERVAL = 120_000;  // 2min max backoff
+
 /**
  * Extract underlying symbol from OCC option symbol
  * e.g., SPY260112P00693000 -> SPY
@@ -139,8 +152,32 @@ export const useTradingData = () => {
   const [lastCloseDebug, setLastCloseDebug] = useState<any>(null);
   const [pendingCloseSymbols, setPendingCloseSymbols] = useState<Set<string>>(new Set());
 
+  // === STABILITY FIX B: useRef mirror for pendingCloseSymbols to avoid stale closures ===
+  const pendingCloseSymbolsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    pendingCloseSymbolsRef.current = pendingCloseSymbols;
+  }, [pendingCloseSymbols]);
+
   const lastEngineRun = useRef<number>(0);
   const lastCloseAttempt = useRef<Map<string, number>>(new Map());
+
+  // === STABILITY FIX A: In-flight guards + backoff ===
+  const fastLoopInFlight = useRef(false);
+  const slowLoopInFlight = useRef(false);
+  const backoffMultiplier = useRef(1);
+  const lastSlowFetch = useRef(0);
+  const marketStateRef = useRef<MarketState>('unknown');
+
+  // Track page visibility
+  const isPageVisible = useRef(true);
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      isPageVisible.current = document.visibilityState === 'visible';
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
+
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
     setActivity(prev => [
       {
@@ -153,16 +190,50 @@ export const useTradingData = () => {
     ]);
   }, []);
 
-  // Fetch market data
-  const fetchData = useCallback(async () => {
+  // === FAST LOOP: Clock + Quotes only ===
+  const fetchFastData = useCallback(async () => {
+    if (fastLoopInFlight.current) return;
+    fastLoopInFlight.current = true;
+
     try {
       // Fetch quotes for SPY and QQQ
       const quotesData = await tradierApi.getQuotes(['SPY', 'QQQ']);
       setQuotes(quotesData);
+
+      // Fetch market clock
+      const clock = await tradierApi.getMarketClock();
+      setMarketState(clock.state);
+      marketStateRef.current = clock.state;
+
+      setIsApiConnected(true);
+      setError(null);
+      setLastUpdate(new Date());
       
+      // Reset backoff on success
+      backoffMultiplier.current = 1;
+    } catch (err) {
+      console.error('Error in fast fetch:', err);
+      // Apply backoff on error (for 429/5xx)
+      backoffMultiplier.current = Math.min(backoffMultiplier.current * 2, BACKOFF_MAX_INTERVAL / FAST_POLL_INTERVAL);
+      setError(err instanceof Error ? err.message : 'Failed to fetch data');
+      setIsApiConnected(false);
+    } finally {
+      fastLoopInFlight.current = false;
+    }
+  }, []);
+
+  // === SLOW LOOP: Positions + Balances + Chains/Greeks ===
+  const fetchSlowData = useCallback(async (forceChains = false) => {
+    if (slowLoopInFlight.current) return;
+    slowLoopInFlight.current = true;
+
+    try {
       // Fetch positions and enrich with strategy info
       const positionsData = await tradierApi.getPositions();
-      
+
+      // Use ref for current pendingCloseSymbols to avoid stale closure
+      const currentPendingClose = pendingCloseSymbolsRef.current;
+
       // Reconcile pending_close set: remove symbols that no longer exist at broker
       const brokerSymbols = new Set(positionsData.map(p => p.symbol));
       setPendingCloseSymbols(prev => {
@@ -176,7 +247,7 @@ export const useTradingData = () => {
       // Enrich positions with strategy info + pending_close state
       const enrichedPositions = positionsData.map(pos => {
         const stratInfo = strategyPositions.get(pos.symbol);
-        const isPending = pendingCloseSymbols.has(pos.symbol);
+        const isPending = currentPendingClose.has(pos.symbol);
 
         const base = {
           ...pos,
@@ -195,18 +266,17 @@ export const useTradingData = () => {
         return base;
       });
       setPositions(enrichedPositions);
-      
+
       // Fetch unrealized P&L from broker (current positions)
       const balances = await tradierApi.getBalances();
       const unrealizedPnl = balances?.open_pl || 0;
-      
+
       // Fetch realized P&L from trade journal (finalized trades today in America/New_York)
-      // This is the authoritative source for realized P&L - same calculation as journal header
       const { realized: realizedPnl, tradeCount } = await tradeJournal.getRealizedTodayPnl();
-      
+
       // Total daily P&L = realized (from DB) + unrealized (from broker)
       const totalDailyPnl = realizedPnl + unrealizedPnl;
-      
+
       setRiskStatus(prev => ({
         ...prev,
         dailyPnl: totalDailyPnl,
@@ -214,32 +284,28 @@ export const useTradingData = () => {
         unrealizedPnl,
         tradeCount,
       }));
-      
+
       // Track P&L history (max 100 points for the day)
       const now = new Date();
       const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
       setPnlHistory(prev => {
         const newPoint = { time: timeLabel, pnl: totalDailyPnl };
-        // Avoid duplicates for same minute
         if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
           return [...prev.slice(0, -1), newPoint];
         }
         return [...prev.slice(-99), newPoint];
       });
-      
-      // Fetch market clock
-      const clock = await tradierApi.getMarketClock();
-      setMarketState(clock.state);
-      
+
       // Calculate Greeks from option positions
-      if (positionsData.length > 0) {
-        // Parse option symbols to get underlyings and expirations
+      // Only fetch chains if market is open OR forceChains is true
+      const shouldFetchChains = forceChains || marketStateRef.current === 'open';
+      
+      if (positionsData.length > 0 && shouldFetchChains) {
         const optionPositions = positionsData
           .map(p => ({ position: p, parsed: parseOptionSymbol(p.symbol) }))
           .filter(item => item.parsed !== null);
-        
+
         if (optionPositions.length > 0) {
-          // Group by underlying and expiration
           const chainRequests = new Map<string, Set<string>>();
           optionPositions.forEach(({ parsed }) => {
             if (!parsed) return;
@@ -248,10 +314,9 @@ export const useTradingData = () => {
             }
             chainRequests.get(parsed.underlying)!.add(parsed.expiration);
           });
-          
+
           let allOptionData: any[] = [];
-          
-          // Fetch chains for each underlying/expiration pair
+
           for (const [underlying, expirations] of chainRequests) {
             for (const expiration of expirations) {
               try {
@@ -262,17 +327,134 @@ export const useTradingData = () => {
               }
             }
           }
-          
-          // Calculate portfolio greeks
+
           const portfolioGreeks = calculatePortfolioGreeks(positionsData, allOptionData);
           setGreeks(portfolioGreeks);
-          
-          // Track delta history (max 50 points for the day)
-          const now = new Date();
-          const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+
+          const timeLabel2 = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+          setDeltaHistory(prev => {
+            const newPoint = { time: timeLabel2, delta: portfolioGreeks.delta };
+            if (prev.length > 0 && prev[prev.length - 1].time === timeLabel2) {
+              return [...prev.slice(0, -1), newPoint];
+            }
+            return [...prev.slice(-49), newPoint];
+          });
+        }
+      }
+
+      setIsApiConnected(true);
+      setError(null);
+      setLastUpdate(new Date());
+      lastSlowFetch.current = Date.now();
+      
+      // Reset backoff on success
+      backoffMultiplier.current = 1;
+    } catch (err) {
+      console.error('Error in slow fetch:', err);
+      backoffMultiplier.current = Math.min(backoffMultiplier.current * 2, BACKOFF_MAX_INTERVAL / SLOW_POLL_INTERVAL);
+      setError(err instanceof Error ? err.message : 'Failed to fetch data');
+      setIsApiConnected(false);
+    } finally {
+      slowLoopInFlight.current = false;
+      setIsLoading(false);
+    }
+  }, [strategyPositions]);
+
+  // === LEGACY FETCH (for STABILITY_MODE=false backward compatibility) ===
+  const fetchDataLegacy = useCallback(async () => {
+    try {
+      const quotesData = await tradierApi.getQuotes(['SPY', 'QQQ']);
+      setQuotes(quotesData);
+
+      const positionsData = await tradierApi.getPositions();
+
+      const brokerSymbols = new Set(positionsData.map(p => p.symbol));
+      setPendingCloseSymbols(prev => {
+        const next = new Set<string>();
+        prev.forEach(sym => {
+          if (brokerSymbols.has(sym)) next.add(sym);
+        });
+        return next;
+      });
+
+      const enrichedPositions = positionsData.map(pos => {
+        const stratInfo = strategyPositions.get(pos.symbol);
+        const isPending = pendingCloseSymbols.has(pos.symbol);
+        const base = {
+          ...pos,
+          status: (isPending ? 'pending_close' : 'open') as Position['status'],
+        };
+        if (stratInfo) {
+          return {
+            ...base,
+            strategyName: stratInfo.strategyName,
+            underlying: stratInfo.underlying,
+            entryCredit: stratInfo.entryCredit,
+          };
+        }
+        return base;
+      });
+      setPositions(enrichedPositions);
+
+      const balances = await tradierApi.getBalances();
+      const unrealizedPnl = balances?.open_pl || 0;
+      const { realized: realizedPnl, tradeCount } = await tradeJournal.getRealizedTodayPnl();
+      const totalDailyPnl = realizedPnl + unrealizedPnl;
+
+      setRiskStatus(prev => ({
+        ...prev,
+        dailyPnl: totalDailyPnl,
+        realizedPnl,
+        unrealizedPnl,
+        tradeCount,
+      }));
+
+      const now = new Date();
+      const timeLabel = `${now.getHours()}:${now.getMinutes().toString().padStart(2, '0')}`;
+      setPnlHistory(prev => {
+        const newPoint = { time: timeLabel, pnl: totalDailyPnl };
+        if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
+          return [...prev.slice(0, -1), newPoint];
+        }
+        return [...prev.slice(-99), newPoint];
+      });
+
+      const clock = await tradierApi.getMarketClock();
+      setMarketState(clock.state);
+
+      if (positionsData.length > 0) {
+        const optionPositions = positionsData
+          .map(p => ({ position: p, parsed: parseOptionSymbol(p.symbol) }))
+          .filter(item => item.parsed !== null);
+
+        if (optionPositions.length > 0) {
+          const chainRequests = new Map<string, Set<string>>();
+          optionPositions.forEach(({ parsed }) => {
+            if (!parsed) return;
+            if (!chainRequests.has(parsed.underlying)) {
+              chainRequests.set(parsed.underlying, new Set());
+            }
+            chainRequests.get(parsed.underlying)!.add(parsed.expiration);
+          });
+
+          let allOptionData: any[] = [];
+
+          for (const [underlying, expirations] of chainRequests) {
+            for (const expiration of expirations) {
+              try {
+                const chain = await tradierApi.getOptionChain(underlying, expiration);
+                allOptionData = [...allOptionData, ...chain];
+              } catch (err) {
+                console.error(`Error fetching chain for ${underlying} ${expiration}:`, err);
+              }
+            }
+          }
+
+          const portfolioGreeks = calculatePortfolioGreeks(positionsData, allOptionData);
+          setGreeks(portfolioGreeks);
+
           setDeltaHistory(prev => {
             const newPoint = { time: timeLabel, delta: portfolioGreeks.delta };
-            // Avoid duplicates for same minute
             if (prev.length > 0 && prev[prev.length - 1].time === timeLabel) {
               return [...prev.slice(0, -1), newPoint];
             }
@@ -280,7 +462,7 @@ export const useTradingData = () => {
           });
         }
       }
-      
+
       setIsApiConnected(true);
       setError(null);
       setLastUpdate(new Date());
@@ -291,7 +473,16 @@ export const useTradingData = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [strategyPositions]);
+  }, [strategyPositions, pendingCloseSymbols]);
+
+  // Unified fetch for manual refresh / post-trade
+  const fetchData = useCallback(async () => {
+    if (STABILITY_MODE) {
+      await Promise.all([fetchFastData(), fetchSlowData(true)]);
+    } else {
+      await fetchDataLegacy();
+    }
+  }, [fetchFastData, fetchSlowData, fetchDataLegacy]);
 
   const toggleBot = useCallback(() => {
     const newState = !isBotRunning;
@@ -317,41 +508,33 @@ export const useTradingData = () => {
       maxPositions: settings.maxPositions,
     }));
     addActivity('RISK', `Risk settings updated: Max Loss $${settings.maxDailyLoss}, Max Positions ${settings.maxPositions}`);
-    
-    // Persist to database
     await settingsService.updateRiskSettings(settings.maxDailyLoss, settings.maxPositions);
   }, [addActivity]);
 
   const updateSafeguards = useCallback(async (newSafeguards: TradeSafeguards) => {
     setSafeguards(newSafeguards);
     addActivity('RISK', `Safeguards updated: Spread ${newSafeguards.maxBidAskSpreadPercent}%, Close Buffer ${newSafeguards.zeroDteCloseBufferMinutes}min, Fill Buffer ${newSafeguards.fillPriceBufferPercent}%`);
-    
-    // Persist to database
     await settingsService.updateSafeguards(newSafeguards);
   }, [addActivity]);
 
   const toggleStrategy = useCallback(async (strategyId: string) => {
     const strategy = strategies.find(s => s.id === strategyId);
     if (!strategy) return;
-    
+
     const newEnabled = !strategy.enabled;
     setStrategies(prev => prev.map(s =>
       s.id === strategyId ? { ...s, enabled: newEnabled } : s
     ));
-    
-    // Persist to database
     await settingsService.updateStrategyEnabled(strategyId, newEnabled);
   }, [strategies]);
 
   const addStrategy = useCallback(async (strategy: Omit<Strategy, 'id'>) => {
-    // Save to database first to get proper ID
     const savedStrategy = await settingsService.addStrategy(strategy);
-    
+
     if (savedStrategy) {
       setStrategies(prev => [...prev, savedStrategy]);
       addActivity('SYSTEM', `Strategy "${strategy.name}" created`);
     } else {
-      // Fallback to local-only if DB fails
       const newStrategy: Strategy = {
         ...strategy,
         id: Date.now().toString(),
@@ -366,16 +549,10 @@ export const useTradingData = () => {
     if (strategy) {
       addActivity('SYSTEM', `Strategy "${strategy.name}" deleted`);
     }
-    
     setStrategies(prev => prev.filter(s => s.id !== strategyId));
-    
-    // Delete from database
     await settingsService.deleteStrategy(strategyId);
   }, [strategies, addActivity]);
 
-  /**
-   * Journal a closed trade to the database
-   */
   const journalClosedTrade = useCallback(async (
     position: Position,
     closeResult: {
@@ -396,9 +573,7 @@ export const useTradingData = () => {
     try {
       const stratInfo = strategyPositions.get(position.symbol);
       const underlying = extractUnderlyingFromSymbol(position.symbol);
-      
-      // Determine open_side from position or strategy tracking
-      // For options: positive cost_basis with short position = sold to open
+
       const positionSide = closeResult.positionDetails?.side;
       let openSide: string | undefined;
       if (positionSide === 'short') {
@@ -406,19 +581,14 @@ export const useTradingData = () => {
       } else if (positionSide === 'long') {
         openSide = 'buy_to_open';
       } else if (position.costBasis < 0) {
-        // Negative cost basis typically means credit received (sold to open)
         openSide = 'sell_to_open';
       } else if (position.costBasis > 0) {
         openSide = 'buy_to_open';
       }
-      
-      // Entry price per contract
+
       const entryPrice = Math.abs(position.costBasis) / (position.quantity * 100);
-      
-      // We don't have fill price yet - mark for reconciliation
-      // The reconciliation job will backfill from Tradier fills
       const needsReconcile = true;
-      
+
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
         underlying,
@@ -428,22 +598,22 @@ export const useTradingData = () => {
         entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || new Date().toISOString(),
         exit_time: new Date().toISOString(),
         entry_price: entryPrice,
-        exit_price: 0, // Will be backfilled by reconciliation
+        exit_price: 0,
         entry_credit: stratInfo?.entryCredit,
-        pnl: 0, // Will be recalculated after reconciliation
+        pnl: 0,
         pnl_percent: 0,
         exit_reason: exitReason,
-        trade_group_id: undefined, // Could link multi-leg closes later
+        trade_group_id: undefined,
         open_side: openSide,
         close_side: closeResult.closeSide,
         close_order_id: closeResult.orderId,
         multiplier: 100,
-        fees: 0, // Will be backfilled by reconciliation
+        fees: 0,
         needs_reconcile: needsReconcile,
       };
 
       const saveResult = await tradeJournal.saveTrade(tradeRecord);
-      
+
       if (saveResult.duplicate) {
         console.log('Trade already journaled (duplicate close_order_id):', position.symbol, closeResult.orderId);
       } else if (saveResult.success) {
@@ -460,7 +630,8 @@ export const useTradingData = () => {
     const position = positions.find(p => p.id === positionId);
     if (!position) return false;
 
-    if (pendingCloseSymbols.has(position.symbol)) {
+    // Use ref to get current value (avoids stale closure)
+    if (pendingCloseSymbolsRef.current.has(position.symbol)) {
       addActivity('SYSTEM', `SKIP: already pending close: ${position.symbol}`);
       return false;
     }
@@ -493,10 +664,7 @@ export const useTradingData = () => {
     if (result.success && !result.dryRun) {
       setPendingCloseSymbols(prev => new Set(prev).add(position.symbol));
       addActivity('TRADE', `Close order accepted: ${position.symbol} (Order #${result.orderId})`);
-      
-      // Journal the trade immediately
       await journalClosedTrade(position, result, exitReason, 'manual_ui', clientRequestId);
-      
       await fetchData();
       return true;
     }
@@ -508,12 +676,12 @@ export const useTradingData = () => {
 
     addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
     return false;
-  }, [positions, pendingCloseSymbols, addActivity, fetchData, closeDebugOptions, journalClosedTrade]);
+  }, [positions, addActivity, fetchData, closeDebugOptions, journalClosedTrade]);
 
   const emergencyCloseAll = useCallback(async () => {
     addActivity('EMERGENCY', 'Emergency close initiated - closing all positions');
     setIsBotRunning(false);
-    
+
     for (const position of positions) {
       const result = await tradierApi.closePosition(position.symbol, position.quantity);
       if (result.success) {
@@ -522,32 +690,30 @@ export const useTradingData = () => {
         addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
       }
     }
-    
+
     fetchData();
     addActivity('EMERGENCY', 'Emergency close complete');
   }, [positions, addActivity, fetchData]);
 
-  // Run strategy engine when bot is running
   const runStrategyEngine = useCallback(async () => {
     if (!isBotRunning || riskStatus.killSwitchActive) return;
-    
-    // Throttle to once per 30 seconds
+
     const now = Date.now();
     if (now - lastEngineRun.current < 30000) return;
     lastEngineRun.current = now;
 
     try {
       addActivity('SYSTEM', 'Strategy engine scanning...');
-      
-      // Check for exit conditions first
+
       const exitResult = await strategyEngine.checkExits(strategies, positions);
-      
+
       let placedAnyExitOrder = false;
 
       for (const exitSignal of exitResult.exitSignals) {
         const key = exitSignal.symbol;
 
-        if (pendingCloseSymbols.has(key)) {
+        // Use ref to get current value
+        if (pendingCloseSymbolsRef.current.has(key)) {
           addActivity('SYSTEM', `SKIP: already pending close: ${key}`);
           continue;
         }
@@ -555,7 +721,6 @@ export const useTradingData = () => {
         const nowTs = Date.now();
         const lastAttemptTs = lastCloseAttempt.current.get(key) || 0;
 
-        // Frontend-side spam guard (edge function enforces the real lock/cooldown).
         if (nowTs - lastAttemptTs < 120_000) {
           addActivity('SYSTEM', `Skipping duplicate close attempt (cooldown): ${exitSignal.symbol}`);
           continue;
@@ -591,8 +756,7 @@ export const useTradingData = () => {
           placedAnyExitOrder = true;
           setPendingCloseSymbols(prev => new Set(prev).add(exitSignal.symbol));
           addActivity('TRADE', `Close order accepted: ${exitSignal.symbol} (Order #${result.orderId})`);
-          
-          // Journal the trade - find the position to get full details
+
           const position = positions.find(p => p.symbol === exitSignal.symbol);
           if (position) {
             await journalClosedTrade(position, result, exitSignal.reason, 'bot_engine', clientRequestId);
@@ -605,24 +769,21 @@ export const useTradingData = () => {
       }
 
       if (placedAnyExitOrder) {
-        // Refresh positions so the next engine run doesn't keep trying to close legs that are already closing/closed.
         await fetchData();
       }
-      // Then evaluate entry conditions
+
       const entryResult = await strategyEngine.evaluateStrategies(strategies, positions);
-      
+
       if (entryResult.signals.length > 0) {
         for (const signal of entryResult.signals) {
           addActivity('TRADE', `Entry signal: ${signal.strategyName} - ${signal.underlying} $${signal.credit.toFixed(2)} credit`);
-          
-          // Auto-execute the signal
+
           const execResult = await strategyEngine.executeSignal(signal);
-          
+
           if (execResult.success) {
             addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId})`);
             setRiskStatus(prev => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
-            
-            // Track the strategy position for each leg
+
             setStrategyPositions(prev => {
               const newMap = new Map(prev);
               signal.legs.forEach(leg => {
@@ -639,8 +800,7 @@ export const useTradingData = () => {
             addActivity('RISK', `Order failed: ${execResult.error}`);
           }
         }
-        
-        // Refresh positions after trades
+
         await fetchData();
       } else {
         addActivity('SYSTEM', 'No entry signals found');
@@ -649,24 +809,21 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, pendingCloseSymbols, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, closeDebugOptions, addActivity, fetchData, strategyPositions, journalClosedTrade]);
 
   // Load saved settings and strategies on mount
   useEffect(() => {
     const loadSavedData = async () => {
       try {
-        // Load strategies
         const savedStrategies = await settingsService.getStrategies();
         if (savedStrategies.length > 0) {
           setStrategies(savedStrategies);
           addActivity('SYSTEM', `Loaded ${savedStrategies.length} saved strategies`);
         } else {
-          // Use defaults if no saved strategies
           setStrategies(defaultStrategies);
           addActivity('SYSTEM', 'Using default strategies (none saved)');
         }
-        
-        // Load settings
+
         const savedSettings = await settingsService.getSettings();
         if (savedSettings) {
           setRiskStatus(prev => ({
@@ -677,7 +834,7 @@ export const useTradingData = () => {
           setSafeguards(savedSettings.safeguards);
           addActivity('SYSTEM', 'Loaded saved risk settings');
         }
-        
+
         setSettingsLoaded(true);
       } catch (error) {
         console.error('Error loading saved data:', error);
@@ -685,7 +842,7 @@ export const useTradingData = () => {
         setSettingsLoaded(true);
       }
     };
-    
+
     loadSavedData();
   }, [addActivity]);
 
@@ -702,18 +859,17 @@ export const useTradingData = () => {
         },
         async (payload) => {
           console.log('Strategy change detected:', payload);
-          
+
           if (payload.eventType === 'INSERT') {
             const newStrategy = settingsService.mapDbToStrategy(payload.new as any);
             setStrategies(prev => {
-              // Avoid duplicates
               if (prev.some(s => s.id === newStrategy.id)) return prev;
               return [...prev, newStrategy];
             });
             addActivity('SYSTEM', `Strategy "${newStrategy.name}" added (synced)`);
           } else if (payload.eventType === 'UPDATE') {
             const updatedStrategy = settingsService.mapDbToStrategy(payload.new as any);
-            setStrategies(prev => 
+            setStrategies(prev =>
               prev.map(s => s.id === updatedStrategy.id ? updatedStrategy : s)
             );
             addActivity('SYSTEM', `Strategy "${updatedStrategy.name}" updated (synced)`);
@@ -731,29 +887,89 @@ export const useTradingData = () => {
     };
   }, [addActivity]);
 
-  // Initial fetch and polling
+  // === STABILITY_MODE: Split polling with visibility + market-hours gating ===
   useEffect(() => {
-    fetchData();
-    addActivity('SYSTEM', 'Dashboard connected - fetching market data');
-    
-    // Poll every 5 seconds when market is open
-    const interval = setInterval(() => {
-      fetchData();
-    }, 5000);
+    if (!STABILITY_MODE) {
+      // Legacy behavior: poll everything every 5s
+      fetchDataLegacy();
+      addActivity('SYSTEM', 'Dashboard connected - fetching market data (legacy mode)');
 
-    return () => clearInterval(interval);
-  }, [fetchData, addActivity]);
+      const interval = setInterval(() => {
+        fetchDataLegacy();
+      }, 5000);
+
+      return () => clearInterval(interval);
+    }
+
+    // Initial fetch
+    fetchFastData();
+    fetchSlowData(true);
+    addActivity('SYSTEM', 'Dashboard connected - fetching market data (stability mode)');
+
+    // Fast loop: clock + quotes
+    const fastIntervalId = setInterval(() => {
+      // Apply backoff multiplier
+      const effectiveInterval = FAST_POLL_INTERVAL * backoffMultiplier.current;
+      
+      // If hidden tab, slow down
+      if (!isPageVisible.current) {
+        if (Date.now() % HIDDEN_POLL_INTERVAL < FAST_POLL_INTERVAL) {
+          fetchFastData();
+        }
+        return;
+      }
+
+      // If market closed, slow down
+      if (marketStateRef.current !== 'open' && marketStateRef.current !== 'premarket') {
+        if (Date.now() % CLOSED_POLL_INTERVAL < FAST_POLL_INTERVAL) {
+          fetchFastData();
+        }
+        return;
+      }
+
+      fetchFastData();
+    }, FAST_POLL_INTERVAL);
+
+    // Slow loop: positions + balances + chains
+    const slowIntervalId = setInterval(() => {
+      const timeSinceLastSlow = Date.now() - lastSlowFetch.current;
+
+      // If hidden tab, use longer interval
+      if (!isPageVisible.current) {
+        if (timeSinceLastSlow >= HIDDEN_POLL_INTERVAL) {
+          fetchSlowData(false); // Don't force chains when hidden
+        }
+        return;
+      }
+
+      // If market closed, use longer interval and skip chains
+      if (marketStateRef.current !== 'open' && marketStateRef.current !== 'premarket') {
+        if (timeSinceLastSlow >= CLOSED_POLL_INTERVAL) {
+          fetchSlowData(false); // Don't fetch chains when closed
+        }
+        return;
+      }
+
+      // Normal market hours
+      if (timeSinceLastSlow >= SLOW_POLL_INTERVAL * backoffMultiplier.current) {
+        fetchSlowData(true);
+      }
+    }, SLOW_POLL_INTERVAL);
+
+    return () => {
+      clearInterval(fastIntervalId);
+      clearInterval(slowIntervalId);
+    };
+  }, [fetchFastData, fetchSlowData, fetchDataLegacy, addActivity]);
 
   // Run strategy engine when bot is running
   useEffect(() => {
     if (!isBotRunning) return;
-    
-    // Run immediately when bot starts
+
     runStrategyEngine();
-    
-    // Then run every 30 seconds
+
     const engineInterval = setInterval(runStrategyEngine, 30000);
-    
+
     return () => clearInterval(engineInterval);
   }, [isBotRunning, runStrategyEngine]);
 
