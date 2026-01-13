@@ -936,6 +936,13 @@ export const useTradingData = () => {
       return true;
     }
 
+    if (result.notFound) {
+      // Position doesn't exist at broker - already closed or stale data
+      addActivity('SYSTEM', `Position ${position.symbol} not found at broker (already closed)`);
+      await fetchData();
+      return true; // Treat as success - goal was to close and it's already closed
+    }
+
     if (result.success && result.dryRun) {
       addActivity('SYSTEM', `Dry run computed for ${position.symbol} (no order sent)`);
       return true;
@@ -1005,6 +1012,9 @@ export const useTradingData = () => {
       if (result.success && !result.dryRun) {
         addActivity('TRADE', `Group leg closed: ${position.symbol} (Order #${result.orderId})`);
         await journalClosedTrade(position, result, exitReason, 'manual_ui_group', `${clientRequestId}-${position.symbol}`);
+      } else if (result.notFound) {
+        // Position doesn't exist at broker - already closed or stale data, not an error
+        addActivity('SYSTEM', `Position ${position.symbol} not found at broker (already closed)`);
       } else if (!result.success) {
         allSuccess = false;
         addActivity('RISK', `Failed to close group leg ${position.symbol}: ${result.error}`);
@@ -1041,6 +1051,8 @@ export const useTradingData = () => {
       const result = await tradierApi.closePosition(position.symbol, position.quantity);
       if (result.success) {
         addActivity('TRADE', `Position closed: ${position.symbol}`);
+      } else if (result.notFound) {
+        addActivity('SYSTEM', `Position ${position.symbol} already closed`);
       } else {
         addActivity('RISK', `Failed to close ${position.symbol}: ${result.error}`);
       }
@@ -1105,6 +1117,8 @@ export const useTradingData = () => {
               placedAnyExitOrder = true;
               addActivity('TRADE', `Bot closed group leg: ${groupPos.symbol} (Order #${result.orderId})`);
               await journalClosedTrade(groupPos, result, exitSignal.reason, 'bot_engine_group', `${clientRequestId}-${groupPos.symbol}`);
+            } else if (result.notFound) {
+              addActivity('SYSTEM', `Position ${groupPos.symbol} already closed`);
             } else if (!result.success) {
               addActivity('RISK', `Bot failed to close group leg ${groupPos.symbol}: ${result.error}`);
             }
@@ -1166,6 +1180,8 @@ export const useTradingData = () => {
           }
         } else if (result.success && result.dryRun) {
           addActivity('SYSTEM', `Dry run computed for ${exitSignal.symbol} (no order sent)`);
+        } else if (result.notFound) {
+          addActivity('SYSTEM', `Position ${exitSignal.symbol} already closed`);
         } else {
           addActivity('RISK', `Close order rejected: ${exitSignal.symbol} - ${result.error || 'Unknown error'}`);
         }
