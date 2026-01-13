@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
@@ -9,6 +9,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { cn } from '@/lib/utils';
 import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection, isClosePending, isCloseRejected, CloseStatus } from '@/services/tradeJournal';
 import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
+import { supabase } from '@/integrations/supabase/client';
 import { format, subDays } from 'date-fns';
 import { ChevronDown, ChevronUp, ChevronRight, Edit2, Save, X, Clock, DollarSign, TrendingUp, TrendingDown, Tag, FileText, Layers, Calculator, Search, AlertTriangle, Trash2, RefreshCw, Download, CheckCircle, XCircle, Loader2, Ban, Activity } from 'lucide-react';
 import { DecisionTraceLink } from './DecisionTraceLink';
@@ -593,10 +594,35 @@ export const TradeJournal = () => {
   // Reconciliation state
   const [isReconciling, setIsReconciling] = useState(false);
 
+  // Initial load
   useEffect(() => {
     loadTrades();
   }, []);
 
+  // Real-time subscription for trade updates
+  useEffect(() => {
+    const channel = supabase
+      .channel('trades-realtime')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'trades'
+        },
+        (payload) => {
+          console.log('[TradeJournal] Real-time update:', payload.eventType);
+          loadTrades(true); // Refresh on any change
+        }
+      )
+      .subscribe();
+    
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Polling fallback when expanded (in case real-time doesn't work)
   useEffect(() => {
     if (!isExpanded) return;
     loadTrades(false);

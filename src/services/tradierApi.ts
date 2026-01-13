@@ -312,16 +312,19 @@ export const tradierApi = {
 
       if (error) {
         // Check if this is a "Position not found" 404 - this is expected when position was already closed
-        // Parse the error context to extract the response body
-        const errorContext = error.context as { body?: string } | undefined;
+        // The Supabase client wraps edge function errors in FunctionsHttpError
+        // The error.context is a Response object, need to call .json() on it
         let parsedBody: any = null;
         try {
-          if (errorContext?.body) {
-            parsedBody = JSON.parse(errorContext.body);
+          // error.context is the Response object for FunctionsHttpError
+          if (error.context && typeof error.context.json === 'function') {
+            parsedBody = await error.context.json();
           }
         } catch {
-          // Ignore parse errors
+          // Ignore parse errors - context might already be consumed or not JSON
         }
+        
+        console.log('[tradierApi.closePosition] Error context parsed:', { parsedBody, errorMessage: error.message, clientRequestId });
         
         if (parsedBody?.error === 'Position not found') {
           console.log('[tradierApi.closePosition] Position not found (already closed or never existed):', { symbol, clientRequestId });
