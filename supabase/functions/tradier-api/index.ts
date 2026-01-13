@@ -1,10 +1,39 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-client-request-id",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+// ============================================================================
+// CORS Configuration
+// - Set ALLOWED_ORIGINS env var to comma-separated list for production
+// - Set DEV_ALLOW_ALL_ORIGINS=true for local development with wildcard CORS
+// ============================================================================
+function getCorsHeaders(requestOrigin?: string | null): Record<string, string> {
+  const allowedOriginsEnv = Deno.env.get("ALLOWED_ORIGINS");
+  const devAllowAll = Deno.env.get("DEV_ALLOW_ALL_ORIGINS") === "true";
+
+  let allowOrigin = "";
+
+  if (devAllowAll) {
+    // Local dev: allow all
+    allowOrigin = "*";
+  } else if (allowedOriginsEnv) {
+    // Production: check against allowlist
+    const allowedOrigins = allowedOriginsEnv.split(",").map(o => o.trim());
+    if (requestOrigin && allowedOrigins.includes(requestOrigin)) {
+      allowOrigin = requestOrigin;
+    } else if (allowedOrigins.length > 0) {
+      // Default to first allowed origin if no match
+      allowOrigin = allowedOrigins[0];
+    }
+  } else {
+    // Fallback: allow all (for backwards compatibility during migration)
+    allowOrigin = "*";
+  }
+
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-client-request-id",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  };
+}
 
 interface TradierRequest {
   action:
@@ -132,10 +161,7 @@ function getCloseInstruction(
     const cbSide = inferSideFromCostBasis(costBasis);
     if (cbSide !== "unknown") {
       side = cbSide;
-      console.warn("WARN: inferred position side from cost_basis as last resort", {
-        positionSymbol,
-        cost_basis: costBasis,
-      });
+      console.warn("INFER_SIDE_FROM_COST_BASIS", { positionSymbol, cost_basis: costBasis });
     }
   }
 
@@ -173,18 +199,20 @@ function getCloseInstruction(
 async function safeParseTradierResponse(resp: Response): Promise<any> {
   const text = await resp.text();
   if (text.trim().startsWith("<")) {
-    console.error("Tradier returned HTML instead of JSON:", text.slice(0, 500));
-    return { error: "Tradier API returned HTML error page", status: resp.status, html_preview: text.slice(0, 200) };
+    console.error("TRADIER_HTML_ERROR", { status: resp.status });
+    return { error: "Tradier API returned HTML error page", status: resp.status };
   }
   try {
     return JSON.parse(text);
   } catch {
-    console.error("Failed to parse Tradier response:", text.slice(0, 500));
-    return { error: "Invalid JSON from Tradier", raw: text.slice(0, 200) };
+    console.error("TRADIER_JSON_PARSE_ERROR", { status: resp.status });
+    return { error: "Invalid JSON from Tradier" };
   }
 }
 
 serve(async (req) => {
+  const corsHeaders = getCorsHeaders(req.headers.get("origin"));
+
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -195,10 +223,16 @@ serve(async (req) => {
     let body: TradierRequest;
     try {
       const rawText = await req.text();
-      console.log("RAW_REQUEST_BODY", { length: rawText.length, preview: rawText.slice(0, 200) });
+      // SECURITY: Only log action and metadata, not full body
       body = JSON.parse(rawText) as TradierRequest;
+      console.log("REQUEST", {
+        action: body.action,
+        symbol: body.symbol || body.positionSymbol,
+        symbols_count: body.symbols?.length,
+        clientRequestId: body.clientRequestId,
+      });
     } catch (parseError) {
-      console.error("Failed to parse request body as JSON:", parseError);
+      console.error("PARSE_ERROR", { error: "Invalid JSON" });
       return new Response(
         JSON.stringify({ error: "Invalid JSON in request body" }),
         { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -208,7 +242,7 @@ serve(async (req) => {
 
     // Handle ping immediately (no Tradier credentials needed)
     if (action === "ping") {
-      console.log("PING received");
+      console.log("PING");
       return new Response(
         JSON.stringify({ ok: true, timestamp: new Date().toISOString(), action: "ping" }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } }
@@ -219,7 +253,7 @@ serve(async (req) => {
     const accountId = Deno.env.get("TRADIER_ACCOUNT_ID");
 
     if (!apiToken || !accountId) {
-      console.error("Missing Tradier credentials");
+      console.error("MISSING_CREDENTIALS");
       return new Response(JSON.stringify({ error: "Tradier API not configured" }), {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -259,28 +293,31 @@ serve(async (req) => {
           });
         }
         const url = `${baseUrl}/markets/quotes?symbols=${symbols.join(",")}`;
-        console.log("Fetching quotes:", url);
+        console.log("QUOTE_REQUEST", { symbols_count: symbols.length });
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Quote response:", JSON.stringify(data));
+        console.log("QUOTE_RESPONSE", { status: response.status });
         break;
       }
 
       case "positions": {
         const url = `${baseUrl}/accounts/${accountId}/positions`;
-        console.log("Fetching positions:", url);
+        console.log("POSITIONS_REQUEST");
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Positions response:", JSON.stringify(data));
+        const posCount = Array.isArray(data?.positions?.position)
+          ? data.positions.position.length
+          : data?.positions?.position ? 1 : 0;
+        console.log("POSITIONS_RESPONSE", { status: response.status, count: posCount });
         break;
       }
 
       case "balances": {
         const url = `${baseUrl}/accounts/${accountId}/balances`;
-        console.log("Fetching balances:", url);
+        console.log("BALANCES_REQUEST");
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Balances response:", JSON.stringify(data));
+        console.log("BALANCES_RESPONSE", { status: response.status });
         break;
       }
 
@@ -292,10 +329,10 @@ serve(async (req) => {
           });
         }
         const url = `${baseUrl}/markets/options/expirations?symbol=${symbol}`;
-        console.log("Fetching expirations:", url);
+        console.log("EXPIRATIONS_REQUEST", { symbol });
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Expirations response:", JSON.stringify(data));
+        console.log("EXPIRATIONS_RESPONSE", { status: response.status, symbol });
         break;
       }
 
@@ -310,36 +347,34 @@ serve(async (req) => {
           );
         }
         const url = `${baseUrl}/markets/options/chains?symbol=${symbol}&expiration=${expiration}&greeks=true`;
-        console.log("Fetching chain:", url);
+        console.log("CHAIN_REQUEST", { symbol, expiration });
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Chain response received");
+        console.log("CHAIN_RESPONSE", { status: response.status, symbol, expiration });
         break;
       }
 
       case "clock": {
         const url = `${baseUrl}/markets/clock`;
-        console.log("Fetching market clock:", url);
+        console.log("CLOCK_REQUEST");
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Clock response:", JSON.stringify(data));
+        console.log("CLOCK_RESPONSE", { status: response.status, state: data?.clock?.state });
         break;
       }
 
       case "orders": {
         // Fetch order history for reconciliation
-        const startDate = body.startDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-        const endDate = body.endDate || new Date().toISOString().split('T')[0];
         const url = `${baseUrl}/accounts/${accountId}/orders?includeTags=true`;
-        console.log("Fetching orders:", url);
+        console.log("ORDERS_REQUEST");
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Orders response received, count:", Array.isArray(data?.orders?.order) ? data.orders.order.length : (data?.orders?.order ? 1 : 0));
+        const orderCount = Array.isArray(data?.orders?.order) ? data.orders.order.length : (data?.orders?.order ? 1 : 0);
+        console.log("ORDERS_RESPONSE", { status: response.status, count: orderCount });
         break;
       }
 
       case "order_detail": {
-        // Fetch specific order details with leg info (includes fill prices)
         const orderId = body.orderId;
         if (!orderId) {
           return new Response(JSON.stringify({ error: "orderId required for order_detail" }), {
@@ -348,15 +383,14 @@ serve(async (req) => {
           });
         }
         const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
-        console.log("Fetching order detail:", url);
+        console.log("ORDER_DETAIL_REQUEST", { orderId });
         response = await fetch(url, { headers });
         data = await safeParseTradierResponse(response);
-        console.log("Order detail response:", JSON.stringify(data));
+        console.log("ORDER_DETAIL_RESPONSE", { status: response.status, orderId });
         break;
       }
 
       case "order_status": {
-        // Fetch order status - returns normalized status for close lifecycle tracking
         const orderId = body.orderId;
         if (!orderId) {
           return new Response(JSON.stringify({ error: "orderId required for order_status" }), {
@@ -365,22 +399,21 @@ serve(async (req) => {
           });
         }
         const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
-        console.log("Fetching order status:", url);
+        console.log("ORDER_STATUS_REQUEST", { orderId });
         response = await fetch(url, { headers });
         const orderData = await safeParseTradierResponse(response);
-        console.log("Order status response:", JSON.stringify(orderData));
-        
+        console.log("ORDER_STATUS_RESPONSE", { status: response.status, orderId });
+
         const order = orderData?.order;
         if (!order) {
           data = { error: "Order not found", orderId };
           break;
         }
 
-        // Normalize status for close lifecycle
         const tradierStatus = String(order.status || '').toLowerCase();
         let closeStatus: 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired' = 'submitted';
         let rejectReason: string | undefined;
-        
+
         if (tradierStatus === 'filled') {
           closeStatus = 'filled';
         } else if (tradierStatus === 'rejected') {
@@ -396,11 +429,10 @@ serve(async (req) => {
           closeStatus = 'submitted';
         }
 
-        // Extract fill details if filled
         let avgFillPrice: number | undefined;
         let filledQty: number | undefined;
         let closeSide: string | undefined;
-        
+
         if (closeStatus === 'filled') {
           avgFillPrice = normalizeNumber(order.avg_fill_price);
           filledQty = normalizeNumber(order.exec_quantity) || normalizeNumber(order.quantity);
@@ -440,20 +472,18 @@ serve(async (req) => {
           clientRequestId,
           trade_group_id,
           symbol: positionSymbol,
-          lockKey,
           dryRun,
-          debug,
         });
 
         if (lock?.inFlight) {
-          console.log("SKIP: cooldown/lock (in-flight)", { source, clientRequestId, lockKey });
+          console.log("CLOSE_SKIP_INFLIGHT", { source, clientRequestId, symbol: positionSymbol });
           return new Response(
             JSON.stringify({ skipped: true, reason: "lock_in_flight", clientRequestId }),
             { headers: { ...corsHeaders, "Content-Type": "application/json" } },
           );
         }
         if (lock?.lastAcceptedAt && now - lock.lastAcceptedAt < CLOSE_COOLDOWN_MS) {
-          console.log("SKIP: cooldown/lock (recently accepted)", { source, clientRequestId, lockKey });
+          console.log("CLOSE_SKIP_COOLDOWN", { source, clientRequestId, symbol: positionSymbol });
           return new Response(
             JSON.stringify({ skipped: true, reason: "cooldown", clientRequestId }),
             { headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -463,7 +493,7 @@ serve(async (req) => {
         closeLocks.set(lockKey, { inFlight: true, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
 
         try {
-          // 0) Fetch exact position snapshot
+          // Fetch exact position snapshot
           const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
           const posResp = await fetch(posUrl, { headers });
           const posData = await safeParseTradierResponse(posResp);
@@ -476,12 +506,7 @@ serve(async (req) => {
 
           const matched = posArray.find((p) => String(p.symbol) === positionSymbol);
           if (!matched) {
-            console.log("CLOSE_DECISION: position_not_found", {
-              source,
-              clientRequestId,
-              positionSymbol,
-              positionsCount: posArray.length,
-            });
+            console.log("CLOSE_NOT_FOUND", { source, clientRequestId, symbol: positionSymbol });
             return new Response(
               JSON.stringify({ error: "Position not found", symbol: positionSymbol, clientRequestId }),
               { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -497,12 +522,7 @@ serve(async (req) => {
             const q = qData?.quotes?.quote;
             quoteType = (Array.isArray(q) ? q[0]?.type : q?.type) as string | undefined;
           } catch (e) {
-            console.warn("WARN: failed to fetch quote for instrument_type", {
-              source,
-              clientRequestId,
-              positionSymbol,
-              error: e instanceof Error ? e.message : String(e),
-            });
+            console.warn("QUOTE_FETCH_FAILED", { symbol: positionSymbol });
           }
 
           const qty = normalizeNumber(matched.quantity);
@@ -514,37 +534,28 @@ serve(async (req) => {
               (isOccOptionSymbol(positionSymbol) ? "option" : "equity"),
           );
 
-          console.log("CLOSE_RAW_POSITION", {
+          console.log("CLOSE_POSITION_DATA", {
             source,
             clientRequestId,
             symbol: positionSymbol,
             instrument_type,
             quantity: qty,
-            cost_basis: costBasis,
             side: side || undefined,
-            raw: matched,
           });
 
           const instruction = getCloseInstruction(matched, positionSymbol, quoteType);
           if (!instruction.ok) {
-            console.log("CLOSE_DECISION_ERROR", { source, clientRequestId, ...instruction });
+            console.log("CLOSE_INSTRUCTION_ERROR", { source, clientRequestId, error: instruction.error });
             return new Response(
               JSON.stringify({ error: instruction.error, clientRequestId, debug: { instruction } }),
               { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
             );
           }
 
-          // 2) Never exceed position size
           const positionSize = Math.abs(qty);
           const closeQty = Math.min(instruction.closeQty, positionSize);
           if (!Number.isFinite(closeQty) || closeQty <= 0) {
-            console.log("CLOSE_DECISION: zero_position_size", {
-              source,
-              clientRequestId,
-              positionSymbol,
-              qty,
-              instruction,
-            });
+            console.log("CLOSE_ZERO_SIZE", { source, clientRequestId, symbol: positionSymbol });
             return new Response(
               JSON.stringify({ error: "Position size is zero", clientRequestId, debug: { instruction } }),
               { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -569,15 +580,12 @@ serve(async (req) => {
             orderParams.option_symbol = positionSymbol;
           }
 
-          console.log("CLOSE_DECISION", {
+          console.log("CLOSE_ORDER_PARAMS", {
             source,
             clientRequestId,
-            trade_group_id,
             symbol: positionSymbol,
-            instrument_type: instruction.instrument_type,
-            side: instruction.side,
-            computed: instruction,
-            orderParams,
+            closeSide: instruction.closeSide,
+            closeQty,
             dryRun,
           });
 
@@ -591,11 +599,8 @@ serve(async (req) => {
                 ? {
                     source,
                     trade_group_id,
-                    raw_position: matched,
-                    quote_type: quoteType,
                     instruction,
                     orderParams,
-                    response: { dry_run: true },
                   }
                 : undefined,
             };
@@ -613,21 +618,23 @@ serve(async (req) => {
           });
 
           const responseText = await response.text();
-          console.log("CLOSE_ORDER_RESPONSE_TEXT", {
-            source,
-            clientRequestId,
-            responseText,
-          });
-
           let parsed: any = null;
           try {
             parsed = JSON.parse(responseText);
           } catch {
-            parsed = { error: responseText };
+            parsed = { error: "Invalid response" };
           }
 
-          // mark accepted timestamp only when Tradier returns an order id
-          if (parsed?.order?.id) {
+          const orderId = parsed?.order?.id;
+          console.log("CLOSE_ORDER_RESULT", {
+            source,
+            clientRequestId,
+            symbol: positionSymbol,
+            orderId,
+            status: response.status,
+          });
+
+          if (orderId) {
             closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: Date.now() });
           } else {
             closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
@@ -640,11 +647,8 @@ serve(async (req) => {
               ? {
                   source,
                   trade_group_id,
-                  raw_position: matched,
-                  quote_type: quoteType,
                   instruction,
                   orderParams,
-                  response: parsed,
                 }
               : undefined,
           };
@@ -664,7 +668,7 @@ serve(async (req) => {
     }
 
     if (!response?.ok && action !== "close_position") {
-      console.error("Tradier API error:", response?.status, data);
+      console.error("TRADIER_API_ERROR", { action, status: response?.status });
       return new Response(JSON.stringify({ error: "Tradier API error", details: data }), {
         status: response?.status || 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -672,7 +676,7 @@ serve(async (req) => {
     }
 
     if (action === "close_position" && response && !response.ok) {
-      console.error("Tradier API close_position error:", response.status, data);
+      console.error("CLOSE_API_ERROR", { status: response.status });
       return new Response(JSON.stringify({ error: "Tradier API error", details: data }), {
         status: response.status,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -684,10 +688,10 @@ serve(async (req) => {
     });
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-    console.error("Error in tradier-api function:", error);
+    console.error("FUNCTION_ERROR", { error: errorMessage });
     return new Response(JSON.stringify({ error: errorMessage }), {
       status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      headers: { ...getCorsHeaders(), "Content-Type": "application/json" },
     });
   }
 });
