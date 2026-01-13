@@ -776,6 +776,17 @@ export const useTradingData = () => {
 
       // STEP 1: Save trade as 'submitted' with NULL pnl/exit_price
       // Tradier 'ok' status != filled - order may still be rejected
+      
+      // trade_group_id must be a valid UUID - check if it looks like one
+      // Human-readable IDs like "hg-heuristic-SPY-2026-01-13-5894417" are NOT valid UUIDs
+      const isValidUUID = (str: string | undefined): boolean => {
+        if (!str) return false;
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        return uuidRegex.test(str);
+      };
+      
+      const tradeGroupId = isValidUUID(position.tradeGroupId) ? position.tradeGroupId : undefined;
+      
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
         underlying,
@@ -791,7 +802,7 @@ export const useTradingData = () => {
         pnl_percent: null,
         pnl_formula: undefined,
         exit_reason: exitReason,
-        trade_group_id: position.tradeGroupId,
+        trade_group_id: tradeGroupId,
         open_side: openSide,
         close_side: closeResult.closeSide,
         close_order_id: closeResult.orderId,
