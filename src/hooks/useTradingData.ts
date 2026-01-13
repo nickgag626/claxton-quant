@@ -303,15 +303,46 @@ export const useTradingData = () => {
     ]);
   }, []);
 
-  // Clear all history (activity log, P&L history, delta history)
-  const clearHistory = useCallback(() => {
-    setActivity([]);
-    setPnlHistory([]);
-    setDeltaHistory([]);
-    toast({
-      title: 'History Cleared',
-      description: 'Activity log and chart history have been reset.',
-    });
+  // Clear all history (trades from DB, activity log, P&L history, delta history)
+  const clearHistory = useCallback(async () => {
+    try {
+      // Clear trades from database
+      const result = await tradeJournal.clearAllTrades();
+      
+      if (!result.success) {
+        toast({
+          title: 'Error Clearing History',
+          description: result.error || 'Failed to clear trades from database',
+          variant: 'destructive',
+        });
+        return;
+      }
+
+      // Clear in-memory state
+      setActivity([]);
+      setPnlHistory([]);
+      setDeltaHistory([]);
+      
+      // Reset P&L stats
+      setRiskStatus(prev => ({
+        ...prev,
+        dailyPnl: 0,
+        realizedPnl: 0,
+        tradeCount: 0,
+      }));
+
+      toast({
+        title: 'History Cleared',
+        description: `Deleted ${result.deleted} trades. Activity log and P&L stats have been reset.`,
+      });
+    } catch (error) {
+      console.error('Error clearing history:', error);
+      toast({
+        title: 'Error Clearing History',
+        description: error instanceof Error ? error.message : 'Unknown error',
+        variant: 'destructive',
+      });
+    }
   }, []);
 
   // === FAST LOOP: Clock + Quotes only ===

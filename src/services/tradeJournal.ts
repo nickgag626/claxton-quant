@@ -1058,4 +1058,37 @@ export const tradeJournal = {
       };
     }
   },
+
+  /**
+   * Clear ALL trades from the database
+   * WARNING: This permanently deletes all trade history
+   */
+  async clearAllTrades(): Promise<{ success: boolean; deleted: number; error?: string }> {
+    try {
+      // First count how many we're about to delete
+      const { count, error: countError } = await supabase
+        .from('trades')
+        .select('*', { count: 'exact', head: true });
+
+      if (countError) throw countError;
+
+      // Delete all trades
+      const { error: deleteError } = await supabase
+        .from('trades')
+        .delete()
+        .neq('id', '00000000-0000-0000-0000-000000000000'); // Delete all (workaround for "delete all" requirement)
+
+      if (deleteError) throw deleteError;
+
+      console.log(`Cleared ${count || 0} trades from database`);
+      return { success: true, deleted: count || 0 };
+    } catch (error) {
+      console.error('Error clearing trades:', error);
+      return { 
+        success: false, 
+        deleted: 0,
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  },
 };
