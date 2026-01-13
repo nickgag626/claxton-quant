@@ -139,13 +139,13 @@ export const tradierApi = {
       
       return posArray.map((p: TradierPosition) => {
         const quote = liveQuotes[p.symbol];
-        // Tradier cost_basis is TOTAL DOLLARS (already includes qty × 100 multiplier)
-        // For current market value: per-contract price × |qty| × 100 
-        const perContractPrice = quote ? (quote.bid + quote.ask) / 2 || quote.last : 0;
-        // Compute total market value in dollars
-        const marketValue = perContractPrice * Math.abs(p.quantity) * 100;
-        // Use sign convention matching Tradier: short positions have negative values
-        const signedMarketValue = p.quantity < 0 ? -marketValue : marketValue;
+        // markPrice is PER-CONTRACT (mid of bid/ask or last) - never multiplied
+        const markPrice = quote ? (quote.bid + quote.ask) / 2 || quote.last : 0;
+        
+        // currentValue is TOTAL DOLLARS: markPrice × |qty| × 100, with sign matching position
+        // Tradier cost_basis is already TOTAL DOLLARS (includes qty × 100 multiplier)
+        const marketValueAbs = markPrice * Math.abs(p.quantity) * 100;
+        const signedMarketValue = p.quantity < 0 ? -marketValueAbs : marketValueAbs;
         
         // Parse option symbol to extract expiration date
         const parsed = parseOptionSymbol(p.symbol);
@@ -157,7 +157,9 @@ export const tradierApi = {
           // costBasis from Tradier is already total dollars (e.g., -38 for short position)
           costBasis: p.cost_basis,
           // currentValue is total dollars (sign matches position direction)
-          currentValue: perContractPrice > 0 ? signedMarketValue : p.cost_basis,
+          currentValue: markPrice > 0 ? signedMarketValue : p.cost_basis,
+          // markPrice is per-contract price for display (e.g., $0.38)
+          markPrice: markPrice > 0 ? markPrice : undefined,
           status: 'open' as const,
           entryTime: new Date(p.date_acquired),
           expirationDate: parsed?.expiration,
@@ -165,7 +167,7 @@ export const tradierApi = {
           // Include raw Tradier values for debugging
           _rawTradier: {
             cost_basis: p.cost_basis,
-            market_value: perContractPrice > 0 ? signedMarketValue : undefined,
+            market_value: markPrice > 0 ? signedMarketValue : undefined,
             quantity: p.quantity,
           },
         };

@@ -8,6 +8,8 @@ export interface Position {
   costBasis: number;
   /** Total dollar current market value (already includes qty × multiplier) */
   currentValue: number;
+  /** Per-contract mark price (mid of bid/ask or last) - NOT multiplied by qty or 100 */
+  markPrice?: number;
   expirationDate?: string;
   strategyName?: string;
   strategyType?: string;
