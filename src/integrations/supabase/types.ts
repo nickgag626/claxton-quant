@@ -47,6 +47,42 @@ export type Database = {
         }
         Relationships: []
       }
+      position_group_map: {
+        Row: {
+          created_at: string
+          expiration: string | null
+          id: string
+          open_order_id: string
+          strategy_name: string | null
+          strategy_type: string | null
+          symbol: string
+          trade_group_id: string
+          underlying: string
+        }
+        Insert: {
+          created_at?: string
+          expiration?: string | null
+          id?: string
+          open_order_id: string
+          strategy_name?: string | null
+          strategy_type?: string | null
+          symbol: string
+          trade_group_id: string
+          underlying: string
+        }
+        Update: {
+          created_at?: string
+          expiration?: string | null
+          id?: string
+          open_order_id?: string
+          strategy_name?: string | null
+          strategy_type?: string | null
+          symbol?: string
+          trade_group_id?: string
+          underlying?: string
+        }
+        Relationships: []
+      }
       settings: {
         Row: {
           created_at: string
