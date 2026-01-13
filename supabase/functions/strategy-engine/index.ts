@@ -113,8 +113,14 @@ interface EvaluationResult {
   };
 }
 
-// Helper: Get current ET time
-function getETTime(): { now: Date; timeStr: string; dateStr: string } {
+// Helper: Get current ET time with full provenance
+function getETTime(): { 
+  now: Date; 
+  timeStr: string; 
+  dateStr: string; 
+  isoET: string;
+  utcIso: string;
+} {
   const now = new Date();
   const etOptions: Intl.DateTimeFormatOptions = { 
     timeZone: 'America/New_York', 
@@ -136,30 +142,62 @@ function getETTime(): { now: Date; timeStr: string; dateStr: string } {
   });
   const dateStr = dateFormatter.format(now);
   
-  return { now, timeStr, dateStr };
+  // Full ISO in ET for storage
+  const fullFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const isoET = fullFormatter.format(now).replace(', ', 'T');
+  
+  return { now, timeStr, dateStr, isoET, utcIso: now.toISOString() };
 }
 
-// Evaluate a single strategy with full trace
+// Evaluate a single strategy with full trace - ALWAYS emits all gates
 async function evaluateStrategyWithTrace(
   strategy: Strategy,
   marketState: string,
   positions: any[],
   apiToken: string,
-  baseUrl: string
+  baseUrl: string,
+  evalOptions?: { overrideMarketStatus?: string }
 ): Promise<EvaluationResult> {
   const gates: Gate[] = [];
-  const { timeStr, dateStr } = getETTime();
+  const { timeStr, dateStr, isoET, utcIso } = getETTime();
   const today = new Date();
   
-  // Get delta target (support both old and new field names)
+  // Determine effective market state (support override for testing)
+  const effectiveMarketState = evalOptions?.overrideMarketStatus || marketState;
+  const isMarketOverridden = !!evalOptions?.overrideMarketStatus;
+  
+  // Get delta target (support both old and new field names) with provenance
+  const usedDeltaField = strategy.entryConditions.shortDeltaTarget !== undefined 
+    ? 'shortDeltaTarget' 
+    : strategy.entryConditions.maxDelta !== undefined 
+    ? 'maxDelta (legacy)' 
+    : 'default (0.16)';
   const shortDeltaTarget = strategy.entryConditions.shortDeltaTarget ?? strategy.entryConditions.maxDelta ?? 0.16;
   const longDeltaTarget = strategy.entryConditions.longDeltaTarget;
   
-  // Initialize inputs
+  // Initialize inputs with full clock provenance
   const inputs: EvaluationResult['inputs'] = {
     market: {
       now_et: `${dateStr} ${timeStr}`,
+      now_et_iso: isoET,
+      now_utc_iso: utcIso,
       underlying: strategy.underlying,
+      clock_source: 'tradier_clock',
+      clock_state_raw: marketState,
+      clock_state_effective: effectiveMarketState,
+      market_override_applied: isMarketOverridden,
+      strategy_startTime: strategy.entryConditions.startTime || null,
+      strategy_endTime: strategy.entryConditions.endTime || null,
+      marketHoursOnly: strategy.entryConditions.marketHoursOnly,
     },
     account: {
       open_positions_count: 0,
@@ -167,33 +205,49 @@ async function evaluateStrategyWithTrace(
     },
   };
   
+  // Track if we hit a hard stop (for downstream gates)
+  let hardStop = false;
+  let hardStopReason = '';
+  
   // GATE 1: Market Hours
+  const marketHoursPass = !strategy.entryConditions.marketHoursOnly || effectiveMarketState === 'open';
   const marketHoursGate: Gate = {
     name: 'Market Hours',
     expected: strategy.entryConditions.marketHoursOnly ? 'market open' : 'any',
-    actual: marketState,
-    pass: !strategy.entryConditions.marketHoursOnly || marketState === 'open',
-    reason: strategy.entryConditions.marketHoursOnly && marketState !== 'open' 
-      ? `Market is ${marketState}, requires open` 
+    actual: { 
+      raw_state: marketState, 
+      effective_state: effectiveMarketState,
+      override_applied: isMarketOverridden,
+      marketHoursOnly: strategy.entryConditions.marketHoursOnly,
+    },
+    pass: marketHoursPass,
+    reason: !marketHoursPass 
+      ? `Market is ${effectiveMarketState}, requires open` 
       : undefined,
   };
   gates.push(marketHoursGate);
   
-  if (!marketHoursGate.pass) {
-    return { decision: 'SKIP', reason: marketHoursGate.reason!, gates, inputs };
+  if (!marketHoursPass) {
+    hardStop = true;
+    hardStopReason = 'market_closed';
   }
   
-  // GATE 2: Time Window (ET)
+  // GATE 2: Time Window (ET) - evaluate even if hard stop
   let timeWindowPass = true;
   let timeWindowReason: string | undefined;
   
-  if (strategy.entryConditions.startTime && timeStr < strategy.entryConditions.startTime) {
+  if (hardStop) {
     timeWindowPass = false;
-    timeWindowReason = `Current time ${timeStr} is before start time ${strategy.entryConditions.startTime}`;
-  }
-  if (strategy.entryConditions.endTime && timeStr > strategy.entryConditions.endTime) {
-    timeWindowPass = false;
-    timeWindowReason = `Current time ${timeStr} is after end time ${strategy.entryConditions.endTime}`;
+    timeWindowReason = `skipped_due_to_${hardStopReason}`;
+  } else {
+    if (strategy.entryConditions.startTime && timeStr < strategy.entryConditions.startTime) {
+      timeWindowPass = false;
+      timeWindowReason = `Current time ${timeStr} is before start time ${strategy.entryConditions.startTime}`;
+    }
+    if (strategy.entryConditions.endTime && timeStr > strategy.entryConditions.endTime) {
+      timeWindowPass = false;
+      timeWindowReason = `Current time ${timeStr} is after end time ${strategy.entryConditions.endTime}`;
+    }
   }
   
   const timeWindowGate: Gate = {
@@ -201,14 +255,15 @@ async function evaluateStrategyWithTrace(
     expected: strategy.entryConditions.startTime && strategy.entryConditions.endTime 
       ? `${strategy.entryConditions.startTime} - ${strategy.entryConditions.endTime}`
       : 'any',
-    actual: { current_time: timeStr },
+    actual: { current_time: timeStr, startTime: strategy.entryConditions.startTime, endTime: strategy.entryConditions.endTime },
     pass: timeWindowPass,
     reason: timeWindowReason,
   };
   gates.push(timeWindowGate);
   
-  if (!timeWindowGate.pass) {
-    return { decision: 'SKIP', reason: timeWindowGate.reason!, gates, inputs };
+  if (!timeWindowPass && !hardStop) {
+    hardStop = true;
+    hardStopReason = 'time_window';
   }
   
   // GATE 3: Max Positions
@@ -218,283 +273,376 @@ async function evaluateStrategyWithTrace(
   const openPositionsCount = strategyPositions.length;
   inputs.account.open_positions_count = openPositionsCount;
   
+  let maxPositionsPass = openPositionsCount < strategy.maxPositions;
+  let maxPositionsReason: string | undefined;
+  
+  if (hardStop) {
+    maxPositionsPass = false;
+    maxPositionsReason = `skipped_due_to_${hardStopReason}`;
+  } else if (!maxPositionsPass) {
+    maxPositionsReason = `Position limit reached (${openPositionsCount}/${strategy.maxPositions})`;
+  }
+  
   const maxPositionsGate: Gate = {
     name: 'Max Positions',
     expected: `open < ${strategy.maxPositions}`,
     actual: { open: openPositionsCount, max: strategy.maxPositions },
-    pass: openPositionsCount < strategy.maxPositions,
-    reason: openPositionsCount >= strategy.maxPositions 
-      ? `Position limit reached (${openPositionsCount}/${strategy.maxPositions})`
-      : undefined,
+    pass: maxPositionsPass,
+    reason: maxPositionsReason,
   };
   gates.push(maxPositionsGate);
   
-  if (!maxPositionsGate.pass) {
-    return { decision: 'SKIP', reason: maxPositionsGate.reason!, gates, inputs };
+  if (!maxPositionsPass && !hardStop) {
+    hardStop = true;
+    hardStopReason = 'max_positions';
   }
   
-  // Fetch option expirations
+  // Fetch option data (only if not hard stopped)
   const headers = {
     'Authorization': `Bearer ${apiToken}`,
     'Accept': 'application/json',
   };
   
   let expirations: string[] = [];
-  try {
-    const expResponse = await fetch(
-      `${baseUrl}/markets/options/expirations?symbol=${strategy.underlying}`,
-      { headers }
-    );
-    const expData = await expResponse.json();
-    expirations = expData?.expirations?.date || [];
-  } catch (error) {
-    const dataGate: Gate = {
-      name: 'Expiration Data',
-      expected: 'available',
-      actual: 'fetch failed',
-      pass: false,
-      reason: 'Could not fetch expirations - data unavailable',
-    };
-    gates.push(dataGate);
-    return { decision: 'SKIP', reason: dataGate.reason!, gates, inputs };
-  }
-  
-  // GATE 4: DTE Range
+  let optionChain: OptionContract[] = [];
+  let underlyingPrice: number | null = null;
   let targetExpiration: string | null = null;
   let selectedDte: number | null = null;
+  let dataFetchError = false;
   
-  for (const exp of expirations) {
-    const expDate = new Date(exp);
-    const dte = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-    if (dte >= strategy.entryConditions.minDte && dte <= strategy.entryConditions.maxDte) {
-      targetExpiration = exp;
-      selectedDte = dte;
-      break;
+  if (!hardStop) {
+    try {
+      const expResponse = await fetch(
+        `${baseUrl}/markets/options/expirations?symbol=${strategy.underlying}`,
+        { headers }
+      );
+      const expData = await expResponse.json();
+      expirations = expData?.expirations?.date || [];
+    } catch (error) {
+      dataFetchError = true;
+    }
+    
+    // Find target expiration
+    const today = new Date();
+    for (const exp of expirations) {
+      const expDate = new Date(exp);
+      const dte = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+      if (dte >= strategy.entryConditions.minDte && dte <= strategy.entryConditions.maxDte) {
+        targetExpiration = exp;
+        selectedDte = dte;
+        break;
+      }
+    }
+    
+    inputs.market.dte_selected = selectedDte;
+    inputs.market.expiration_selected = targetExpiration;
+    
+    // Fetch option chain if we have an expiration
+    if (targetExpiration) {
+      try {
+        const chainResponse = await fetch(
+          `${baseUrl}/markets/options/chains?symbol=${strategy.underlying}&expiration=${targetExpiration}&greeks=true`,
+          { headers }
+        );
+        const chainData = await chainResponse.json();
+        optionChain = chainData?.options?.option || [];
+        
+        // Get underlying price
+        const quoteResponse = await fetch(
+          `${baseUrl}/markets/quotes?symbols=${strategy.underlying}`,
+          { headers }
+        );
+        const quoteData = await quoteResponse.json();
+        underlyingPrice = quoteData?.quotes?.quote?.last || quoteData?.quotes?.quote?.close;
+        inputs.market.underlying_price = underlyingPrice;
+      } catch (error) {
+        dataFetchError = true;
+      }
     }
   }
   
-  inputs.market.dte_selected = selectedDte;
-  inputs.market.expiration_selected = targetExpiration;
+  // GATE 4: DTE Range
+  let dtePass = targetExpiration !== null;
+  let dteReason: string | undefined;
+  
+  if (hardStop) {
+    dtePass = false;
+    dteReason = `skipped_due_to_${hardStopReason}`;
+  } else if (!dtePass) {
+    dteReason = dataFetchError 
+      ? 'Could not fetch expirations - data unavailable'
+      : `No expiration found in DTE range ${strategy.entryConditions.minDte}-${strategy.entryConditions.maxDte}`;
+  }
   
   const dteGate: Gate = {
     name: 'DTE Range',
     expected: `${strategy.entryConditions.minDte} - ${strategy.entryConditions.maxDte}`,
-    actual: selectedDte !== null ? { dte: selectedDte, expiration: targetExpiration } : 'no expiration found',
-    pass: targetExpiration !== null,
-    reason: !targetExpiration ? `No expiration found in DTE range ${strategy.entryConditions.minDte}-${strategy.entryConditions.maxDte}` : undefined,
+    actual: selectedDte !== null 
+      ? { dte: selectedDte, expiration: targetExpiration, available_expirations: expirations.slice(0, 5) } 
+      : { available_expirations: expirations.slice(0, 5), error: dataFetchError ? 'fetch_failed' : 'no_match' },
+    pass: dtePass,
+    reason: dteReason,
   };
   gates.push(dteGate);
   
-  if (!dteGate.pass) {
-    return { decision: 'SKIP', reason: dteGate.reason!, gates, inputs };
-  }
-  
-  // Fetch option chain
-  let options: OptionContract[] = [];
-  let underlyingPrice: number | null = null;
-  
-  try {
-    const chainResponse = await fetch(
-      `${baseUrl}/markets/options/chains?symbol=${strategy.underlying}&expiration=${targetExpiration}&greeks=true`,
-      { headers }
-    );
-    const chainData = await chainResponse.json();
-    options = chainData?.options?.option || [];
-    
-    // Get underlying price
-    const quoteResponse = await fetch(
-      `${baseUrl}/markets/quotes?symbols=${strategy.underlying}`,
-      { headers }
-    );
-    const quoteData = await quoteResponse.json();
-    underlyingPrice = quoteData?.quotes?.quote?.last || quoteData?.quotes?.quote?.close;
-    inputs.market.underlying_price = underlyingPrice;
-  } catch (error) {
-    const dataGate: Gate = {
-      name: 'Option Chain Data',
-      expected: 'available',
-      actual: 'fetch failed',
-      pass: false,
-      reason: 'Could not fetch option chain - data unavailable',
-    };
-    gates.push(dataGate);
-    return { decision: 'SKIP', reason: dataGate.reason!, gates, inputs };
-  }
-  
-  if (options.length === 0) {
-    const chainGate: Gate = {
-      name: 'Option Chain Data',
-      expected: 'options available',
-      actual: 'empty chain',
-      pass: false,
-      reason: 'Option chain is empty',
-    };
-    gates.push(chainGate);
-    return { decision: 'SKIP', reason: chainGate.reason!, gates, inputs };
+  if (!dtePass && !hardStop) {
+    hardStop = true;
+    hardStopReason = 'dte_range';
   }
   
   // GATE 5: Delta Selection (Short Strike)
-  const puts = options.filter(o => 
+  const puts = optionChain.filter((o: OptionContract) => 
     o.option_type === 'put' && o.greeks && o.bid > 0
-  ).sort((a, b) => Math.abs(a.greeks!.delta) - Math.abs(shortDeltaTarget) - (Math.abs(b.greeks!.delta) - Math.abs(shortDeltaTarget)));
-  
-  const calls = options.filter(o => 
+  );
+  const calls = optionChain.filter((o: OptionContract) => 
     o.option_type === 'call' && o.greeks && o.bid > 0
-  ).sort((a, b) => Math.abs(a.greeks!.delta) - Math.abs(shortDeltaTarget) - (Math.abs(b.greeks!.delta) - Math.abs(shortDeltaTarget)));
+  );
   
-  // Find closest to target delta
-  const shortPut = puts.find(p => p.greeks && Math.abs(p.greeks.delta) <= shortDeltaTarget + 0.05);
-  const shortCall = calls.find(c => c.greeks && Math.abs(c.greeks.delta) <= shortDeltaTarget + 0.05);
+  const shortPut = puts.find((p: OptionContract) => p.greeks && Math.abs(p.greeks.delta) <= shortDeltaTarget + 0.05);
+  const shortCall = calls.find((c: OptionContract) => c.greeks && Math.abs(c.greeks.delta) <= shortDeltaTarget + 0.05);
+  
+  let shortDeltaPass = true;
+  if (strategy.type.includes('put') && !shortPut) shortDeltaPass = false;
+  if (strategy.type.includes('call') && !shortCall) shortDeltaPass = false;
+  if (['iron_condor', 'strangle', 'straddle', 'iron_fly'].includes(strategy.type) && (!shortPut || !shortCall)) {
+    shortDeltaPass = false;
+  }
+  
+  let shortDeltaReason: string | undefined;
+  if (hardStop) {
+    shortDeltaPass = false;
+    shortDeltaReason = `skipped_due_to_${hardStopReason}`;
+  } else if (!shortDeltaPass) {
+    shortDeltaReason = optionChain.length === 0 
+      ? 'Option chain unavailable'
+      : 'No strikes found matching delta target';
+  }
   
   const shortDeltaGate: Gate = {
     name: 'Short Delta Target',
     expected: `|delta| ≤ ${shortDeltaTarget}`,
     actual: {
+      usedField: usedDeltaField,
+      shortDeltaTarget,
       put: shortPut ? { strike: shortPut.strike, delta: shortPut.greeks?.delta } : 'not found',
       call: shortCall ? { strike: shortCall.strike, delta: shortCall.greeks?.delta } : 'not found',
+      chain_size: optionChain.length,
     },
-    pass: (strategy.type.includes('put') ? !!shortPut : true) && (strategy.type.includes('call') ? !!shortCall : true) && (strategy.type === 'iron_condor' || strategy.type === 'strangle' || strategy.type === 'straddle' || strategy.type === 'iron_fly' ? !!shortPut && !!shortCall : true),
-    reason: !shortPut && !shortCall ? 'No strikes found matching delta target' : undefined,
+    pass: shortDeltaPass,
+    reason: shortDeltaReason,
   };
   gates.push(shortDeltaGate);
   
-  // Build proposed order based on strategy type
-  const proposedOrder = buildProposedOrder(strategy, options, shortDeltaTarget, longDeltaTarget);
+  // Build proposed order based on strategy type (even if we won't use it)
+  const proposedOrder = !hardStop && optionChain.length > 0 
+    ? buildProposedOrder(strategy, optionChain, shortDeltaTarget, longDeltaTarget)
+    : null;
   
   // GATE 6: Long Delta Target (for spreads)
-  if (longDeltaTarget !== undefined && proposedOrder) {
-    const longLegs = proposedOrder.legs.filter(l => l.side.includes('buy'));
-    const longDeltaGate: Gate = {
-      name: 'Long Delta Target',
-      expected: `|delta| ≤ ${longDeltaTarget}`,
-      actual: longLegs.length > 0 
-        ? { legs: longLegs.map(l => ({ strike: l.strike, delta: l.delta })) }
-        : 'no long legs',
-      pass: longLegs.length > 0 || !['iron_condor', 'credit_put_spread', 'credit_call_spread', 'iron_fly'].includes(strategy.type),
-    };
-    gates.push(longDeltaGate);
+  let longDeltaPass = true;
+  let longDeltaReason: string | undefined;
+  const longLegs = proposedOrder?.legs.filter((l: any) => l.side.includes('buy')) || [];
+  
+  if (longDeltaTarget !== undefined) {
+    if (hardStop) {
+      longDeltaPass = false;
+      longDeltaReason = `skipped_due_to_${hardStopReason}`;
+    } else if (['iron_condor', 'credit_put_spread', 'credit_call_spread', 'iron_fly'].includes(strategy.type) && longLegs.length === 0) {
+      longDeltaPass = false;
+      longDeltaReason = 'No long strikes found for spread';
+    }
   }
+  
+  const longDeltaGate: Gate = {
+    name: 'Long Delta Target',
+    expected: longDeltaTarget !== undefined ? `|delta| ≤ ${longDeltaTarget}` : 'not configured',
+    actual: longDeltaTarget !== undefined
+      ? { longDeltaTarget, legs: longLegs.map((l: any) => ({ strike: l.strike, delta: l.delta })) }
+      : { configured: false },
+    pass: longDeltaPass,
+    reason: longDeltaReason,
+  };
+  gates.push(longDeltaGate);
   
   // GATE 7: Premium Filter
+  const estimatedCredit = proposedOrder?.estimated_credit || 0;
+  let premiumPass = true;
+  let premiumReason: string | undefined;
+  
   if (strategy.entryConditions.minPremium) {
-    const estimatedCredit = proposedOrder?.estimated_credit || 0;
-    const premiumGate: Gate = {
-      name: 'Minimum Premium',
-      expected: `credit ≥ $${strategy.entryConditions.minPremium}`,
-      actual: { estimated_credit: estimatedCredit },
-      pass: estimatedCredit >= strategy.entryConditions.minPremium,
-      reason: estimatedCredit < strategy.entryConditions.minPremium 
-        ? `Credit $${estimatedCredit.toFixed(2)} below minimum $${strategy.entryConditions.minPremium}`
-        : undefined,
-    };
-    gates.push(premiumGate);
-    
-    if (!premiumGate.pass) {
-      return { decision: 'SKIP', reason: premiumGate.reason!, gates, inputs, proposedOrder: proposedOrder || undefined };
+    if (hardStop) {
+      premiumPass = false;
+      premiumReason = `skipped_due_to_${hardStopReason}`;
+    } else if (estimatedCredit < strategy.entryConditions.minPremium) {
+      premiumPass = false;
+      premiumReason = `Credit $${estimatedCredit.toFixed(2)} below minimum $${strategy.entryConditions.minPremium}`;
     }
   }
   
-  // GATE 8: IV Rank Filter (if enabled)
-  if (strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined) {
-    // Note: IV rank requires historical data - mark as unavailable if not accessible
-    const ivGate: Gate = {
-      name: 'IV Rank Filter',
-      expected: `${strategy.entryConditions.minIvRank ?? 0}% - ${strategy.entryConditions.maxIvRank ?? 100}%`,
-      actual: 'data unavailable',
-      pass: false,
-      reason: 'IV rank data not available from broker API - gate FAILED',
-    };
-    gates.push(ivGate);
-    // Don't fail on IV if data unavailable - just log it
+  const premiumGate: Gate = {
+    name: 'Premium Filter',
+    expected: strategy.entryConditions.minPremium 
+      ? `credit ≥ $${strategy.entryConditions.minPremium}` 
+      : 'not configured',
+    actual: { 
+      configured: !!strategy.entryConditions.minPremium,
+      minPremium: strategy.entryConditions.minPremium || null,
+      estimated_credit: estimatedCredit 
+    },
+    pass: premiumPass,
+    reason: premiumReason,
+  };
+  gates.push(premiumGate);
+  
+  if (!premiumPass && !hardStop && strategy.entryConditions.minPremium) {
+    hardStop = true;
+    hardStopReason = 'premium_filter';
   }
+  
+  // GATE 8: IV Rank Filter
+  let ivPass = true;
+  let ivReason: string | undefined;
+  
+  if (strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined) {
+    if (hardStop) {
+      ivPass = false;
+      ivReason = `skipped_due_to_${hardStopReason}`;
+    } else {
+      // IV rank requires historical data - not available from Tradier options endpoint
+      ivPass = false;
+      ivReason = 'IV rank data not available from broker API';
+    }
+  }
+  
+  const ivGate: Gate = {
+    name: 'IV Rank Filter',
+    expected: strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined
+      ? `${strategy.entryConditions.minIvRank ?? 0}% - ${strategy.entryConditions.maxIvRank ?? 100}%`
+      : 'not configured',
+    actual: {
+      configured: strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined,
+      minIvRank: strategy.entryConditions.minIvRank ?? null,
+      maxIvRank: strategy.entryConditions.maxIvRank ?? null,
+      iv_data: 'unavailable',
+    },
+    pass: strategy.entryConditions.minIvRank === undefined && strategy.entryConditions.maxIvRank === undefined ? true : ivPass,
+    reason: ivReason,
+  };
+  gates.push(ivGate);
   
   // GATE 9: Risk Sizing
+  let sizingPass = true;
+  let sizingReason: string | undefined;
+  let computedContracts = strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1;
+  
   if (strategy.sizing?.mode === 'risk' && strategy.sizing.riskPerTrade) {
     const maxLoss = proposedOrder?.estimated_max_loss || 0;
-    const computedContracts = maxLoss > 0 
-      ? Math.floor(strategy.sizing.riskPerTrade / maxLoss)
-      : 1;
-    const cappedContracts = Math.min(
-      computedContracts, 
-      strategy.sizing.maxContracts || 10
-    );
-    
-    const sizingGate: Gate = {
-      name: 'Risk-Based Sizing',
-      expected: `risk/trade = $${strategy.sizing.riskPerTrade}, max contracts = ${strategy.sizing.maxContracts || 10}`,
-      actual: { 
-        max_loss_per_contract: maxLoss, 
-        computed_contracts: computedContracts,
-        capped_contracts: cappedContracts 
-      },
-      pass: cappedContracts >= 1,
-      reason: cappedContracts < 1 ? 'Risk sizing resulted in 0 contracts' : undefined,
-    };
-    gates.push(sizingGate);
-    
-    if (proposedOrder) {
-      proposedOrder.sizing_result = {
-        mode: 'risk',
-        computed_contracts: cappedContracts,
-        risk_per_trade: strategy.sizing.riskPerTrade,
-      };
-      // Update leg quantities
-      proposedOrder.legs.forEach(leg => {
-        leg.quantity = cappedContracts;
-      });
+    if (hardStop) {
+      sizingPass = false;
+      sizingReason = `skipped_due_to_${hardStopReason}`;
+      computedContracts = 0;
+    } else if (maxLoss <= 0) {
+      sizingPass = false;
+      sizingReason = 'Cannot compute risk sizing - max loss unknown';
+      computedContracts = 0;
+    } else {
+      computedContracts = Math.floor(strategy.sizing.riskPerTrade / maxLoss);
+      computedContracts = Math.min(computedContracts, strategy.sizing.maxContracts || 10);
+      if (computedContracts < 1) {
+        sizingPass = false;
+        sizingReason = 'Risk sizing resulted in 0 contracts';
+      }
     }
-  } else {
-    // Fixed sizing
-    const fixedContracts = strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1;
-    const sizingGate: Gate = {
-      name: 'Fixed Sizing',
-      expected: `${fixedContracts} contracts`,
-      actual: { contracts: fixedContracts },
-      pass: true,
-    };
-    gates.push(sizingGate);
-    
-    if (proposedOrder) {
-      proposedOrder.sizing_result = {
-        mode: 'fixed',
-        computed_contracts: fixedContracts,
-      };
-    }
+  } else if (hardStop) {
+    sizingPass = false;
+    sizingReason = `skipped_due_to_${hardStopReason}`;
   }
   
-  // GATE 10: MA Filter (if enabled)
+  const sizingGate: Gate = {
+    name: 'Risk Sizing',
+    expected: strategy.sizing?.mode === 'risk' 
+      ? `risk/trade = $${strategy.sizing.riskPerTrade}, max = ${strategy.sizing.maxContracts || 10}`
+      : `fixed = ${strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1}`,
+    actual: {
+      mode: strategy.sizing?.mode || 'fixed',
+      computed_contracts: computedContracts,
+      riskPerTrade: strategy.sizing?.riskPerTrade || null,
+      maxContracts: strategy.sizing?.maxContracts || null,
+      fixedContracts: strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1,
+      estimated_max_loss: proposedOrder?.estimated_max_loss || null,
+    },
+    pass: sizingPass,
+    reason: sizingReason,
+  };
+  gates.push(sizingGate);
+  
+  // Update proposed order quantities if sizing passed
+  if (proposedOrder && sizingPass && computedContracts > 0) {
+    proposedOrder.sizing_result = {
+      mode: strategy.sizing?.mode || 'fixed',
+      computed_contracts: computedContracts,
+      risk_per_trade: strategy.sizing?.riskPerTrade,
+    };
+    proposedOrder.legs.forEach((leg: any) => {
+      leg.quantity = computedContracts;
+    });
+  }
+  
+  // GATE 10: MA Filter
+  let maPass = true;
+  let maReason: string | undefined;
+  
   if (strategy.entryConditions.maFilter?.enabled && strategy.entryConditions.maFilter.rules?.length) {
-    // Note: MA calculation requires historical data
-    const maGate: Gate = {
-      name: 'Moving Average Filter',
-      expected: strategy.entryConditions.maFilter.rules.map(r => `${r.left} ${r.op} ${r.right}`).join(' AND '),
-      actual: 'data unavailable - requires historical bars',
-      pass: false,
-      reason: 'MA filter requires historical price data not available from Tradier options endpoint',
-    };
-    gates.push(maGate);
-    // Don't fail entry on MA if data unavailable - log it
+    if (hardStop) {
+      maPass = false;
+      maReason = `skipped_due_to_${hardStopReason}`;
+    } else {
+      // MA calculation requires historical data
+      maPass = false;
+      maReason = 'MA filter requires historical price data not available from Tradier options endpoint';
+    }
   }
   
-  // Record chain slice in inputs
+  const maGate: Gate = {
+    name: 'MA Filter',
+    expected: strategy.entryConditions.maFilter?.enabled 
+      ? strategy.entryConditions.maFilter.rules?.map((r: any) => `${r.left} ${r.op} ${r.right}`).join(' AND ') || 'enabled'
+      : 'not configured',
+    actual: {
+      configured: !!strategy.entryConditions.maFilter?.enabled,
+      rules: strategy.entryConditions.maFilter?.rules || [],
+      sma_data: 'unavailable',
+      underlying_price: underlyingPrice,
+    },
+    pass: !strategy.entryConditions.maFilter?.enabled || maPass,
+    reason: maReason,
+  };
+  gates.push(maGate);
+  
+  // Record chain slice in inputs if available
   if (proposedOrder?.legs) {
-    inputs.market.chain_slice = proposedOrder.legs.map(leg => ({
+    inputs.market.chain_slice = proposedOrder.legs.map((leg: any) => ({
       symbol: leg.option_symbol,
       strike: leg.strike,
       delta: leg.delta,
-      bid: 0, // Would need to look up
-      ask: 0,
-      option_type: leg.role.includes('put') ? 'put' : 'call',
+      role: leg.role,
+      side: leg.side,
     }));
   }
   
-  // Check if all critical gates passed
-  const failedGates = gates.filter(g => !g.pass && !g.name.includes('IV') && !g.name.includes('MA'));
+  // Determine final decision
+  const criticalGates = gates.filter(g => 
+    !g.pass && 
+    !g.name.includes('IV') && 
+    !g.name.includes('MA') &&
+    !g.reason?.startsWith('skipped_due_to')
+  );
   
-  if (failedGates.length > 0) {
+  if (hardStop || criticalGates.length > 0) {
+    const firstFail = gates.find(g => !g.pass && !g.reason?.startsWith('skipped_due_to'));
     return { 
       decision: 'SKIP', 
-      reason: failedGates[0].reason || `Gate failed: ${failedGates[0].name}`, 
+      reason: firstFail?.reason || `Hard stop: ${hardStopReason}`, 
       gates, 
       inputs,
       proposedOrder: proposedOrder || undefined 
@@ -693,7 +841,7 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl!, supabaseKey!);
     const body = await req.json();
-    const { action, strategies, positions, strategyId } = body;
+    const { action, strategies, positions, strategyId, overrideMarketStatus } = body;
 
     const baseUrl = 'https://sandbox.tradier.com/v1';
     const headers = {
@@ -742,13 +890,15 @@ serve(async (req) => {
       // Fetch current positions (if any)
       const currentPositions: any[] = positions || [];
       
-      // Run evaluation with trace
+      // Run evaluation with trace (support override for testing)
+      const evalOptions = overrideMarketStatus ? { overrideMarketStatus } : undefined;
       const result = await evaluateStrategyWithTrace(
         strategy,
         marketState,
         currentPositions,
         apiToken,
-        baseUrl
+        baseUrl,
+        evalOptions
       );
       
       // Save evaluation to DB

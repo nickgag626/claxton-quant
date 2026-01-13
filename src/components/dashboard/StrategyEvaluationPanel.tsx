@@ -20,6 +20,7 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
   const [isLoading, setIsLoading] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [simulateOpen, setSimulateOpen] = useState(false);
 
   const loadEvaluation = async () => {
     setIsLoading(true);
@@ -35,10 +36,11 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
   const handleRunEvaluation = async () => {
     setIsRunning(true);
     try {
-      const result = await evaluationService.runEvaluation(strategyId);
+      const options = simulateOpen ? { overrideMarketStatus: 'open' } : undefined;
+      const result = await evaluationService.runEvaluation(strategyId, options);
       if (result) {
         setEvaluation(result);
-        toast.success('Evaluation completed');
+        toast.success(simulateOpen ? 'Evaluation completed (simulated market open)' : 'Evaluation completed');
       } else {
         toast.error('Evaluation failed');
       }
@@ -98,6 +100,15 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
           )}
         </div>
         <div className="flex items-center gap-2">
+          <label className="flex items-center gap-1 text-[9px] text-muted-foreground cursor-pointer" onClick={(e) => e.stopPropagation()}>
+            <input 
+              type="checkbox" 
+              checked={simulateOpen} 
+              onChange={(e) => setSimulateOpen(e.target.checked)}
+              className="w-3 h-3"
+            />
+            Simulate Open
+          </label>
           <Button
             variant="ghost"
             size="sm"
