@@ -4,6 +4,7 @@ import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/servi
 import { strategyEngine } from '@/services/strategyEngine';
 import { tradeJournal, TradeRecord } from '@/services/tradeJournal';
 import { settingsService } from '@/services/settingsService';
+import { toast } from '@/hooks/use-toast';
 import type {
   Position, 
   Greeks, 
@@ -1147,6 +1148,21 @@ export const useTradingData = () => {
                 });
               });
               return newMap;
+            });
+          } else if (execResult.blocked === 'cooldown') {
+            addActivity('RISK', `Entry blocked (cooldown): ${signal.strategyName} - wait 2 minutes`);
+            toast({
+              title: "Entry Blocked - Cooldown",
+              description: `${signal.strategyName} entry blocked due to recent rejection. Wait 2 minutes before retry.`,
+              variant: "destructive",
+            });
+          } else if (execResult.blocked === 'conflict') {
+            const conflictSymbols = execResult.conflicts?.map(c => c.symbol).join(', ') || 'unknown';
+            addActivity('RISK', `Entry blocked (conflict): ${signal.strategyName} - ${conflictSymbols}`);
+            toast({
+              title: "Entry Blocked - Position Conflict",
+              description: `Cannot open ${signal.strategyName}: existing positions on ${conflictSymbols}. Close/flatten first.`,
+              variant: "destructive",
             });
           } else {
             addActivity('RISK', `Order failed: ${execResult.error}`);

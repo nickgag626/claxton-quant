@@ -49,6 +49,14 @@ export const strategyEngine = {
     success: boolean;
     orderId?: string;
     error?: string;
+    blocked?: 'cooldown' | 'conflict';
+    conflicts?: Array<{
+      symbol: string;
+      proposedSide: string;
+      existingQty: number;
+      conflict: string;
+      resolution: string;
+    }>;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
