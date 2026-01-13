@@ -11,6 +11,50 @@ const corsHeaders = {
 const entryCooldownCache = new Map<string, number>();
 const ENTRY_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 
+// In-flight order cache: tracks recently submitted orders to prevent duplicate entries
+// Key format: underlying:expiration:sortedSymbols (symbols, not strikes, for exact match)
+// This prevents race conditions where broker positions haven't updated yet
+const inFlightOrderCache = new Map<string, number>();
+const IN_FLIGHT_ORDER_TTL_MS = 60 * 1000; // 1 minute
+
+function generateInFlightKey(underlying: string, expiration: string, legs: any[]): string {
+  // Use sorted option symbols for exact match (catches duplicate condors with same strikes)
+  const symbols = legs.map(l => l.option_symbol || l.symbol).filter(Boolean).sort().join(',');
+  return `${underlying}:${expiration}:${symbols}`;
+}
+
+function isOrderInFlight(key: string): boolean {
+  const expiry = inFlightOrderCache.get(key);
+  if (!expiry) return false;
+  if (Date.now() < expiry) return true;
+  inFlightOrderCache.delete(key);
+  return false;
+}
+
+function setOrderInFlight(key: string): void {
+  inFlightOrderCache.set(key, Date.now() + IN_FLIGHT_ORDER_TTL_MS);
+  console.log(`[IN_FLIGHT] Set order in-flight: ${key}`);
+}
+
+function getInFlightSymbols(): Set<string> {
+  // Return all symbols from orders currently in-flight
+  const symbols = new Set<string>();
+  const now = Date.now();
+  for (const [key, expiry] of inFlightOrderCache.entries()) {
+    if (now < expiry) {
+      // Extract symbols from key (format: underlying:expiration:sym1,sym2,sym3,sym4)
+      const parts = key.split(':');
+      if (parts.length >= 3) {
+        const symbolList = parts[2].split(',');
+        symbolList.forEach(s => symbols.add(s));
+      }
+    } else {
+      inFlightOrderCache.delete(key);
+    }
+  }
+  return symbols;
+}
+
 function generateEntryCooldownKey(strategyId: string, underlying: string, expiration: string, legs: any[]): string {
   const strikes = legs.map(l => l.strike).sort((a, b) => a - b).join('-');
   return `${strategyId}:${underlying}:${expiration}:${strikes}`;
@@ -1578,7 +1622,53 @@ serve(async (req) => {
         );
       }
       
-      // PREFLIGHT 2: Fetch current broker positions and check for conflicts
+      // PREFLIGHT 2: In-flight order check (prevents duplicate entries before broker updates)
+      const inFlightKey = generateInFlightKey(
+        signal.underlying,
+        signal.expiration || '',
+        signal.proposedOrder?.legs || signal.legs
+      );
+      
+      const orderInFlight = isOrderInFlight(inFlightKey);
+      gates.push({
+        name: 'In-Flight Order',
+        expected: 'no duplicate in-flight order',
+        actual: { inFlight: orderInFlight, key: inFlightKey },
+        pass: !orderInFlight,
+        reason: orderInFlight ? 'Entry blocked - identical order already in-flight (wait 1 minute)' : undefined,
+      });
+      
+      if (orderInFlight) {
+        console.log(`[PREFLIGHT] Entry blocked by in-flight order: ${inFlightKey}`);
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: 'Entry blocked - identical order already in-flight',
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            { signal, blocked: 'in_flight' },
+            effectiveTradeGroupId
+          );
+        }
+        return new Response(
+          JSON.stringify({ 
+            success: false, 
+            error: 'Entry blocked - identical order already in-flight (wait 1 minute)',
+            blocked: 'in_flight',
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // PREFLIGHT 3: Fetch current broker positions and check for conflicts
       let brokerPositions: Array<{ symbol: string; quantity: number }> = [];
       try {
         const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
@@ -1594,6 +1684,18 @@ serve(async (req) => {
         console.log(`[PREFLIGHT] Fetched ${brokerPositions.length} broker positions`);
       } catch (err) {
         console.error('[PREFLIGHT] Failed to fetch positions:', err);
+      }
+      
+      // Add in-flight symbols as virtual positions (qty=1) to prevent conflicts
+      const inFlightSymbols = getInFlightSymbols();
+      for (const symbol of inFlightSymbols) {
+        // Only add if not already in broker positions
+        if (!brokerPositions.some(p => p.symbol === symbol)) {
+          brokerPositions.push({ symbol, quantity: 1 }); // Virtual position
+        }
+      }
+      if (inFlightSymbols.size > 0) {
+        console.log(`[PREFLIGHT] Added ${inFlightSymbols.size} in-flight symbols as virtual positions`);
       }
       
       // Build position map for conflict check
@@ -1704,6 +1806,12 @@ serve(async (req) => {
         : signal;
 
       const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signalToExecute);
+      
+      // If order succeeded, set in-flight to prevent duplicate entries
+      if (orderResponse.success) {
+        setOrderInFlight(inFlightKey);
+        console.log(`[PREFLIGHT] Order succeeded, set in-flight: ${inFlightKey}`);
+      }
       
       // If order was rejected, set cooldown
       if (!orderResponse.success) {
