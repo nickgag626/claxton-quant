@@ -2176,7 +2176,11 @@ async function placeOrder(
         expiration: signal.expiration || null,
         strategyName: signal.strategyName || null,
         strategyType: signal.type || null,
-        legs: signal.legs.map((leg: any) => leg.symbol),
+        legs: signal.legs.map((leg: any) => ({
+          symbol: leg.symbol,
+          quantity: leg.quantity || 1,
+          side: leg.side || 'unknown',
+        })),
       });
     }
     
@@ -2221,7 +2225,11 @@ async function placeOrder(
       expiration: signal.expiration || null,
       strategyName: signal.strategyName || null,
       strategyType: signal.type || null,
-      legs: [leg.symbol],
+      legs: [{
+        symbol: leg.symbol,
+        quantity: leg.quantity || 1,
+        side: leg.side || 'unknown',
+      }],
     });
   }
   
@@ -2236,6 +2244,7 @@ async function placeOrder(
 /**
  * Persist symbol -> trade_group_id mapping when an entry order is placed.
  * This is the SOURCE OF TRUTH for position grouping.
+ * Stores leg_qty and leg_side for deterministic stacking support.
  */
 async function persistPositionGroupMap(
   supabaseClient: any,
@@ -2246,25 +2255,28 @@ async function persistPositionGroupMap(
     expiration: string | null;
     strategyName: string | null;
     strategyType: string | null;
-    legs: string[];
+    legs: Array<{ symbol: string; quantity: number; side: string }>;
   }
 ): Promise<void> {
   const { tradeGroupId, openOrderId, underlying, expiration, strategyName, strategyType, legs } = params;
   
-  const records = legs.map(symbol => ({
+  const records = legs.map(leg => ({
     trade_group_id: tradeGroupId,
     open_order_id: openOrderId,
-    symbol,
+    symbol: leg.symbol,
     underlying,
     expiration,
     strategy_name: strategyName,
     strategy_type: strategyType,
+    leg_qty: leg.quantity,
+    leg_side: leg.side,
   }));
   
   try {
+    // Insert each record - no upsert since same symbol can exist in multiple groups
     const { error } = await supabaseClient
       .from('position_group_map')
-      .upsert(records, { onConflict: 'open_order_id,symbol', ignoreDuplicates: true });
+      .insert(records);
     
     if (error) {
       console.error('[persistPositionGroupMap] Error inserting:', error);

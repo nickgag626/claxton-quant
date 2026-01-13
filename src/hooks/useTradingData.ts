@@ -165,6 +165,8 @@ function generateHeuristicGroupKey(pos: Position): string {
 
 /**
  * Apply trade_group_id from position_group_map (source of truth).
+ * Uses DETERMINISTIC ALLOCATION: for each symbol, allocate broker qty to group mappings
+ * in order of created_at (oldest first). This handles stacked entries correctly.
  * Falls back to STRICT heuristic grouping only if group forms valid 4L iron condor.
  * Otherwise marks positions as ungrouped (requires reconcile).
  */
@@ -175,49 +177,154 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
   
   try {
     // === SOURCE OF TRUTH: Fetch from position_group_map (set at entry time) ===
+    // Order by created_at ASC for deterministic allocation (oldest entries first)
     const { data: groupMaps, error: mapError } = await supabase
       .from('position_group_map')
-      .select('symbol, trade_group_id, strategy_name, strategy_type')
-      .in('symbol', symbols);
+      .select('symbol, trade_group_id, strategy_name, strategy_type, leg_qty, leg_side, created_at, open_order_id')
+      .in('symbol', symbols)
+      .order('created_at', { ascending: true });
 
     if (mapError) {
       console.error('Error fetching position_group_map:', mapError);
     }
 
-    // Build symbol -> group info map from position_group_map
-    const symbolToGroupInfo = new Map<string, { tradeGroupId: string; strategyName?: string; strategyType?: string }>();
+    // Build symbol -> array of group mappings (ordered by created_at ASC)
+    const symbolToMappings = new Map<string, Array<{
+      tradeGroupId: string;
+      strategyName?: string;
+      strategyType?: string;
+      legQty: number;
+      legSide?: string;
+      openOrderId: string;
+      createdAt: string;
+    }>>();
+    
     if (groupMaps) {
       groupMaps.forEach((row: any) => {
         if (row.trade_group_id) {
-          symbolToGroupInfo.set(row.symbol, {
+          const existing = symbolToMappings.get(row.symbol) || [];
+          existing.push({
             tradeGroupId: row.trade_group_id,
             strategyName: row.strategy_name,
             strategyType: row.strategy_type,
+            legQty: row.leg_qty || 1,
+            legSide: row.leg_side,
+            openOrderId: row.open_order_id,
+            createdAt: row.created_at,
           });
+          symbolToMappings.set(row.symbol, existing);
         }
       });
     }
-    console.log(`[enrichPositionsWithGroupIds] Found ${symbolToGroupInfo.size}/${symbols.length} symbols in position_group_map`);
-
-    // Apply DB-first grouping
-    const enrichedPositions = positions.map(pos => {
-      const dbInfo = symbolToGroupInfo.get(pos.symbol);
-      if (dbInfo) {
-        return { 
-          ...pos, 
-          tradeGroupId: dbInfo.tradeGroupId,
-          strategyName: pos.strategyName || dbInfo.strategyName,
-          strategyType: pos.strategyType || dbInfo.strategyType,
-        };
-      }
-      return pos;
+    
+    // Count total mapped qty per symbol for debugging
+    const totalMappedBySymbol = new Map<string, number>();
+    symbolToMappings.forEach((mappings, symbol) => {
+      totalMappedBySymbol.set(symbol, mappings.reduce((sum, m) => sum + m.legQty, 0));
     });
+    
+    console.log(`[enrichPositionsWithGroupIds] Found mappings for ${symbolToMappings.size}/${symbols.length} symbols`);
+
+    // === DETERMINISTIC ALLOCATION: Distribute broker qty to groups oldest-first ===
+    // For each broker position, allocate its quantity to group mappings in order
+    // This creates "virtual" position records for each allocation
+    const allocatedPositions: Position[] = [];
+    
+    for (const pos of positions) {
+      const mappings = symbolToMappings.get(pos.symbol);
+      
+      if (!mappings || mappings.length === 0) {
+        // No mapping found - leave as ungrouped
+        allocatedPositions.push(pos);
+        continue;
+      }
+      
+      // Total broker quantity (absolute value for allocation)
+      let remainingQty = Math.abs(pos.quantity);
+      const qtySign = pos.quantity < 0 ? -1 : 1;
+      
+      // Calculate total mapped qty for this symbol
+      const totalMappedQty = mappings.reduce((sum, m) => sum + m.legQty, 0);
+      
+      if (mappings.length === 1) {
+        // Single mapping - straightforward assignment
+        const mapping = mappings[0];
+        allocatedPositions.push({
+          ...pos,
+          tradeGroupId: mapping.tradeGroupId,
+          strategyName: pos.strategyName || mapping.strategyName,
+          strategyType: pos.strategyType || mapping.strategyType,
+        });
+      } else if (totalMappedQty === remainingQty) {
+        // Mapped qty matches broker qty exactly - split into separate position entries
+        for (const mapping of mappings) {
+          if (mapping.legQty <= 0) continue;
+          
+          // Pro-rata cost/value allocation
+          const fraction = mapping.legQty / totalMappedQty;
+          
+          allocatedPositions.push({
+            ...pos,
+            // Create unique ID for each allocation
+            id: `${pos.id}-${mapping.openOrderId}`,
+            quantity: qtySign * mapping.legQty,
+            costBasis: pos.costBasis * fraction,
+            currentValue: pos.currentValue * fraction,
+            tradeGroupId: mapping.tradeGroupId,
+            strategyName: pos.strategyName || mapping.strategyName,
+            strategyType: pos.strategyType || mapping.strategyType,
+          });
+        }
+      } else {
+        // Mismatch - allocate oldest-first, any leftover stays ungrouped
+        console.log(`[enrichPositionsWithGroupIds] Qty mismatch for ${pos.symbol}: broker=${remainingQty}, mapped=${totalMappedQty}`);
+        
+        const totalToAllocate = Math.min(remainingQty, totalMappedQty);
+        let allocated = 0;
+        
+        for (const mapping of mappings) {
+          if (remainingQty <= 0) break;
+          
+          const allocQty = Math.min(mapping.legQty, remainingQty);
+          if (allocQty <= 0) continue;
+          
+          const fraction = allocQty / Math.abs(pos.quantity);
+          
+          allocatedPositions.push({
+            ...pos,
+            id: `${pos.id}-${mapping.openOrderId}`,
+            quantity: qtySign * allocQty,
+            costBasis: pos.costBasis * fraction,
+            currentValue: pos.currentValue * fraction,
+            tradeGroupId: mapping.tradeGroupId,
+            strategyName: pos.strategyName || mapping.strategyName,
+            strategyType: pos.strategyType || mapping.strategyType,
+          });
+          
+          remainingQty -= allocQty;
+          allocated += allocQty;
+        }
+        
+        // Any remaining qty is ungrouped (requires manual reconcile)
+        if (remainingQty > 0) {
+          const fraction = remainingQty / Math.abs(pos.quantity);
+          allocatedPositions.push({
+            ...pos,
+            id: `${pos.id}-orphan`,
+            quantity: qtySign * remainingQty,
+            costBasis: pos.costBasis * fraction,
+            currentValue: pos.currentValue * fraction,
+            // No tradeGroupId - will be detected as broken/ungrouped
+          });
+        }
+      }
+    }
 
     // === STRICT HEURISTIC FALLBACK: Only for positions not in DB ===
     // Group ungrouped positions by heuristic key
     const ungroupedByHeuristic = new Map<string, Position[]>();
     
-    enrichedPositions.forEach(pos => {
+    allocatedPositions.forEach(pos => {
       if (!pos.tradeGroupId) {
         const key = generateHeuristicGroupKey(pos);
         const existing = ungroupedByHeuristic.get(key) || [];
@@ -240,7 +347,7 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
     });
 
     // Apply heuristic group IDs only to valid 4L groups
-    return enrichedPositions.map(pos => {
+    return allocatedPositions.map(pos => {
       if (pos.tradeGroupId) return pos; // Already has DB group ID
       
       const heuristicKey = generateHeuristicGroupKey(pos);
