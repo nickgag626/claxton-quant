@@ -265,6 +265,7 @@ export const tradierApi = {
     success: boolean;
     dryRun?: boolean;
     skipped?: boolean;
+    notFound?: boolean; // Position doesn't exist at broker - not an error, just stale data
     orderId?: string;
     error?: string;
     debug?: any;
@@ -310,6 +311,29 @@ export const tradierApi = {
       console.log('[tradierApi.closePosition] Response', { data, error, clientRequestId });
 
       if (error) {
+        // Check if this is a "Position not found" 404 - this is expected when position was already closed
+        // Parse the error context to extract the response body
+        const errorContext = error.context as { body?: string } | undefined;
+        let parsedBody: any = null;
+        try {
+          if (errorContext?.body) {
+            parsedBody = JSON.parse(errorContext.body);
+          }
+        } catch {
+          // Ignore parse errors
+        }
+        
+        if (parsedBody?.error === 'Position not found') {
+          console.log('[tradierApi.closePosition] Position not found (already closed or never existed):', { symbol, clientRequestId });
+          return {
+            success: false,
+            notFound: true,
+            error: 'Position not found at broker',
+            debug: { parsedBody },
+            clientRequestId,
+          };
+        }
+
         const isCors = error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError');
         console.error('[tradierApi.closePosition] Invoke error:', { error, isCors, clientRequestId });
         return {
