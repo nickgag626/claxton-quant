@@ -47,13 +47,17 @@ interface TradierRequest {
     | "orders"
     | "order_detail"
     | "order_status"
-    | "close_position";
+    | "close_position"
+    | "close_group";
   symbols?: string[];
   symbol?: string;
   expiration?: string;
 
   // close_position
   positionSymbol?: string;
+  // close_group
+  positionSymbols?: string[];
+
   // kept for backwards compatibility; close logic derives from live Tradier position
   positionQuantity?: number;
 
@@ -450,6 +454,183 @@ serve(async (req) => {
           rawOrder: order,
         };
         break;
+      }
+
+      case "close_group": {
+        const positionSymbols = body.positionSymbols;
+        if (!positionSymbols || positionSymbols.length < 2) {
+          return new Response(
+            JSON.stringify({ error: "positionSymbols (2+) required for close_group" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+
+        const symbolsSorted = [...positionSymbols].map(String).sort();
+        const lockKey = `${accountId}:group:${symbolsSorted.join("|")}`;
+        const now = Date.now();
+        const lock = closeLocks.get(lockKey);
+
+        console.log("CLOSE_GROUP_REQUEST", {
+          source,
+          clientRequestId,
+          trade_group_id,
+          symbols: symbolsSorted,
+          dryRun,
+        });
+
+        if (lock?.inFlight) {
+          console.log("CLOSE_GROUP_SKIP_INFLIGHT", { source, clientRequestId });
+          return new Response(
+            JSON.stringify({ skipped: true, reason: "lock_in_flight", clientRequestId }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+        if (lock?.lastAcceptedAt && now - lock.lastAcceptedAt < CLOSE_COOLDOWN_MS) {
+          console.log("CLOSE_GROUP_SKIP_COOLDOWN", { source, clientRequestId });
+          return new Response(
+            JSON.stringify({ skipped: true, reason: "cooldown", clientRequestId }),
+            { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+          );
+        }
+
+        closeLocks.set(lockKey, { inFlight: true, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+
+        try {
+          // Fetch positions once
+          const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
+          const posResp = await fetch(posUrl, { headers });
+          const posData = await safeParseTradierResponse(posResp);
+          const positionsRaw = posData?.positions?.position;
+          const posArray: TradierPosition[] = Array.isArray(positionsRaw)
+            ? positionsRaw
+            : positionsRaw
+              ? [positionsRaw]
+              : [];
+
+          const legs: Array<{ symbol: string; closeSide: string; closeQty: number; positionSide?: string }> = [];
+
+          // All legs must be options with same underlying
+          const underlying0 = extractUnderlyingFromOcc(symbolsSorted[0]);
+          for (const sym of symbolsSorted) {
+            const matched = posArray.find((p) => String(p.symbol) === sym);
+            if (!matched) {
+              console.log("CLOSE_GROUP_NOT_FOUND", { source, clientRequestId, symbol: sym });
+              return new Response(
+                JSON.stringify({ error: "Position not found", symbol: sym, clientRequestId }),
+                { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+
+            if (!isOccOptionSymbol(sym)) {
+              return new Response(
+                JSON.stringify({ error: "close_group supports OCC option symbols only", symbol: sym, clientRequestId }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+
+            const underlying = extractUnderlyingFromOcc(sym);
+            if (underlying !== underlying0) {
+              return new Response(
+                JSON.stringify({ error: "All legs must share the same underlying", clientRequestId, debug: { underlying0, underlying } }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+
+            const instruction = getCloseInstruction(matched, sym, "option");
+            if (!instruction.ok) {
+              return new Response(
+                JSON.stringify({ error: instruction.error, clientRequestId, debug: { instruction, sym } }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+
+            const qty = normalizeNumber(matched.quantity);
+            const closeQty = Math.min(instruction.closeQty, Math.abs(qty));
+            if (!Number.isFinite(closeQty) || closeQty <= 0) {
+              return new Response(
+                JSON.stringify({ error: "Position size is zero", clientRequestId, debug: { sym, qty } }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+
+            legs.push({
+              symbol: sym,
+              closeSide: instruction.closeSide,
+              closeQty,
+              positionSide: String((matched as any).side || "") || undefined,
+            });
+          }
+
+          const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
+
+          const orderParams: Record<string, string> = {
+            type: "market",
+            duration: "day",
+            class: "multileg",
+            symbol: underlying0,
+          };
+
+          legs.forEach((leg, idx) => {
+            orderParams[`option_symbol[${idx}]`] = leg.symbol;
+            orderParams[`side[${idx}]`] = leg.closeSide;
+            orderParams[`quantity[${idx}]`] = String(leg.closeQty);
+          });
+
+          console.log("CLOSE_GROUP_ORDER_PARAMS", { source, clientRequestId, legs: legs.length, dryRun });
+
+          if (dryRun) {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+            data = {
+              dry_run: true,
+              clientRequestId,
+              planned_order: orderParams,
+              legs,
+              debug: debug
+                ? { source, trade_group_id, orderParams, legs }
+                : undefined,
+            };
+            break;
+          }
+
+          response = await fetch(orderUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiToken}`,
+              Accept: "application/json",
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams(orderParams).toString(),
+          });
+
+          const responseText = await response.text();
+          let parsed: any = null;
+          try {
+            parsed = JSON.parse(responseText);
+          } catch {
+            parsed = { error: "Invalid response" };
+          }
+
+          const orderId = parsed?.order?.id;
+          console.log("CLOSE_GROUP_ORDER_RESULT", { source, clientRequestId, orderId, status: response.status });
+
+          if (orderId) {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: Date.now() });
+          } else {
+            closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+          }
+
+          data = {
+            ...parsed,
+            clientRequestId,
+            legs,
+            debug: debug ? { source, trade_group_id, orderParams, legs } : undefined,
+          };
+
+          break;
+        } finally {
+          const cur = closeLocks.get(lockKey);
+          if (cur) closeLocks.set(lockKey, { ...cur, inFlight: false });
+        }
       }
 
       case "close_position": {

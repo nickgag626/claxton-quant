@@ -5,6 +5,7 @@ import { strategyEngine } from '@/services/strategyEngine';
 import { tradeJournal, TradeRecord } from '@/services/tradeJournal';
 import { settingsService } from '@/services/settingsService';
 import { toast } from '@/hooks/use-toast';
+import { expectedLegCount, strategyDisplayName } from '@/lib/strategyLegs';
 import type {
   Position, 
   Greeks, 
@@ -746,7 +747,7 @@ export const useTradingData = () => {
     exitReason: string,
     source: string,
     clientRequestId: string
-  ) => {
+  ): Promise<string | undefined> => {
     if (!closeResult.orderId) {
       console.error('journalClosedTrade: No orderId provided, cannot journal');
       return;
@@ -776,17 +777,17 @@ export const useTradingData = () => {
 
       // STEP 1: Save trade as 'submitted' with NULL pnl/exit_price
       // Tradier 'ok' status != filled - order may still be rejected
-      
+
       // trade_group_id must be a valid UUID - check if it looks like one
-      // Human-readable IDs like "hg-heuristic-SPY-2026-01-13-5894417" are NOT valid UUIDs
+      // Human-readable IDs like "hg-heuristic-SPY-..." are NOT valid UUIDs
       const isValidUUID = (str: string | undefined): boolean => {
         if (!str) return false;
         const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
         return uuidRegex.test(str);
       };
-      
+
       const tradeGroupId = isValidUUID(position.tradeGroupId) ? position.tradeGroupId : undefined;
-      
+
       const tradeRecord: Omit<TradeRecord, 'id'> = {
         symbol: position.symbol,
         underlying,
@@ -820,26 +821,26 @@ export const useTradingData = () => {
 
       if (saveResult.duplicate) {
         console.log('[journalClosedTrade] Duplicate (already exists):', position.symbol, closeResult.orderId);
-        return;
+        return saveResult.id;
       }
-      
+
       if (!saveResult.success) {
         console.error('[journalClosedTrade] Failed to save submitted trade:', saveResult.error);
         return;
       }
 
-      console.log('[journalClosedTrade] Saved as submitted:', position.symbol, closeResult.orderId);
+      console.log('[journalClosedTrade] Saved as submitted:', position.symbol, closeResult.orderId, 'row:', saveResult.id);
 
       // STEP 2: Immediately check order status with Tradier
       // Small delay to allow order to process
       await new Promise(resolve => setTimeout(resolve, 500));
-      
+
       const orderStatus = await tradierApi.getOrderStatus(closeResult.orderId);
       console.log('[journalClosedTrade] Order status:', closeResult.orderId, orderStatus);
 
       if (!orderStatus.success) {
         console.warn('[journalClosedTrade] Could not fetch order status, will retry later:', orderStatus.error);
-        return;
+        return saveResult.id;
       }
 
       // STEP 3: Update trade based on order status
@@ -857,7 +858,7 @@ export const useTradingData = () => {
 
       if (updateResult.success) {
         console.log('[journalClosedTrade] Updated to', orderStatus.closeStatus, ':', position.symbol);
-        
+
         if (orderStatus.closeStatus === 'filled') {
           addActivity('TRADE', `Trade filled: ${position.symbol} @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'}`);
         } else if (orderStatus.closeStatus === 'rejected' || orderStatus.closeStatus === 'canceled' || orderStatus.closeStatus === 'expired') {
@@ -866,10 +867,214 @@ export const useTradingData = () => {
       } else {
         console.error('[journalClosedTrade] Failed to update close status:', updateResult.error);
       }
+
+      return saveResult.id;
     } catch (error) {
       console.error('[journalClosedTrade] Error:', error);
+      return;
     }
   }, [strategyPositions, addActivity]);
+
+  /**
+   * SINGLE CHOKE POINT for ALL closes.
+   * The ONLY place in the app allowed to call tradierApi.closePosition/closeGroup.
+   */
+  const requestClose = useCallback(async (params: {
+    source: 'bot' | 'manual' | 'emergency';
+    exitReason: string;
+    tradeGroupId?: string;
+    symbol?: string;
+  }): Promise<boolean> => {
+    const { source, exitReason, tradeGroupId, symbol } = params;
+
+    const allowFlagKey = '__ALLOW_BROKER_CLOSE__';
+
+    const logAttempt = (decision: string, extra?: Record<string, any>) => {
+      const payload = {
+        source,
+        symbol,
+        tradeGroupId,
+        legOutMode: legOutModeEnabled,
+        decision,
+        ...extra,
+      };
+      console.log('[requestClose]', payload);
+      addActivity(decision === 'blocked' ? 'RISK' : 'TRADE',
+        `CLOSE ${decision.toUpperCase()}: src=${source} sym=${symbol || '-'} group=${tradeGroupId || '-'} legOut=${legOutModeEnabled}` +
+        (extra?.reason ? ` — ${extra.reason}` : '')
+      );
+    };
+
+    // ===== GROUP CLOSE =====
+    if (tradeGroupId) {
+      const groupPositions = getGroupPositions(tradeGroupId);
+      const symbolsInGroup = groupPositions.map(p => p.symbol);
+
+      if (groupPositions.length === 0) {
+        logAttempt('blocked', { reason: 'No positions found for group' });
+        return false;
+      }
+
+      const strategyType = groupPositions.find(p => p.strategyType)?.strategyType;
+      const expected = expectedLegCount(strategyType);
+      const observed = groupPositions.length;
+
+      if (!legOutModeEnabled && expected !== null && observed < expected) {
+        logAttempt('blocked', { reason: 'Broken structure — manual intervention required', expected, observed });
+        return false;
+      }
+
+      // Mark as pending close immediately (UI)
+      setPendingCloseSymbols(prev => {
+        const next = new Set(prev);
+        symbolsInGroup.forEach(s => next.add(s));
+        return next;
+      });
+
+      const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      logAttempt('submitted', { symbols: symbolsInGroup, clientRequestId });
+
+      // Allow broker close only inside this scope (dev assertion guard)
+      (globalThis as any)[allowFlagKey] = true;
+      try {
+        const result = await tradierApi.closeGroup(symbolsInGroup, {
+          dryRun: closeDebugOptions.dryRun,
+          debug: closeDebugOptions.debug,
+          clientRequestId,
+          trade_group_id: tradeGroupId,
+          source: source === 'bot' ? 'bot_engine_group' : source === 'emergency' ? 'emergency_close' : 'manual_ui_group',
+        });
+
+        if (result.skipped) {
+          logAttempt('blocked', { reason: result.error || 'cooldown/lock', clientRequestId });
+          return false;
+        }
+
+        if (result.notFound) {
+          logAttempt('filled', { reason: 'Already closed (not found)', clientRequestId });
+          await fetchData();
+          return true;
+        }
+
+        if (result.success && result.dryRun) {
+          logAttempt('submitted', { reason: 'dryRun', clientRequestId });
+          return true;
+        }
+
+        if (result.success && result.orderId) {
+          const legInfoBySymbol = new Map(
+            (result.legs || []).map(l => [l.symbol, l])
+          );
+
+          const journalIds: Array<{ symbol: string; id?: string }> = [];
+          for (const p of groupPositions) {
+            const leg = legInfoBySymbol.get(p.symbol);
+            const journalId = await journalClosedTrade(
+              p,
+              {
+                orderId: result.orderId,
+                closeSide: leg?.closeSide,
+                closeQty: leg?.closeQty,
+                positionDetails: leg ? { symbol: p.symbol, quantity: p.quantity, costBasis: p.costBasis, side: leg.positionSide } : undefined,
+              },
+              exitReason,
+              source === 'bot' ? 'bot_engine_group' : source === 'emergency' ? 'emergency_close' : 'manual_ui_group',
+              clientRequestId
+            );
+            journalIds.push({ symbol: p.symbol, id: journalId });
+          }
+
+          logAttempt('submitted', { orderId: result.orderId, journal: journalIds });
+          await fetchData();
+          return true;
+        }
+
+        logAttempt('rejected', { reason: result.error || 'Order failed', clientRequestId });
+        return false;
+      } finally {
+        (globalThis as any)[allowFlagKey] = false;
+      }
+    }
+
+    // ===== SINGLE SYMBOL CLOSE =====
+    if (!symbol) {
+      logAttempt('blocked', { reason: 'Missing symbol or tradeGroupId' });
+      return false;
+    }
+
+    const position = positions.find(p => p.symbol === symbol);
+    if (!position) {
+      logAttempt('blocked', { reason: 'Position not found in local state' });
+      return false;
+    }
+
+    // If position is grouped, and legOutMode is OFF, single-leg close is forbidden.
+    if (position.tradeGroupId && !legOutModeEnabled) {
+      const expected = expectedLegCount(position.strategyType);
+      const observed = getGroupPositions(position.tradeGroupId).length;
+      logAttempt('blocked', {
+        reason: expected !== null ? `Grouped structure — use Close Group (${observed}/${expected})` : 'Grouped structure — use Close Group',
+      });
+      return false;
+    }
+
+    // If grouped AND legOutMode ON, still apply broken-structure gate only when legOutMode is OFF (so allow here)
+
+    if (pendingCloseSymbolsRef.current.has(position.symbol)) {
+      logAttempt('blocked', { reason: 'Already pending close' });
+      return false;
+    }
+
+    const clientRequestId = crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    logAttempt('submitted', { clientRequestId });
+
+    (globalThis as any)[allowFlagKey] = true;
+    try {
+      const result = await tradierApi.closePosition(position.symbol, position.quantity, {
+        dryRun: closeDebugOptions.dryRun,
+        debug: closeDebugOptions.debug,
+        clientRequestId,
+        trade_group_id: position.tradeGroupId,
+        source:
+          source === 'bot' ? 'bot_engine_single' :
+          source === 'emergency' ? 'emergency_close' :
+          legOutModeEnabled ? 'manual_ui_legout' : 'manual_ui',
+      });
+
+      setLastCloseDebug({ source, clientRequestId, symbol: position.symbol, result, edgeDebug: result.debug });
+
+      if (result.skipped) {
+        logAttempt('blocked', { reason: result.error || 'cooldown/lock', clientRequestId });
+        return false;
+      }
+
+      if (result.notFound) {
+        logAttempt('filled', { reason: 'Already closed (not found)', clientRequestId });
+        await fetchData();
+        return true;
+      }
+
+      if (result.success && result.dryRun) {
+        logAttempt('submitted', { reason: 'dryRun', clientRequestId });
+        return true;
+      }
+
+      if (result.success && result.orderId) {
+        setPendingCloseSymbols(prev => new Set(prev).add(position.symbol));
+        const journalId = await journalClosedTrade(position, result, exitReason, String(result?.debug?.source || source), clientRequestId);
+        logAttempt('submitted', { orderId: result.orderId, journalRowId: journalId, clientRequestId });
+        await fetchData();
+        return true;
+      }
+
+      logAttempt('rejected', { reason: result.error || 'Order failed', clientRequestId });
+      return false;
+    } finally {
+      (globalThis as any)[allowFlagKey] = false;
+    }
+  }, [addActivity, closeDebugOptions.debug, closeDebugOptions.dryRun, fetchData, getGroupPositions, journalClosedTrade, legOutModeEnabled, positions]);
+
 
   // Get all positions that belong to the same trade group
   const getGroupPositions = useCallback((tradeGroupId: string | undefined): Position[] => {
