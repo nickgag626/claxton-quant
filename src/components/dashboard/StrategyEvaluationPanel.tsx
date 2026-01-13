@@ -21,6 +21,8 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [simulateOpen, setSimulateOpen] = useState(false);
+  const [simulateTime, setSimulateTime] = useState(false);
+  const [overrideTime, setOverrideTime] = useState('10:30');
 
   const loadEvaluation = async () => {
     setIsLoading(true);
@@ -36,11 +38,21 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
   const handleRunEvaluation = async () => {
     setIsRunning(true);
     try {
-      const options = simulateOpen ? { overrideMarketStatus: 'open' } : undefined;
-      const result = await evaluationService.runEvaluation(strategyId, options);
+      const options: { overrideMarketStatus?: string; overrideTimeET?: string } = {};
+      if (simulateOpen) options.overrideMarketStatus = 'open';
+      if (simulateTime) options.overrideTimeET = overrideTime;
+      
+      const result = await evaluationService.runEvaluation(
+        strategyId, 
+        Object.keys(options).length > 0 ? options : undefined
+      );
       if (result) {
+        const overrideNotes = [
+          simulateOpen ? 'market open' : null,
+          simulateTime ? `time ${overrideTime}` : null,
+        ].filter(Boolean).join(', ');
+        toast.success(overrideNotes ? `Evaluation completed (simulated: ${overrideNotes})` : 'Evaluation completed');
         setEvaluation(result);
-        toast.success(simulateOpen ? 'Evaluation completed (simulated market open)' : 'Evaluation completed');
       } else {
         toast.error('Evaluation failed');
       }
@@ -107,8 +119,27 @@ export const StrategyEvaluationPanel = ({ strategyId, strategyName }: StrategyEv
               onChange={(e) => setSimulateOpen(e.target.checked)}
               className="w-3 h-3"
             />
-            Simulate Open
+            Sim Open
           </label>
+          <label className="flex items-center gap-1 text-[9px] text-muted-foreground cursor-pointer" onClick={(e) => e.stopPropagation()}>
+            <input 
+              type="checkbox" 
+              checked={simulateTime} 
+              onChange={(e) => setSimulateTime(e.target.checked)}
+              className="w-3 h-3"
+            />
+            Sim Time
+          </label>
+          {simulateTime && (
+            <input
+              type="text"
+              value={overrideTime}
+              onChange={(e) => setOverrideTime(e.target.value)}
+              onClick={(e) => e.stopPropagation()}
+              className="w-12 h-5 text-[9px] px-1 bg-background border border-border rounded"
+              placeholder="HH:MM"
+            />
+          )}
           <Button
             variant="ghost"
             size="sm"

@@ -80,13 +80,17 @@ export const evaluationService = {
   },
 
   // Trigger a manual evaluation for a strategy
-  async runEvaluation(strategyId: string, options?: { overrideMarketStatus?: string }): Promise<StrategyEvaluation | null> {
+  async runEvaluation(strategyId: string, options?: { 
+    overrideMarketStatus?: string;
+    overrideTimeET?: string;
+  }): Promise<StrategyEvaluation | null> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
         body: {
           action: 'run_evaluation',
           strategyId,
           overrideMarketStatus: options?.overrideMarketStatus,
+          overrideTimeET: options?.overrideTimeET,
         },
       });
 

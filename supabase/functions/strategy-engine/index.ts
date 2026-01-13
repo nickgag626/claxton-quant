@@ -165,15 +165,23 @@ async function evaluateStrategyWithTrace(
   positions: any[],
   apiToken: string,
   baseUrl: string,
-  evalOptions?: { overrideMarketStatus?: string }
+  supabaseClient: any,
+  evalOptions?: { 
+    overrideMarketStatus?: string;
+    overrideTimeET?: string; // Format: "HH:MM"
+  }
 ): Promise<EvaluationResult> {
   const gates: Gate[] = [];
-  const { timeStr, dateStr, isoET, utcIso } = getETTime();
+  const { timeStr: realTimeStr, dateStr, isoET, utcIso } = getETTime();
   const today = new Date();
   
   // Determine effective market state (support override for testing)
   const effectiveMarketState = evalOptions?.overrideMarketStatus || marketState;
   const isMarketOverridden = !!evalOptions?.overrideMarketStatus;
+  
+  // Determine effective time (support override for testing)
+  const effectiveTimeStr = evalOptions?.overrideTimeET || realTimeStr;
+  const isTimeOverridden = !!evalOptions?.overrideTimeET;
   
   // Get delta target (support both old and new field names) with provenance
   const usedDeltaField = strategy.entryConditions.shortDeltaTarget !== undefined 
@@ -187,14 +195,17 @@ async function evaluateStrategyWithTrace(
   // Initialize inputs with full clock provenance
   const inputs: EvaluationResult['inputs'] = {
     market: {
-      now_et: `${dateStr} ${timeStr}`,
+      now_et: `${dateStr} ${effectiveTimeStr}`,
       now_et_iso: isoET,
       now_utc_iso: utcIso,
+      now_et_real: realTimeStr,
       underlying: strategy.underlying,
       clock_source: 'tradier_clock',
       clock_state_raw: marketState,
       clock_state_effective: effectiveMarketState,
       market_override_applied: isMarketOverridden,
+      time_override_applied: isTimeOverridden,
+      time_override_value: evalOptions?.overrideTimeET || null,
       strategy_startTime: strategy.entryConditions.startTime || null,
       strategy_endTime: strategy.entryConditions.endTime || null,
       marketHoursOnly: strategy.entryConditions.marketHoursOnly,
@@ -240,13 +251,13 @@ async function evaluateStrategyWithTrace(
     timeWindowPass = false;
     timeWindowReason = `skipped_due_to_${hardStopReason}`;
   } else {
-    if (strategy.entryConditions.startTime && timeStr < strategy.entryConditions.startTime) {
+    if (strategy.entryConditions.startTime && effectiveTimeStr < strategy.entryConditions.startTime) {
       timeWindowPass = false;
-      timeWindowReason = `Current time ${timeStr} is before start time ${strategy.entryConditions.startTime}`;
+      timeWindowReason = `Current time ${effectiveTimeStr} is before start time ${strategy.entryConditions.startTime}`;
     }
-    if (strategy.entryConditions.endTime && timeStr > strategy.entryConditions.endTime) {
+    if (strategy.entryConditions.endTime && effectiveTimeStr > strategy.entryConditions.endTime) {
       timeWindowPass = false;
-      timeWindowReason = `Current time ${timeStr} is after end time ${strategy.entryConditions.endTime}`;
+      timeWindowReason = `Current time ${effectiveTimeStr} is after end time ${strategy.entryConditions.endTime}`;
     }
   }
   
@@ -255,7 +266,13 @@ async function evaluateStrategyWithTrace(
     expected: strategy.entryConditions.startTime && strategy.entryConditions.endTime 
       ? `${strategy.entryConditions.startTime} - ${strategy.entryConditions.endTime}`
       : 'any',
-    actual: { current_time: timeStr, startTime: strategy.entryConditions.startTime, endTime: strategy.entryConditions.endTime },
+    actual: { 
+      current_time: effectiveTimeStr, 
+      real_time: realTimeStr,
+      time_override_applied: isTimeOverridden,
+      startTime: strategy.entryConditions.startTime, 
+      endTime: strategy.entryConditions.endTime 
+    },
     pass: timeWindowPass,
     reason: timeWindowReason,
   };
@@ -297,7 +314,7 @@ async function evaluateStrategyWithTrace(
     hardStopReason = 'max_positions';
   }
   
-  // Fetch option data (only if not hard stopped)
+  // Fetch option data - with caching for after-hours evaluation
   const headers = {
     'Authorization': `Bearer ${apiToken}`,
     'Accept': 'application/json',
@@ -309,56 +326,167 @@ async function evaluateStrategyWithTrace(
   let targetExpiration: string | null = null;
   let selectedDte: number | null = null;
   let dataFetchError = false;
+  let dataSource: 'live' | 'cache' = 'live';
+  let cacheTimestamp: string | null = null;
   
-  if (!hardStop) {
-    try {
-      const expResponse = await fetch(
-        `${baseUrl}/markets/options/expirations?symbol=${strategy.underlying}`,
-        { headers }
-      );
-      const expData = await expResponse.json();
-      expirations = expData?.expirations?.date || [];
-    } catch (error) {
-      dataFetchError = true;
+  // Helper: Get cached data
+  async function getCachedData(underlying: string, cacheType: string, expiration?: string): Promise<{ data: any; cachedAt: string } | null> {
+    const query = supabaseClient
+      .from('options_cache')
+      .select('data, cached_at')
+      .eq('underlying', underlying)
+      .eq('cache_type', cacheType)
+      .gt('expires_at', new Date().toISOString())
+      .order('cached_at', { ascending: false })
+      .limit(1);
+    
+    if (expiration) {
+      query.eq('expiration', expiration);
     }
     
-    // Find target expiration
-    const today = new Date();
-    for (const exp of expirations) {
-      const expDate = new Date(exp);
-      const dte = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-      if (dte >= strategy.entryConditions.minDte && dte <= strategy.entryConditions.maxDte) {
-        targetExpiration = exp;
-        selectedDte = dte;
-        break;
+    const { data } = await query.single();
+    return data ? { data: data.data, cachedAt: data.cached_at } : null;
+  }
+  
+  // Helper: Save to cache (expires in 4 hours for after-hours use)
+  async function saveToCache(underlying: string, cacheType: string, cacheData: any, expiration?: string): Promise<void> {
+    const expiresAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(); // 4 hours
+    await supabaseClient.from('options_cache').upsert({
+      underlying,
+      cache_type: cacheType,
+      expiration: expiration || null,
+      data: cacheData,
+      cached_at: new Date().toISOString(),
+      expires_at: expiresAt,
+    }, { onConflict: 'underlying,cache_type,expiration' }).select();
+  }
+  
+  // Fetch expirations (always try, even if hardStop - for testing/cache)
+  const expUrl = `${baseUrl}/markets/options/expirations?symbol=${strategy.underlying}`;
+  console.log(`[OPTIONS] Fetching expirations: ${expUrl}`);
+  
+  try {
+    const expResponse = await fetch(expUrl, { headers });
+    const expStatus = expResponse.status;
+    const expData = await expResponse.json();
+    console.log(`[OPTIONS] Expirations response (${expStatus}):`, JSON.stringify(expData).slice(0, 200));
+    
+    expirations = expData?.expirations?.date || [];
+    
+    // If we got live data, cache it
+    if (expirations.length > 0) {
+      await saveToCache(strategy.underlying, 'expirations', expirations);
+    } else {
+      // Try cache if live returned empty (after-hours)
+      console.log(`[OPTIONS] No live expirations, checking cache...`);
+      const cached = await getCachedData(strategy.underlying, 'expirations');
+      if (cached) {
+        expirations = cached.data;
+        dataSource = 'cache';
+        cacheTimestamp = cached.cachedAt;
+        console.log(`[OPTIONS] Using cached expirations from ${cached.cachedAt}: ${expirations.length} dates`);
       }
     }
+  } catch (error) {
+    console.error(`[OPTIONS] Error fetching expirations:`, error);
+    // Try cache on error
+    const cached = await getCachedData(strategy.underlying, 'expirations');
+    if (cached) {
+      expirations = cached.data;
+      dataSource = 'cache';
+      cacheTimestamp = cached.cachedAt;
+      console.log(`[OPTIONS] Using cached expirations (fetch error): ${expirations.length} dates`);
+    } else {
+      dataFetchError = true;
+    }
+  }
+  
+  // Find target expiration
+  const evalDate = new Date();
+  for (const exp of expirations) {
+    const expDate = new Date(exp);
+    const dte = Math.ceil((expDate.getTime() - evalDate.getTime()) / (1000 * 60 * 60 * 24));
+    if (dte >= strategy.entryConditions.minDte && dte <= strategy.entryConditions.maxDte) {
+      targetExpiration = exp;
+      selectedDte = dte;
+      break;
+    }
+  }
+  
+  inputs.market.dte_selected = selectedDte;
+  inputs.market.expiration_selected = targetExpiration;
+  inputs.market.data_source = dataSource;
+  if (cacheTimestamp) {
+    inputs.market.cache_timestamp = cacheTimestamp;
+  }
+  
+  // Fetch option chain if we have an expiration
+  if (targetExpiration) {
+    const chainUrl = `${baseUrl}/markets/options/chains?symbol=${strategy.underlying}&expiration=${targetExpiration}&greeks=true`;
+    console.log(`[OPTIONS] Fetching chain: ${chainUrl}`);
     
-    inputs.market.dte_selected = selectedDte;
-    inputs.market.expiration_selected = targetExpiration;
-    
-    // Fetch option chain if we have an expiration
-    if (targetExpiration) {
-      try {
-        const chainResponse = await fetch(
-          `${baseUrl}/markets/options/chains?symbol=${strategy.underlying}&expiration=${targetExpiration}&greeks=true`,
-          { headers }
-        );
-        const chainData = await chainResponse.json();
-        optionChain = chainData?.options?.option || [];
-        
-        // Get underlying price
-        const quoteResponse = await fetch(
-          `${baseUrl}/markets/quotes?symbols=${strategy.underlying}`,
-          { headers }
-        );
-        const quoteData = await quoteResponse.json();
-        underlyingPrice = quoteData?.quotes?.quote?.last || quoteData?.quotes?.quote?.close;
-        inputs.market.underlying_price = underlyingPrice;
-      } catch (error) {
+    try {
+      const chainResponse = await fetch(chainUrl, { headers });
+      const chainStatus = chainResponse.status;
+      const chainData = await chainResponse.json();
+      const rawChain = chainData?.options?.option || [];
+      console.log(`[OPTIONS] Chain response (${chainStatus}): ${rawChain.length} contracts`);
+      
+      optionChain = rawChain;
+      
+      // Cache if we got live data
+      if (optionChain.length > 0) {
+        await saveToCache(strategy.underlying, 'chain', optionChain, targetExpiration);
+      } else if (dataSource === 'cache' || optionChain.length === 0) {
+        // Try cache for chain
+        console.log(`[OPTIONS] No live chain, checking cache...`);
+        const cachedChain = await getCachedData(strategy.underlying, 'chain', targetExpiration);
+        if (cachedChain) {
+          optionChain = cachedChain.data;
+          dataSource = 'cache';
+          cacheTimestamp = cachedChain.cachedAt;
+          console.log(`[OPTIONS] Using cached chain from ${cachedChain.cachedAt}: ${optionChain.length} contracts`);
+        }
+      }
+      
+      // Get underlying price
+      const quoteUrl = `${baseUrl}/markets/quotes?symbols=${strategy.underlying}`;
+      const quoteResponse = await fetch(quoteUrl, { headers });
+      const quoteData = await quoteResponse.json();
+      underlyingPrice = quoteData?.quotes?.quote?.last || quoteData?.quotes?.quote?.close;
+      
+      // Cache quote
+      if (underlyingPrice) {
+        await saveToCache(strategy.underlying, 'quote', { price: underlyingPrice });
+      } else {
+        const cachedQuote = await getCachedData(strategy.underlying, 'quote');
+        if (cachedQuote) {
+          underlyingPrice = cachedQuote.data?.price;
+          console.log(`[OPTIONS] Using cached quote: ${underlyingPrice}`);
+        }
+      }
+      
+      inputs.market.underlying_price = underlyingPrice;
+    } catch (error) {
+      console.error(`[OPTIONS] Error fetching chain:`, error);
+      // Try cache on error
+      const cachedChain = await getCachedData(strategy.underlying, 'chain', targetExpiration);
+      if (cachedChain) {
+        optionChain = cachedChain.data;
+        dataSource = 'cache';
+        cacheTimestamp = cachedChain.cachedAt;
+        console.log(`[OPTIONS] Using cached chain (fetch error): ${optionChain.length} contracts`);
+      } else {
         dataFetchError = true;
       }
     }
+  }
+  
+  // Update inputs with final data source info
+  inputs.market.data_source = dataSource;
+  inputs.market.data_stale = dataSource === 'cache';
+  if (cacheTimestamp) {
+    inputs.market.cache_timestamp = cacheTimestamp;
   }
   
   // GATE 4: DTE Range
@@ -850,7 +978,7 @@ serve(async (req) => {
 
     const supabase = createClient(supabaseUrl!, supabaseKey!);
     const body = await req.json();
-    const { action, strategies, positions, strategyId, overrideMarketStatus } = body;
+    const { action, strategies, positions, strategyId, overrideMarketStatus, overrideTimeET } = body;
 
     const baseUrl = 'https://sandbox.tradier.com/v1';
     const headers = {
@@ -900,14 +1028,18 @@ serve(async (req) => {
       const currentPositions: any[] = positions || [];
       
       // Run evaluation with trace (support override for testing)
-      const evalOptions = overrideMarketStatus ? { overrideMarketStatus } : undefined;
+      const evalOptions: { overrideMarketStatus?: string; overrideTimeET?: string } = {};
+      if (overrideMarketStatus) evalOptions.overrideMarketStatus = overrideMarketStatus;
+      if (overrideTimeET) evalOptions.overrideTimeET = overrideTimeET;
+      
       const result = await evaluateStrategyWithTrace(
         strategy,
         marketState,
         currentPositions,
         apiToken,
         baseUrl,
-        evalOptions
+        supabase,
+        Object.keys(evalOptions).length > 0 ? evalOptions : undefined
       );
       
       // Save evaluation to DB
@@ -951,7 +1083,8 @@ serve(async (req) => {
           marketState,
           positions || [],
           apiToken,
-          baseUrl
+          baseUrl,
+          supabase
         );
         
         // Save evaluation (will be de-duped if no change)

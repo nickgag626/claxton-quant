@@ -14,6 +14,39 @@ export type Database = {
   }
   public: {
     Tables: {
+      options_cache: {
+        Row: {
+          cache_type: string
+          cached_at: string
+          created_at: string
+          data: Json
+          expiration: string | null
+          expires_at: string
+          id: string
+          underlying: string
+        }
+        Insert: {
+          cache_type: string
+          cached_at?: string
+          created_at?: string
+          data?: Json
+          expiration?: string | null
+          expires_at: string
+          id?: string
+          underlying: string
+        }
+        Update: {
+          cache_type?: string
+          cached_at?: string
+          created_at?: string
+          data?: Json
+          expiration?: string | null
+          expires_at?: string
+          id?: string
+          underlying?: string
+        }
+        Relationships: []
+      }
       settings: {
         Row: {
           created_at: string
