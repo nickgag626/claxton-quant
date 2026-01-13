@@ -290,6 +290,7 @@ export const useTradingData = () => {
     maxBidAskSpreadPercent: 5,
     zeroDteCloseBufferMinutes: 30,
     fillPriceBufferPercent: 2,
+    maxCondorsPerExpiry: 3,
   });
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [marketState, setMarketState] = useState<MarketState>('unknown');

@@ -162,6 +162,7 @@ export interface TradeSafeguards {
   maxBidAskSpreadPercent: number;  // 1-20%, default 5%
   zeroDteCloseBufferMinutes: number;  // 15-60, default 30
   fillPriceBufferPercent: number;  // 0-10%, default 2%
+  maxCondorsPerExpiry: number;  // Max stacked condors per underlying+expiry, default 3
 }
 
 export interface Trade {

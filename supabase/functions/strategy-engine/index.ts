@@ -217,6 +217,13 @@ interface Strategy {
   }>;
 }
 
+interface Safeguards {
+  maxBidAskSpreadPercent: number;
+  zeroDteCloseBufferMinutes: number;
+  fillPriceBufferPercent: number;
+  maxCondorsPerExpiry: number;
+}
+
 interface OptionContract {
   symbol: string;
   strike: number;
@@ -238,6 +245,18 @@ interface Gate {
   actual: Record<string, unknown> | string | number | boolean;
   pass: boolean;
   reason?: string;
+}
+
+interface JitterResult {
+  applied: boolean;
+  existingCondors: number;
+  strikeStep: number;
+  offset: number;
+  jitterSize: number;
+  originalStrikes: { shortPut: number; longPut: number; shortCall: number; longCall: number };
+  shiftedStrikes: { shortPut: number; longPut: number; shortCall: number; longCall: number };
+  allUnique: boolean;
+  allExistInChain: boolean;
 }
 
 interface EvaluationResult {
@@ -265,7 +284,74 @@ interface EvaluationResult {
       computed_contracts: number;
       risk_per_trade?: number;
     };
+    jitter?: JitterResult;
   };
+}
+
+// Compute strike step from option chain (minimum adjacent strike difference)
+function computeStrikeStep(options: OptionContract[]): number {
+  const strikes = [...new Set(options.map(o => o.strike))].sort((a, b) => a - b);
+  if (strikes.length < 2) return 1;
+  
+  let minStep = Infinity;
+  for (let i = 1; i < strikes.length; i++) {
+    const diff = strikes[i] - strikes[i - 1];
+    if (diff > 0 && diff < minStep) {
+      minStep = diff;
+    }
+  }
+  return minStep === Infinity ? 1 : minStep;
+}
+
+// Count existing condors for a given underlying+expiration from broker positions
+function countExistingCondors(
+  brokerPositions: Array<{ symbol: string; quantity: number }>,
+  underlying: string,
+  expiration: string
+): number {
+  // Parse OCC symbols to find matching positions
+  // OCC format: SYMBOL + YYMMDD + C/P + Strike (8 digits)
+  // Example: SPY260113C00580000
+  
+  const matchingPositions = brokerPositions.filter(p => {
+    // Extract underlying from symbol
+    const match = p.symbol.match(/^([A-Z]+)\d{6}/);
+    if (!match) return false;
+    const posUnderlying = match[1];
+    
+    // Extract expiration (YYMMDD)
+    const expMatch = p.symbol.match(/^[A-Z]+(\d{6})/);
+    if (!expMatch) return false;
+    const posExpYYMMDD = expMatch[1];
+    
+    // Convert expiration to YYMMDD for comparison
+    // Input format might be YYYY-MM-DD
+    const expDate = new Date(expiration);
+    const expYYMMDD = expDate.toISOString().slice(2, 4) + 
+                      expDate.toISOString().slice(5, 7) + 
+                      expDate.toISOString().slice(8, 10);
+    
+    return posUnderlying === underlying && posExpYYMMDD === expYYMMDD;
+  });
+  
+  // Group by trade_group heuristically: 4-leg structures = 1 condor
+  // Count unique strikes to estimate condor count
+  const uniqueStrikes = new Set<number>();
+  for (const pos of matchingPositions) {
+    // Extract strike from OCC symbol (last 8 digits, divide by 1000)
+    const strikeMatch = pos.symbol.match(/\d{8}$/);
+    if (strikeMatch) {
+      const strike = parseInt(strikeMatch[0]) / 1000;
+      uniqueStrikes.add(strike);
+    }
+  }
+  
+  // Iron condor has 4 distinct strikes
+  // Estimate condor count = floor(unique strikes / 4)
+  // This is conservative - if there are 8 strikes, we assume 2 condors
+  const condorCount = Math.floor(uniqueStrikes.size / 4);
+  
+  return condorCount;
 }
 
 // Helper: Get current ET time with full provenance
@@ -716,9 +802,18 @@ async function evaluateStrategyWithTrace(
   };
   gates.push(shortDeltaGate);
   
-  // Build proposed order based on strategy type (even if we won't use it)
+  // Build proposed order based on strategy type with multi-condor jitter support
+  // For iron condors, count existing condors and apply strike jitter if needed
+  const jitterConfig = (strategy.type === 'iron_condor' || strategy.type === 'iron_fly') && targetExpiration
+    ? {
+        existingCondors: countExistingCondors(positions.map(p => ({ symbol: p.symbol, quantity: p.quantity || 1 })), strategy.underlying, targetExpiration),
+        maxCondorsPerExpiry: 3, // Default, will be overridden by safeguards when available
+        brokerPositionSymbols: positions.map(p => p.symbol),
+      }
+    : undefined;
+  
   const proposedOrder = !hardStop && optionChain.length > 0 
-    ? buildProposedOrder(strategy, optionChain, shortDeltaTarget, longDeltaTarget)
+    ? buildProposedOrder(strategy, optionChain, shortDeltaTarget, longDeltaTarget, jitterConfig)
     : null;
   
   // GATE 6: Long Delta Target (for spreads)
@@ -958,7 +1053,12 @@ function buildProposedOrder(
   strategy: Strategy, 
   options: OptionContract[], 
   shortDeltaTarget: number,
-  longDeltaTarget?: number
+  longDeltaTarget?: number,
+  jitterConfig?: {
+    existingCondors: number;
+    maxCondorsPerExpiry: number;
+    brokerPositionSymbols: string[];
+  }
 ): EvaluationResult['proposedOrder'] | null {
   const effectiveLongDelta = longDeltaTarget ?? shortDeltaTarget * 0.5;
   const positionSize = strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1;
@@ -976,6 +1076,16 @@ function buildProposedOrder(
     });
   };
   
+  // Helper: Find option by exact strike
+  const findByStrike = (optionType: 'put' | 'call', strike: number): OptionContract | undefined => {
+    return options.find(o => o.option_type === optionType && o.strike === strike && o.bid > 0);
+  };
+  
+  // Helper: Check if symbol conflicts with existing positions
+  const symbolConflicts = (symbol: string): boolean => {
+    return jitterConfig?.brokerPositionSymbols?.includes(symbol) ?? false;
+  };
+  
   const legs: Array<{
     role: string;
     option_symbol?: string;
@@ -987,16 +1097,134 @@ function buildProposedOrder(
   
   let estimatedCredit = 0;
   let estimatedMaxLoss = 0;
+  let jitterResult: JitterResult | undefined;
   
   switch (strategy.type) {
     case 'iron_condor':
     case 'iron_fly': {
-      const shortPut = findByDelta(puts, shortDeltaTarget);
-      const longPut = findByDelta(puts, effectiveLongDelta);
-      const shortCall = findByDelta(calls, shortDeltaTarget);
-      const longCall = findByDelta(calls, effectiveLongDelta);
+      // Find base strikes via delta targeting
+      const baseShortPut = findByDelta(puts, shortDeltaTarget);
+      const baseLongPut = findByDelta(puts, effectiveLongDelta);
+      const baseShortCall = findByDelta(calls, shortDeltaTarget);
+      const baseLongCall = findByDelta(calls, effectiveLongDelta);
       
-      if (!shortPut || !longPut || !shortCall || !longCall) return null;
+      if (!baseShortPut || !baseLongPut || !baseShortCall || !baseLongCall) return null;
+      
+      // Initialize jitter result
+      const strikeStep = computeStrikeStep(options);
+      const existingCondors = jitterConfig?.existingCondors ?? 0;
+      
+      jitterResult = {
+        applied: false,
+        existingCondors,
+        strikeStep,
+        offset: 0,
+        jitterSize: 0,
+        originalStrikes: {
+          shortPut: baseShortPut.strike,
+          longPut: baseLongPut.strike,
+          shortCall: baseShortCall.strike,
+          longCall: baseLongCall.strike,
+        },
+        shiftedStrikes: {
+          shortPut: baseShortPut.strike,
+          longPut: baseLongPut.strike,
+          shortCall: baseShortCall.strike,
+          longCall: baseLongCall.strike,
+        },
+        allUnique: true,
+        allExistInChain: true,
+      };
+      
+      // Apply strike jitter if there are existing condors
+      let shortPut = baseShortPut;
+      let longPut = baseLongPut;
+      let shortCall = baseShortCall;
+      let longCall = baseLongCall;
+      
+      if (existingCondors > 0) {
+        // Try jitterSize = 1, then 2
+        for (const jitterSize of [1, 2]) {
+          const offset = existingCondors * strikeStep * jitterSize;
+          
+          // Symmetric jitter: puts move DOWN, calls move UP
+          const newShortPutStrike = baseShortPut.strike - offset;
+          const newLongPutStrike = baseLongPut.strike - offset;
+          const newShortCallStrike = baseShortCall.strike + offset;
+          const newLongCallStrike = baseLongCall.strike + offset;
+          
+          // Find options at shifted strikes
+          const shiftedShortPut = findByStrike('put', newShortPutStrike);
+          const shiftedLongPut = findByStrike('put', newLongPutStrike);
+          const shiftedShortCall = findByStrike('call', newShortCallStrike);
+          const shiftedLongCall = findByStrike('call', newLongCallStrike);
+          
+          // Check all shifted strikes exist in chain
+          const allExist = !!(shiftedShortPut && shiftedLongPut && shiftedShortCall && shiftedLongCall);
+          
+          // Check all symbols are unique (no conflicts with existing positions)
+          const symbols = [
+            shiftedShortPut?.symbol,
+            shiftedLongPut?.symbol,
+            shiftedShortCall?.symbol,
+            shiftedLongCall?.symbol,
+          ].filter(Boolean) as string[];
+          
+          const hasSymbolConflict = symbols.some(s => symbolConflicts(s));
+          const allUnique = new Set(symbols).size === 4 && !hasSymbolConflict;
+          
+          jitterResult = {
+            applied: true,
+            existingCondors,
+            strikeStep,
+            offset,
+            jitterSize,
+            originalStrikes: {
+              shortPut: baseShortPut.strike,
+              longPut: baseLongPut.strike,
+              shortCall: baseShortCall.strike,
+              longCall: baseLongCall.strike,
+            },
+            shiftedStrikes: {
+              shortPut: newShortPutStrike,
+              longPut: newLongPutStrike,
+              shortCall: newShortCallStrike,
+              longCall: newLongCallStrike,
+            },
+            allUnique,
+            allExistInChain: allExist,
+          };
+          
+          if (allExist && allUnique) {
+            // Success! Use shifted strikes
+            shortPut = shiftedShortPut!;
+            longPut = shiftedLongPut!;
+            shortCall = shiftedShortCall!;
+            longCall = shiftedLongCall!;
+            console.log(`[JITTER] Applied jitterSize=${jitterSize}, offset=${offset} for condor #${existingCondors + 1}`);
+            break;
+          } else {
+            console.log(`[JITTER] jitterSize=${jitterSize} failed: allExist=${allExist}, allUnique=${allUnique}`);
+            if (jitterSize === 2) {
+              // Both jitter sizes failed - return null to block entry
+              console.log(`[JITTER] All jitter attempts failed for ${strategy.underlying}, blocking entry`);
+              return null;
+            }
+          }
+        }
+      } else {
+        // No existing condors - still check for symbol conflicts with base strikes
+        const baseSymbols = [shortPut.symbol, longPut.symbol, shortCall.symbol, longCall.symbol];
+        const hasConflict = baseSymbols.some(s => symbolConflicts(s));
+        if (hasConflict) {
+          console.log(`[JITTER] Base strikes conflict with existing positions, attempting jitter`);
+          // Recursively try with existingCondors = 1 to force jitter
+          return buildProposedOrder(strategy, options, shortDeltaTarget, longDeltaTarget, {
+            ...jitterConfig!,
+            existingCondors: 1,
+          });
+        }
+      }
       
       legs.push(
         { role: 'long_put', option_symbol: longPut.symbol, strike: longPut.strike, delta: longPut.greeks!.delta, side: 'buy_to_open', quantity: positionSize },
@@ -1070,6 +1298,7 @@ function buildProposedOrder(
     estimated_credit: estimatedCredit,
     estimated_max_loss: estimatedMaxLoss === Infinity ? undefined : estimatedMaxLoss,
     entry_rationale: `${strategy.type} on ${strategy.underlying} with ${legs.length} legs`,
+    jitter: jitterResult,
   };
 }
 

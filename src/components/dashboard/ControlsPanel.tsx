@@ -48,6 +48,7 @@ export const ControlsPanel = ({
   const [editSpread, setEditSpread] = useState(safeguards.maxBidAskSpreadPercent);
   const [editCloseBuffer, setEditCloseBuffer] = useState(safeguards.zeroDteCloseBufferMinutes);
   const [editFillBuffer, setEditFillBuffer] = useState(safeguards.fillPriceBufferPercent);
+  const [editMaxCondors, setEditMaxCondors] = useState(safeguards.maxCondorsPerExpiry);
   const [pingResult, setPingResult] = useState<{ ok: boolean; timestamp?: string; error?: string; details?: any } | null>(null);
   const [isPinging, setIsPinging] = useState(false);
   
@@ -238,6 +239,7 @@ export const ControlsPanel = ({
                 setEditSpread(safeguards.maxBidAskSpreadPercent);
                 setEditCloseBuffer(safeguards.zeroDteCloseBufferMinutes);
                 setEditFillBuffer(safeguards.fillPriceBufferPercent);
+                setEditMaxCondors(safeguards.maxCondorsPerExpiry);
                 setIsEditingSafeguards(true);
               }}
               disabled={isBotRunning}
@@ -254,6 +256,7 @@ export const ControlsPanel = ({
                   maxBidAskSpreadPercent: editSpread,
                   zeroDteCloseBufferMinutes: editCloseBuffer,
                   fillPriceBufferPercent: editFillBuffer,
+                  maxCondorsPerExpiry: editMaxCondors,
                 });
                 setIsEditingSafeguards(false);
               }}
@@ -326,6 +329,27 @@ export const ControlsPanel = ({
             </div>
           </div>
           
+          {/* Max Condors Per Expiry */}
+          <div>
+            <div className="flex justify-between items-center mb-1">
+              <span>Max Condors/Expiry:</span>
+              <span className="font-mono text-foreground">{isEditingSafeguards ? editMaxCondors : safeguards.maxCondorsPerExpiry}</span>
+            </div>
+            {isEditingSafeguards && (
+              <Slider
+                value={[editMaxCondors]}
+                onValueChange={(v) => setEditMaxCondors(v[0])}
+                min={1}
+                max={5}
+                step={1}
+                className="w-full"
+              />
+            )}
+            <div className="text-[9px] text-muted-foreground/70">
+              Multi-condor stacking limit per underlying+expiry
+            </div>
+          </div>
+          
           {isEditingSafeguards && (
             <div className="pt-2 flex gap-2">
               <Button
@@ -345,6 +369,7 @@ export const ControlsPanel = ({
                     maxBidAskSpreadPercent: editSpread,
                     zeroDteCloseBufferMinutes: editCloseBuffer,
                     fillPriceBufferPercent: editFillBuffer,
+                    maxCondorsPerExpiry: editMaxCondors,
                   });
                   setIsEditingSafeguards(false);
                 }}

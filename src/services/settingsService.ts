@@ -164,6 +164,7 @@ export const settingsService = {
         maxBidAskSpreadPercent: Number(data.max_bid_ask_spread_percent),
         zeroDteCloseBufferMinutes: data.zero_dte_close_buffer_minutes,
         fillPriceBufferPercent: Number(data.fill_price_buffer_percent),
+        maxCondorsPerExpiry: data.max_condors_per_expiry ?? 3,
       },
     };
   },
@@ -194,6 +195,7 @@ export const settingsService = {
         max_bid_ask_spread_percent: safeguards.maxBidAskSpreadPercent,
         zero_dte_close_buffer_minutes: safeguards.zeroDteCloseBufferMinutes,
         fill_price_buffer_percent: safeguards.fillPriceBufferPercent,
+        max_condors_per_expiry: safeguards.maxCondorsPerExpiry,
         updated_at: new Date().toISOString(),
       })
       .neq('id', '00000000-0000-0000-0000-000000000000'); // Update all rows

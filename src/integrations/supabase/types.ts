@@ -53,6 +53,7 @@ export type Database = {
           fill_price_buffer_percent: number
           id: string
           max_bid_ask_spread_percent: number
+          max_condors_per_expiry: number
           max_daily_loss: number
           max_positions: number
           updated_at: string
@@ -63,6 +64,7 @@ export type Database = {
           fill_price_buffer_percent?: number
           id?: string
           max_bid_ask_spread_percent?: number
+          max_condors_per_expiry?: number
           max_daily_loss?: number
           max_positions?: number
           updated_at?: string
@@ -73,6 +75,7 @@ export type Database = {
           fill_price_buffer_percent?: number
           id?: string
           max_bid_ask_spread_percent?: number
+          max_condors_per_expiry?: number
           max_daily_loss?: number
           max_positions?: number
           updated_at?: string
