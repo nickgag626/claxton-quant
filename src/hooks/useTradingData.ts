@@ -795,7 +795,7 @@ export const useTradingData = () => {
         strategy_type: position.strategyType,
         quantity,
         entry_time: stratInfo?.entryTime?.toISOString() || position.entryTime?.toISOString() || now,
-        exit_time: undefined, // Set when filled
+        exit_time: now, // Set to submission time, updated when filled
         entry_price: entryPrice,
         exit_price: undefined, // Set when filled from Tradier avg_fill_price
         entry_credit: stratInfo?.entryCredit,
