@@ -23,6 +23,33 @@ export interface ExitSignal {
   dte?: number;
 }
 
+export interface VerifyFillParams {
+  orderId: string;
+  expectedLegs: { symbol: string; quantity: number; side: string }[];
+  tradeGroupId: string;
+  strategyName: string;
+  strategyType: string;
+  underlying: string;
+  expiration?: string;
+}
+
+export interface VerifyFillResult {
+  verified: boolean;
+  filledLegs?: string[];
+  missingLegs?: string[];
+  critical?: boolean;
+  orderStatus?: string;
+  mappingPersisted?: boolean;
+  message?: string;
+}
+
+export interface StructureIntegrityResult {
+  healthy: boolean;
+  brokenGroups: { groupId: string; expected: number; observed: number; strategyType: string }[];
+  orphanSymbols: string[];
+  reason: string;
+}
+
 export const strategyEngine = {
   async evaluateStrategies(strategies: Strategy[], positions: Position[]): Promise<{
     signals: TradeSignal[];
@@ -61,6 +88,9 @@ export const strategyEngine = {
       resolution: string;
     }>;
     allow_entry_netting?: boolean;
+    pendingVerification?: VerifyFillParams;
+    requiresVerification?: boolean;
+    tradeGroupId?: string;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
@@ -96,6 +126,77 @@ export const strategyEngine = {
     } catch (error) {
       console.error('Error checking exits:', error);
       return { exitSignals: [], marketState: 'unknown' };
+    }
+  },
+
+  /**
+   * Verify that all legs of an order were filled before persisting to position_group_map.
+   * Checks order status first (primary source of truth), then verifies positions.
+   * If order status is 'filled' but positions not showing, waits extra 5 seconds.
+   */
+  async verifyFill(params: VerifyFillParams): Promise<VerifyFillResult> {
+    try {
+      const { data, error } = await supabase.functions.invoke('strategy-engine', {
+        body: {
+          action: 'verify_fill',
+          ...params,
+        },
+      });
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error verifying fill:', error);
+      return { 
+        verified: false, 
+        critical: false, 
+        message: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  },
+
+  /**
+   * Check structure integrity of current positions.
+   * Returns orphans and broken groups that would block new entries.
+   */
+  async checkStructureIntegrity(positions: Position[]): Promise<StructureIntegrityResult> {
+    try {
+      const { data, error } = await supabase.functions.invoke('strategy-engine', {
+        body: {
+          action: 'check_structure_integrity',
+          positions,
+        },
+      });
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error checking structure integrity:', error);
+      return { 
+        healthy: true, // Fail open to avoid blocking during errors
+        brokenGroups: [], 
+        orphanSymbols: [], 
+        reason: 'integrity_check_failed' 
+      };
+    }
+  },
+
+  /**
+   * Clean up stale position_group_map entries (older than 24h, no matching broker positions).
+   */
+  async cleanupMaps(): Promise<{ deletedCount: number; activeSymbolsCount: number }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('strategy-engine', {
+        body: {
+          action: 'cleanup_maps',
+        },
+      });
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error cleaning up maps:', error);
+      return { deletedCount: 0, activeSymbolsCount: 0 };
     }
   },
 };

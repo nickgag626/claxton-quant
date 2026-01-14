@@ -2107,6 +2107,256 @@ serve(async (req) => {
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
+    
+    // === ATOMIC MAPPING VERIFICATION ===
+    // Verifies all legs are filled before persisting to position_group_map
+    if (action === 'verify_fill') {
+      const { orderId, expectedLegs, tradeGroupId, strategyName, strategyType, underlying, expiration } = body;
+      
+      if (!orderId || !expectedLegs || !tradeGroupId) {
+        return new Response(
+          JSON.stringify({ error: 'orderId, expectedLegs, and tradeGroupId required' }),
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // Step 1: Check Order Status FIRST (primary source of truth)
+      const orderStatusUrl = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
+      let orderStatus = 'unknown';
+      
+      try {
+        const orderResponse = await fetch(orderStatusUrl, { headers });
+        const orderData = await orderResponse.json();
+        orderStatus = orderData?.order?.status?.toLowerCase() || 'unknown';
+        console.log(`[verify_fill] Order ${orderId} status: ${orderStatus}`);
+      } catch (err) {
+        console.error(`[verify_fill] Error fetching order status:`, err);
+      }
+      
+      // If order still pending, return non-critical - will retry
+      if (orderStatus === 'pending' || orderStatus === 'open') {
+        return new Response(JSON.stringify({ 
+          verified: false, 
+          critical: false,
+          orderStatus,
+          message: 'Order still pending - will retry'
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Step 2: Poll broker positions to verify all legs filled
+      const MAX_RETRIES = 3;
+      const RETRY_DELAY_MS = 3000;
+      const FILLED_EXTRA_WAIT_MS = 5000; // Extra wait if order shows FILLED but positions not showing
+      
+      let filledLegs: string[] = [];
+      let verified = false;
+      const expectedSymbols = expectedLegs.map((l: any) => l.symbol);
+      
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        try {
+          const positionsResponse = await fetch(
+            `${baseUrl}/accounts/${accountId}/positions`,
+            { headers }
+          );
+          const posData = await positionsResponse.json();
+          const rawPositions = posData?.positions?.position;
+          const brokerPositions = rawPositions ? (Array.isArray(rawPositions) ? rawPositions : [rawPositions]) : [];
+          
+          // Check which expected symbols are present with non-zero qty
+          filledLegs = expectedSymbols.filter((sym: string) => 
+            brokerPositions.some((bp: any) => bp.symbol === sym && bp.quantity !== 0)
+          );
+          
+          console.log(`[verify_fill] Attempt ${attempt + 1}: ${filledLegs.length}/${expectedSymbols.length} legs found`);
+          
+          if (filledLegs.length === expectedSymbols.length) {
+            verified = true;
+            break;
+          }
+          
+          // If order status is FILLED but positions not showing yet, wait extra 5 seconds
+          if (orderStatus === 'filled' && attempt === 0) {
+            console.log(`[verify_fill] Order FILLED but only ${filledLegs.length}/${expectedSymbols.length} positions visible - waiting ${FILLED_EXTRA_WAIT_MS}ms`);
+            await new Promise(r => setTimeout(r, FILLED_EXTRA_WAIT_MS));
+          } else {
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+          }
+        } catch (err) {
+          console.error(`[verify_fill] Error fetching positions:`, err);
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+        }
+      }
+      
+      if (verified) {
+        // SUCCESS: Persist the mapping NOW
+        await persistPositionGroupMap(supabase, {
+          tradeGroupId,
+          openOrderId: String(orderId),
+          underlying,
+          expiration: expiration || null,
+          strategyName: strategyName || null,
+          strategyType: strategyType || null,
+          legs: expectedLegs,
+        });
+        
+        console.log(`[verify_fill] SUCCESS: All ${filledLegs.length} legs verified and mapping persisted for order ${orderId}`);
+        
+        return new Response(JSON.stringify({ 
+          verified: true, 
+          filledLegs,
+          mappingPersisted: true,
+          orderStatus,
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      } else {
+        // PARTIAL FILL - DO NOT PERSIST
+        const missingLegs = expectedSymbols.filter((s: string) => !filledLegs.includes(s));
+        
+        console.error(`[CRITICAL] PARTIAL FILL: Order ${orderId} - only ${filledLegs.length}/${expectedSymbols.length} legs filled`);
+        console.error(`[CRITICAL] Missing legs: ${missingLegs.join(', ')}`);
+        
+        return new Response(JSON.stringify({ 
+          verified: false,
+          critical: true,
+          orderStatus,
+          filledLegs,
+          missingLegs,
+          message: 'PARTIAL FILL DETECTED - Manual intervention required. Mapping NOT persisted.'
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    
+    // === STRUCTURE INTEGRITY CHECK ===
+    // Checks for orphan positions and broken groups
+    if (action === 'check_structure_integrity') {
+      const positionsToCheck = body.positions || [];
+      
+      const brokenGroups: { groupId: string; expected: number; observed: number; strategyType: string }[] = [];
+      const orphanSymbols: string[] = [];
+      
+      // Check for orphans
+      for (const pos of positionsToCheck) {
+        if (pos.id?.endsWith('-orphan')) {
+          orphanSymbols.push(pos.symbol);
+        }
+      }
+      
+      // Group by tradeGroupId
+      const groupedPositions = new Map<string, any[]>();
+      for (const pos of positionsToCheck.filter((p: any) => p.tradeGroupId)) {
+        const group = groupedPositions.get(pos.tradeGroupId) || [];
+        group.push(pos);
+        groupedPositions.set(pos.tradeGroupId, group);
+      }
+      
+      // Check for broken groups
+      for (const [groupId, groupLegs] of groupedPositions) {
+        const strategyType = groupLegs[0]?.strategyType;
+        let expected: number | null = null;
+        
+        switch (strategyType) {
+          case 'iron_condor':
+          case 'iron_fly':
+            expected = 4;
+            break;
+          case 'credit_put_spread':
+          case 'credit_call_spread':
+          case 'straddle':
+          case 'strangle':
+            expected = 2;
+            break;
+          case 'butterfly':
+            expected = 3;
+            break;
+        }
+        
+        if (expected !== null && groupLegs.length < expected) {
+          brokenGroups.push({ 
+            groupId, 
+            expected, 
+            observed: groupLegs.length,
+            strategyType: strategyType || 'unknown',
+          });
+        }
+      }
+      
+      const healthy = brokenGroups.length === 0 && orphanSymbols.length === 0;
+      const reason = healthy ? '' : 
+        `${brokenGroups.length} broken group(s), ${orphanSymbols.length} orphan position(s)`;
+      
+      return new Response(JSON.stringify({ 
+        healthy, 
+        brokenGroups, 
+        orphanSymbols, 
+        reason 
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    
+    // === CLEANUP STALE MAPPINGS ===
+    // Removes old position_group_map entries that no longer correspond to broker positions
+    if (action === 'cleanup_maps') {
+      // Fetch current broker positions
+      let activeSymbols = new Set<string>();
+      
+      try {
+        const positionsResponse = await fetch(
+          `${baseUrl}/accounts/${accountId}/positions`,
+          { headers }
+        );
+        const posData = await positionsResponse.json();
+        const rawPositions = posData?.positions?.position;
+        const brokerPositions = rawPositions ? (Array.isArray(rawPositions) ? rawPositions : [rawPositions]) : [];
+        activeSymbols = new Set(brokerPositions.map((p: any) => p.symbol));
+        console.log(`[cleanup_maps] Found ${activeSymbols.size} active broker positions`);
+      } catch (err) {
+        console.error('[cleanup_maps] Error fetching positions:', err);
+        return new Response(JSON.stringify({ 
+          error: 'Failed to fetch broker positions',
+          deletedCount: 0,
+          activeSymbolsCount: 0,
+        }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Fetch all mappings older than 24h
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      
+      const { data: staleMaps, error: fetchErr } = await supabase
+        .from('position_group_map')
+        .select('id, symbol, trade_group_id, created_at')
+        .lt('created_at', cutoff);
+      
+      if (fetchErr) {
+        console.error('[cleanup_maps] Error fetching stale maps:', fetchErr);
+        return new Response(JSON.stringify({ 
+          error: fetchErr.message,
+          deletedCount: 0,
+          activeSymbolsCount: activeSymbols.size,
+        }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Filter to only delete if symbol is NOT in broker positions
+      const toDelete = (staleMaps || []).filter((m: any) => !activeSymbols.has(m.symbol));
+      
+      let deletedCount = 0;
+      if (toDelete.length > 0) {
+        const { error: deleteErr } = await supabase
+          .from('position_group_map')
+          .delete()
+          .in('id', toDelete.map((m: any) => m.id));
+        
+        if (deleteErr) {
+          console.error('[cleanup_maps] Delete error:', deleteErr);
+        } else {
+          deletedCount = toDelete.length;
+          console.log(`[cleanup_maps] Deleted ${deletedCount} stale mappings`);
+        }
+      }
+      
+      return new Response(JSON.stringify({ 
+        deletedCount,
+        activeSymbolsCount: activeSymbols.size,
+        staleChecked: staleMaps?.length || 0,
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
 
     return new Response(
       JSON.stringify({ error: 'Invalid action' }),
@@ -2167,28 +2417,29 @@ async function placeOrder(
     const orderId = data?.order?.id;
     const success = !!orderId;
     
-    // === CRITICAL: Persist leg -> trade_group_id mapping on entry ===
-    if (success && orderId) {
-      await persistPositionGroupMap(supabaseClient, {
-        tradeGroupId,
-        openOrderId: String(orderId),
-        underlying: signal.underlying,
-        expiration: signal.expiration || null,
-        strategyName: signal.strategyName || null,
-        strategyType: signal.type || null,
-        legs: signal.legs.map((leg: any) => ({
-          symbol: leg.symbol,
-          quantity: leg.quantity || 1,
-          side: leg.side || 'unknown',
-        })),
-      });
-    }
+    // === ATOMIC MAPPING: DO NOT persist immediately ===
+    // Return pending verification data - frontend will call verify_fill
+    // Only persist AFTER verification confirms all legs filled
     
     return {
       success,
       orderId,
       error: data?.errors?.error,
       signal,
+      pendingVerification: success ? {
+        orderId: String(orderId),
+        expectedLegs: signal.legs.map((leg: any) => ({
+          symbol: leg.symbol,
+          quantity: leg.quantity || 1,
+          side: leg.side || 'unknown',
+        })),
+        tradeGroupId,
+        strategyName: signal.strategyName || null,
+        strategyType: signal.type || null,
+        underlying: signal.underlying,
+        expiration: signal.expiration || null,
+      } : null,
+      requiresVerification: success,
     };
   }
 
@@ -2216,28 +2467,26 @@ async function placeOrder(
   const orderId = data?.order?.id;
   const success = !!orderId;
   
-  // Persist single-leg mapping too
-  if (success && orderId) {
-    await persistPositionGroupMap(supabaseClient, {
-      tradeGroupId,
-      openOrderId: String(orderId),
-      underlying: signal.underlying,
-      expiration: signal.expiration || null,
-      strategyName: signal.strategyName || null,
-      strategyType: signal.type || null,
-      legs: [{
-        symbol: leg.symbol,
-        quantity: leg.quantity || 1,
-        side: leg.side || 'unknown',
-      }],
-    });
-  }
-  
+  // Single leg - still use verification for consistency
   return {
     success,
     orderId,
     error: data?.errors?.error,
     signal,
+    pendingVerification: success ? {
+      orderId: String(orderId),
+      expectedLegs: [{
+        symbol: leg.symbol,
+        quantity: leg.quantity || 1,
+        side: leg.side || 'unknown',
+      }],
+      tradeGroupId,
+      strategyName: signal.strategyName || null,
+      strategyType: signal.type || null,
+      underlying: signal.underlying,
+      expiration: signal.expiration || null,
+    } : null,
+    requiresVerification: success,
   };
 }
 
@@ -2245,6 +2494,8 @@ async function placeOrder(
  * Persist symbol -> trade_group_id mapping when an entry order is placed.
  * This is the SOURCE OF TRUTH for position grouping.
  * Stores leg_qty and leg_side for deterministic stacking support.
+ * 
+ * CRITICAL: This should ONLY be called AFTER verify_fill confirms all legs are present.
  */
 async function persistPositionGroupMap(
   supabaseClient: any,
