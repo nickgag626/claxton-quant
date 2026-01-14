@@ -7,7 +7,9 @@ export type EventType =
   | 'entry_filled' 
   | 'exit_attempt' 
   | 'exit_filled' 
-  | 'exit_rejected';
+  | 'exit_rejected'
+  | 'exit_blocked'
+  | 'critical_auto_reconcile';
 
 export type Decision = 'PASS' | 'FAIL' | 'OPEN' | 'SKIP' | 'CLOSE' | 'HOLD';
 

@@ -76,7 +76,7 @@ export const strategyEngine = {
     success: boolean;
     orderId?: string;
     error?: string;
-    blocked?: 'cooldown' | 'conflict';
+    blocked?: 'cooldown' | 'conflict' | 'in_flight';
     entry_conflict?: boolean;
     conflict_symbols?: string[];
     conflictDetails?: string[];
@@ -88,9 +88,21 @@ export const strategyEngine = {
       resolution: string;
     }>;
     allow_entry_netting?: boolean;
-    pendingVerification?: VerifyFillParams;
-    requiresVerification?: boolean;
     tradeGroupId?: string;
+    // Verified Entry response fields
+    verified?: boolean;
+    critical?: boolean;
+    filledLegs?: string[];
+    missingLegs?: string[];
+    bailOutOrders?: Array<{
+      symbol: string;
+      orderId?: string;
+      error?: string;
+      side: string;
+    }>;
+    orderStatus?: string;
+    mappingPersisted?: boolean;
+    message?: string;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {

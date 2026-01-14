@@ -1659,10 +1659,13 @@ export const useTradingData = () => {
         for (const signal of entryResult.signals) {
           addActivity('TRADE', `Entry signal: ${signal.strategyName} - ${signal.underlying} $${signal.credit.toFixed(2)} credit`);
 
+          // === VERIFIED ENTRY: Server handles 60s verification + bail-out ===
+          addActivity('TRADE', `Submitting verified entry: ${signal.strategyName} (60s fill window)`);
           const execResult = await strategyEngine.executeSignal(signal);
 
-          if (execResult.success) {
-            addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId}) - Verifying fills...`);
+          if (execResult.success && execResult.verified) {
+            // Fully verified - all legs confirmed
+            addActivity('TRADE', `✅ Entry verified: ${signal.strategyName} (Order #${execResult.orderId}) - All legs filled`);
             setRiskStatus(prev => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
 
             setStrategyPositions(prev => {
@@ -1677,49 +1680,36 @@ export const useTradingData = () => {
               });
               return newMap;
             });
+          } else if (execResult.critical) {
+            // CRITICAL: Partial fill with automatic bail-out
+            const filled = execResult.filledLegs?.length || 0;
+            const missing = execResult.missingLegs?.length || 0;
+            const bailOutCount = execResult.bailOutOrders?.filter((o: any) => o.orderId)?.length || 0;
             
-            // === ATOMIC MAPPING: Verify fills before persisting ===
-            // Wait for broker to update, then verify
-            if (execResult.pendingVerification) {
-              // Wait a moment for broker to process
-              await new Promise(r => setTimeout(r, 3000));
-              
-              try {
-                const verifyResult = await strategyEngine.verifyFill(execResult.pendingVerification);
-                
-                if (verifyResult.verified) {
-                  addActivity('TRADE', `✅ All ${verifyResult.filledLegs?.length || signal.legs.length} legs verified for ${signal.strategyName}`);
-                } else if (verifyResult.critical) {
-                  // CRITICAL: Partial fill detected - halt entries
-                  const missing = verifyResult.missingLegs?.join(', ') || 'unknown';
-                  
-                  addActivity('RISK', 
-                    `🚨 CRITICAL: PARTIAL FILL - ${signal.strategyName} Order #${execResult.orderId}. ` +
-                    `Missing legs: ${missing}. ENTRIES HALTED.`
-                  );
-                  
-                  toast({
-                    title: "🚨 CRITICAL: Partial Fill Detected",
-                    description: `Order ${execResult.orderId} only filled ${verifyResult.filledLegs?.length || 0}/${signal.legs.length} legs.\n\n` +
-                      `Missing: ${missing}\n\n` +
-                      `Bot entries are HALTED until you manually resolve this.`,
-                    variant: "destructive",
-                    duration: 30000,
-                  });
-                  
-                  // Set critical block flag
-                  setEntryBlockedReason(`PARTIAL FILL: Order ${execResult.orderId} - ${verifyResult.missingLegs?.length || 'some'} leg(s) missing`);
-                  
-                  // Stop processing more entries this cycle
-                  await fetchData();
-                  return;
-                } else if (verifyResult.orderStatus === 'pending' || verifyResult.orderStatus === 'open') {
-                  addActivity('SYSTEM', `Order ${execResult.orderId} still pending - will verify on next cycle`);
-                }
-              } catch (verifyErr) {
-                addActivity('SYSTEM', `Verification failed: ${verifyErr} - will retry on next cycle`);
-              }
-            }
+            addActivity('RISK', 
+              `🚨 CRITICAL AUTO-RECONCILE: ${signal.strategyName} Order #${execResult.orderId}. ` +
+              `${filled} filled, ${missing} missing. ${bailOutCount} bail-out orders placed.`
+            );
+            
+            toast({
+              title: "🚨 CRITICAL: Partial Fill - Auto Bail-Out Executed",
+              description: `Order ${execResult.orderId} only filled ${filled}/${filled + missing} legs.\n\n` +
+                `Missing: ${execResult.missingLegs?.join(', ') || 'unknown'}\n\n` +
+                `${bailOutCount} bail-out close orders placed automatically.\n\n` +
+                `Bot entries are HALTED. Manual review required.`,
+              variant: "destructive",
+              duration: 60000, // Keep visible for 1 minute
+            });
+            
+            // Set critical block flag
+            setEntryBlockedReason(
+              `CRITICAL AUTO-RECONCILE: Order ${execResult.orderId} - ` +
+              `${missing} leg(s) missing, ${bailOutCount} bail-out orders placed`
+            );
+            
+            // Stop processing more entries this cycle
+            await fetchData();
+            return;
           } else if (execResult.blocked === 'cooldown') {
             addActivity('RISK', `Entry blocked (cooldown): ${signal.strategyName} - wait 2 minutes`);
             toast({
@@ -1729,7 +1719,7 @@ export const useTradingData = () => {
             });
           } else if (execResult.blocked === 'conflict') {
             const conflictSymbols = execResult.conflict_symbols?.join(', ') || 
-              execResult.conflicts?.map(c => c.symbol).join(', ') || 'unknown';
+              execResult.conflicts?.map((c: any) => c.symbol).join(', ') || 'unknown';
             const conflictDetails = execResult.conflictDetails?.join('\n• ') || '';
             
             addActivity('RISK', `STRICT MODE: Entry blocked - overlapping positions [${conflictSymbols}]`);
@@ -1939,9 +1929,32 @@ export const useTradingData = () => {
     runStrategyEngine();
 
     const engineInterval = setInterval(runStrategyEngine, 30000);
+    
+    // === AUTO CLEANUP: Every 5 minutes while bot is running ===
+    const AUTO_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    let lastAutoCleanup = Date.now();
+    
+    const cleanupInterval = setInterval(async () => {
+      const now = Date.now();
+      if (now - lastAutoCleanup >= AUTO_CLEANUP_INTERVAL_MS) {
+        lastAutoCleanup = now;
+        try {
+          console.log('[AUTO_CLEANUP] Running 5-minute stale mapping cleanup...');
+          const result = await strategyEngine.cleanupMaps(true); // aggressive mode
+          if (result.deletedCount > 0) {
+            addActivity('SYSTEM', `Auto cleanup: deleted ${result.deletedCount} stale mappings`);
+          }
+        } catch (err) {
+          console.error('[AUTO_CLEANUP] Error:', err);
+        }
+      }
+    }, 60000); // Check every minute if cleanup is due
 
-    return () => clearInterval(engineInterval);
-  }, [isBotRunning, runStrategyEngine]);
+    return () => {
+      clearInterval(engineInterval);
+      clearInterval(cleanupInterval);
+    };
+  }, [isBotRunning, runStrategyEngine, addActivity]);
 
   // Background task: Poll pending close orders and update their status
   useEffect(() => {
