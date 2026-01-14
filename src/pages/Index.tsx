@@ -55,6 +55,8 @@ const Index = () => {
     // Structure Integrity Gate
     entryBlockedReason,
     clearEntryBlock,
+    // Mapping maintenance
+    purgeStaleMappings,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -101,6 +103,7 @@ const Index = () => {
               onRetryCloseAsGroup={retryCloseAsGroup}
               entryBlockedReason={entryBlockedReason}
               onClearEntryBlock={clearEntryBlock}
+              onPurgeStaleMappings={purgeStaleMappings}
             />
             <PnLChart dailyPnl={riskStatus.dailyPnl} pnlHistory={pnlHistory} />
             <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />
