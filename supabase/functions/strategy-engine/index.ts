@@ -15,7 +15,12 @@ const ENTRY_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 // Key format: underlying:expiration:sortedSymbols (symbols, not strikes, for exact match)
 // This prevents race conditions where broker positions haven't updated yet
 const inFlightOrderCache = new Map<string, number>();
-const IN_FLIGHT_ORDER_TTL_MS = 60 * 1000; // 1 minute
+const IN_FLIGHT_ORDER_TTL_MS = 90 * 1000; // 90 seconds (covers 60s verification window + buffer)
+
+// === VERIFIED ENTRY CONSTANTS ===
+const VERIFICATION_TIMEOUT_MS = 60 * 1000; // 60 seconds max wait for fill
+const VERIFICATION_POLL_INTERVAL_MS = 3000; // Poll every 3 seconds
+const BAILOUT_ORDER_DELAY_MS = 300; // 300ms between bail-out orders to avoid throttling
 
 function generateInFlightKey(underlying: string, expiration: string, legs: any[]): string {
   // Use sorted option symbols for exact match (catches duplicate condors with same strikes)
@@ -1561,7 +1566,11 @@ serve(async (req) => {
     }
 
     if (action === 'execute') {
-      // Execute a trade signal with preflight checks
+      // Execute a trade signal with VERIFIED ENTRY flow
+      // 1. Place order
+      // 2. Wait up to 60 seconds for fill confirmation
+      // 3. If not filled, BAIL OUT (cancel + market close orphan legs)
+      // 4. Only persist mapping if fully verified
       const { signal, tradeGroupId } = body;
       
       if (!signal || !signal.legs) {
@@ -1635,7 +1644,7 @@ serve(async (req) => {
         expected: 'no duplicate in-flight order',
         actual: { inFlight: orderInFlight, key: inFlightKey },
         pass: !orderInFlight,
-        reason: orderInFlight ? 'Entry blocked - identical order already in-flight (wait 1 minute)' : undefined,
+        reason: orderInFlight ? 'Entry blocked - identical order already in-flight (wait 90 seconds)' : undefined,
       });
       
       if (orderInFlight) {
@@ -1660,7 +1669,7 @@ serve(async (req) => {
         return new Response(
           JSON.stringify({ 
             success: false, 
-            error: 'Entry blocked - identical order already in-flight (wait 1 minute)',
+            error: 'Entry blocked - identical order already in-flight (wait 90 seconds)',
             blocked: 'in_flight',
             tradeGroupId: effectiveTradeGroupId,
           }),
@@ -1700,7 +1709,6 @@ serve(async (req) => {
       
       // Build position map for conflict check
       // STRICT MODE by default (allowNetting = false)
-      // Only allow netting if signal explicitly enables it
       const proposedLegs = signal.proposedOrder?.legs || signal.legs;
       const allowNetting = signal.allowEntryNetting === true; // Default: false (STRICT mode)
       const conflictResult = checkEntryConflicts(proposedLegs, brokerPositions, allowNetting);
@@ -1727,10 +1735,8 @@ serve(async (req) => {
       
       if (!conflictResult.canProceed) {
         console.log(`[PREFLIGHT] STRICT MODE: Entry blocked by conflicts:`, conflictResult.conflicts);
-        // Set cooldown to prevent spam
         setEntryCooldown(cooldownKey);
         
-        // Build detailed conflict description for UI
         const conflictDetails = conflictResult.conflicts.map(c => 
           `${c.symbol}: ${c.existingQty > 0 ? 'LONG' : 'SHORT'} ${Math.abs(c.existingQty)} vs proposed ${c.proposedSide}`
         );
@@ -1775,7 +1781,7 @@ serve(async (req) => {
         );
       }
 
-      // Save entry_attempt evaluation with trade_group_id (including preflight gates)
+      // Save entry_attempt evaluation with trade_group_id
       if (signal.strategyId) {
         await saveEvaluation(
           supabase,
@@ -1785,7 +1791,7 @@ serve(async (req) => {
           {
             decision: 'OPEN',
             reason: conflictResult.nettingApplied 
-              ? `Entry proceeding with netting: ${conflictResult.conflicts.filter(c => c.resolution === 'netting_applied').length} leg(s) converted to close (WARNING: may create partial structure)` 
+              ? `Entry proceeding with netting` 
               : 'Executing entry order (no conflicts)',
             gates,
             inputs: { market: {}, account: {} },
@@ -1794,7 +1800,6 @@ serve(async (req) => {
           { 
             signal, 
             netting_applied: conflictResult.nettingApplied,
-            adjustments: conflictResult.nettingApplied ? conflictResult : undefined 
           },
           effectiveTradeGroupId
         );
@@ -1805,41 +1810,303 @@ serve(async (req) => {
         ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
         : signal;
 
-      const orderResponse = await placeOrder(baseUrl, accountId, apiToken, signalToExecute, effectiveTradeGroupId, supabase);
+      // === SET IN-FLIGHT IMMEDIATELY (before order submission) ===
+      setOrderInFlight(inFlightKey);
       
-      // If order succeeded, set in-flight to prevent duplicate entries
-      if (orderResponse.success) {
-        setOrderInFlight(inFlightKey);
-        console.log(`[PREFLIGHT] Order succeeded, set in-flight: ${inFlightKey}`);
-      }
+      // === STEP 1: Place the order ===
+      const orderResponse = await placeOrderOnly(baseUrl, accountId, apiToken, signalToExecute, effectiveTradeGroupId);
       
-      // If order was rejected, set cooldown
-      if (!orderResponse.success) {
+      if (!orderResponse.success || !orderResponse.orderId) {
+        // Order failed - set cooldown and return
         setEntryCooldown(cooldownKey);
-        console.log(`[PREFLIGHT] Order rejected, setting cooldown: ${cooldownKey}`);
+        console.log(`[EXECUTE] Order rejected: ${orderResponse.error}`);
+        
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'exit_rejected', // Using this for order rejection
+            {
+              decision: 'FAIL',
+              reason: orderResponse.error || 'Order failed',
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            { signal, orderResponse },
+            effectiveTradeGroupId
+          );
+        }
+        
+        return new Response(
+          JSON.stringify({ 
+            success: false, 
+            error: orderResponse.error,
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
       }
       
-      // Save entry_submitted or entry_rejected based on result
+      console.log(`[EXECUTE] Order placed: ${orderResponse.orderId} - Starting verified entry flow (60s timeout)`);
+      
+      // === STEP 2: VERIFIED ENTRY - Poll for up to 60 seconds ===
+      const startTime = Date.now();
+      const expectedSymbols = signalToExecute.legs.map((l: any) => l.symbol);
+      const expectedLegCount = expectedSymbols.length;
+      let verified = false;
+      let orderStatus = 'pending';
+      let filledLegs: string[] = [];
+      let lastBrokerPositions: Array<{ symbol: string; quantity: number }> = [];
+      
+      while (Date.now() - startTime < VERIFICATION_TIMEOUT_MS) {
+        await new Promise(r => setTimeout(r, VERIFICATION_POLL_INTERVAL_MS));
+        
+        // Check order status
+        try {
+          const orderStatusUrl = `${baseUrl}/accounts/${accountId}/orders/${orderResponse.orderId}`;
+          const statusResponse = await fetch(orderStatusUrl, { headers });
+          const statusData = await statusResponse.json();
+          orderStatus = statusData?.order?.status?.toLowerCase() || 'unknown';
+          console.log(`[VERIFY] Order ${orderResponse.orderId} status: ${orderStatus} (elapsed: ${Date.now() - startTime}ms)`);
+          
+          // If order was rejected/canceled, exit immediately
+          if (orderStatus === 'rejected' || orderStatus === 'canceled' || orderStatus === 'expired') {
+            console.log(`[VERIFY] Order ${orderResponse.orderId} terminal status: ${orderStatus}`);
+            break;
+          }
+        } catch (err) {
+          console.error(`[VERIFY] Error checking order status:`, err);
+        }
+        
+        // Check broker positions
+        try {
+          const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
+          const posResponse = await fetch(posUrl, { headers });
+          const posData = await posResponse.json();
+          const rawPositions = posData?.positions?.position;
+          lastBrokerPositions = rawPositions 
+            ? (Array.isArray(rawPositions) ? rawPositions : [rawPositions])
+                .map((p: any) => ({ symbol: p.symbol, quantity: p.quantity }))
+            : [];
+          
+          // Check which expected symbols are present with non-zero qty
+          filledLegs = expectedSymbols.filter((sym: string) => 
+            lastBrokerPositions.some((bp: any) => bp.symbol === sym && bp.quantity !== 0)
+          );
+          
+          console.log(`[VERIFY] Filled legs: ${filledLegs.length}/${expectedLegCount}`);
+          
+          if (filledLegs.length === expectedLegCount) {
+            verified = true;
+            break;
+          }
+        } catch (err) {
+          console.error(`[VERIFY] Error checking positions:`, err);
+        }
+      }
+      
+      // === STEP 3: EVALUATE RESULT ===
+      if (verified) {
+        // SUCCESS: All legs filled - persist mapping
+        console.log(`[VERIFIED] ✅ All ${expectedLegCount} legs filled for order ${orderResponse.orderId}`);
+        
+        await persistPositionGroupMap(supabase, {
+          tradeGroupId: effectiveTradeGroupId,
+          openOrderId: String(orderResponse.orderId),
+          underlying: signal.underlying,
+          expiration: signal.expiration || null,
+          strategyName: signal.strategyName || null,
+          strategyType: signal.type || null,
+          legs: signalToExecute.legs.map((leg: any) => ({
+            symbol: leg.symbol,
+            quantity: leg.quantity || 1,
+            side: leg.side || 'unknown',
+          })),
+        });
+        
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_filled',
+            {
+              decision: 'OPEN',
+              reason: `All ${expectedLegCount} legs verified and filled`,
+              gates: [...gates, {
+                name: 'Fill Verification',
+                expected: `${expectedLegCount} legs filled`,
+                actual: { filledLegs: filledLegs.length, verified: true, orderStatus },
+                pass: true,
+              }],
+              inputs: { market: {}, account: {} },
+              proposedOrder: { ...signal.proposedOrder, order_id: orderResponse.orderId },
+            },
+            { signal, orderResponse, verified: true },
+            effectiveTradeGroupId
+          );
+        }
+        
+        return new Response(
+          JSON.stringify({ 
+            success: true,
+            orderId: orderResponse.orderId,
+            tradeGroupId: effectiveTradeGroupId,
+            verified: true,
+            filledLegs,
+            mappingPersisted: true,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+      
+      // === STEP 4: BAIL-OUT (Automatic rollback) ===
+      const missingLegs = expectedSymbols.filter((s: string) => !filledLegs.includes(s));
+      console.error(`[BAILOUT] 🚨 PARTIAL FILL: Order ${orderResponse.orderId} - ${filledLegs.length}/${expectedLegCount} legs after 60s`);
+      console.error(`[BAILOUT] Missing: ${missingLegs.join(', ')}, Filled: ${filledLegs.join(', ')}`);
+      
+      const bailOutOrders: Array<{ symbol: string; orderId?: string; error?: string; side: string }> = [];
+      
+      // Step 4a: Try to cancel unfilled order portions
+      if (orderStatus === 'open' || orderStatus === 'pending' || orderStatus === 'partially_filled') {
+        try {
+          const cancelUrl = `${baseUrl}/accounts/${accountId}/orders/${orderResponse.orderId}`;
+          const cancelResponse = await fetch(cancelUrl, { 
+            method: 'DELETE',
+            headers 
+          });
+          const cancelData = await cancelResponse.json();
+          console.log(`[BAILOUT] Cancel attempt for order ${orderResponse.orderId}:`, cancelData);
+        } catch (err) {
+          console.error(`[BAILOUT] Cancel failed:`, err);
+        }
+      }
+      
+      // Step 4b: Close any filled legs at market
+      for (const sym of filledLegs) {
+        await new Promise(r => setTimeout(r, BAILOUT_ORDER_DELAY_MS));
+        
+        // Find the leg info to determine close side
+        const leg = signalToExecute.legs.find((l: any) => l.symbol === sym);
+        const entryWasSell = leg?.side?.includes('sell');
+        const closeSide = entryWasSell ? 'buy_to_close' : 'sell_to_close';
+        
+        // Find current position qty
+        const positionQty = lastBrokerPositions.find(p => p.symbol === sym)?.quantity || 0;
+        const closeQty = Math.abs(positionQty);
+        
+        if (closeQty === 0) {
+          console.log(`[BAILOUT] Skip ${sym} - qty is 0`);
+          continue;
+        }
+        
+        try {
+          const closeUrl = `${baseUrl}/accounts/${accountId}/orders`;
+          const closeResponse = await fetch(closeUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${apiToken}`,
+              'Accept': 'application/json',
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+              class: 'option',
+              symbol: signal.underlying,
+              option_symbol: sym,
+              side: closeSide,
+              quantity: closeQty.toString(),
+              type: 'market',
+              duration: 'day',
+            }).toString(),
+          });
+          const closeData = await closeResponse.json();
+          const closeOrderId = closeData?.order?.id;
+          
+          bailOutOrders.push({
+            symbol: sym,
+            orderId: closeOrderId,
+            error: closeData?.errors?.error,
+            side: closeSide,
+          });
+          console.log(`[BAILOUT] Close order for ${sym}: ${closeOrderId || closeData?.errors?.error}`);
+        } catch (err) {
+          bailOutOrders.push({
+            symbol: sym,
+            error: err instanceof Error ? err.message : 'Unknown error',
+            side: closeSide,
+          });
+          console.error(`[BAILOUT] Close order failed for ${sym}:`, err);
+        }
+      }
+      
+      // Step 4c: Log CRITICAL_AUTO_RECONCILE event
       if (signal.strategyId) {
         await saveEvaluation(
           supabase,
           signal.strategyId,
           signal.underlying,
-          orderResponse.success ? 'entry_submitted' : 'exit_rejected',
+          'critical_auto_reconcile',
           {
-            decision: orderResponse.success ? 'OPEN' : 'FAIL',
-            reason: orderResponse.success ? `Order submitted: ${orderResponse.orderId}` : orderResponse.error || 'Order failed',
-            gates,
-            inputs: { market: {}, account: {} },
-            proposedOrder: { ...signal.proposedOrder, order_id: orderResponse.orderId },
+            decision: 'FAIL',
+            reason: `PARTIAL FILL - ${filledLegs.length}/${expectedLegCount} legs after 60s. Auto bail-out executed.`,
+            gates: [...gates, {
+              name: 'Fill Verification',
+              expected: `${expectedLegCount} legs filled within 60s`,
+              actual: { 
+                filledLegs: filledLegs.length, 
+                missingLegs: missingLegs.length,
+                verified: false, 
+                orderStatus,
+                timeoutMs: VERIFICATION_TIMEOUT_MS,
+              },
+              pass: false,
+              reason: 'Timeout exceeded - automatic bail-out triggered',
+            }],
+            inputs: { 
+              market: {
+                bailout_orders: bailOutOrders,
+                missing_legs: missingLegs,
+                filled_legs: filledLegs,
+              }, 
+              account: {} 
+            },
+            proposedOrder: { 
+              ...signal.proposedOrder, 
+              order_id: orderResponse.orderId,
+              bailout_orders: bailOutOrders,
+            },
           },
-          { signal, orderResponse },
+          { 
+            signal, 
+            orderResponse, 
+            verified: false, 
+            critical: true,
+            bailOutOrders,
+            missingLegs,
+            filledLegs,
+          },
           effectiveTradeGroupId
         );
       }
       
+      // DO NOT persist mapping - bail-out occurred
+      console.error(`[BAILOUT] ⚠️ Mapping NOT persisted for order ${orderResponse.orderId} - requires manual reconciliation`);
+      
       return new Response(
-        JSON.stringify({ ...orderResponse, tradeGroupId: effectiveTradeGroupId }),
+        JSON.stringify({ 
+          success: false,
+          orderId: orderResponse.orderId,
+          tradeGroupId: effectiveTradeGroupId,
+          verified: false,
+          critical: true,
+          orderStatus,
+          filledLegs,
+          missingLegs,
+          bailOutOrders,
+          message: 'CRITICAL: Partial fill detected. Automatic bail-out executed. Manual review required.',
+        }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -2431,13 +2698,17 @@ serve(async (req) => {
   }
 });
 
-async function placeOrder(
+/**
+ * Place order ONLY - no verification, no mapping persistence.
+ * This is step 1 of the Verified Entry flow.
+ * Returns immediately after broker accepts/rejects the order.
+ */
+async function placeOrderOnly(
   baseUrl: string, 
   accountId: string, 
   apiToken: string, 
   signal: any, 
-  tradeGroupId: string,
-  supabaseClient: any
+  tradeGroupId: string
 ) {
   const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
   
@@ -2457,7 +2728,7 @@ async function placeOrder(
       ...legParams,
     }).toString();
 
-    console.log('Placing multi-leg order:', orderBody);
+    console.log('[placeOrderOnly] Placing multi-leg order:', orderBody);
 
     const response = await fetch(orderUrl, {
       method: 'POST',
@@ -2470,34 +2741,16 @@ async function placeOrder(
     });
 
     const data = await response.json();
-    console.log('Order response:', JSON.stringify(data));
+    console.log('[placeOrderOnly] Order response:', JSON.stringify(data));
     
     const orderId = data?.order?.id;
     const success = !!orderId;
-    
-    // === ATOMIC MAPPING: DO NOT persist immediately ===
-    // Return pending verification data - frontend will call verify_fill
-    // Only persist AFTER verification confirms all legs filled
     
     return {
       success,
       orderId,
       error: data?.errors?.error,
       signal,
-      pendingVerification: success ? {
-        orderId: String(orderId),
-        expectedLegs: signal.legs.map((leg: any) => ({
-          symbol: leg.symbol,
-          quantity: leg.quantity || 1,
-          side: leg.side || 'unknown',
-        })),
-        tradeGroupId,
-        strategyName: signal.strategyName || null,
-        strategyType: signal.type || null,
-        underlying: signal.underlying,
-        expiration: signal.expiration || null,
-      } : null,
-      requiresVerification: success,
     };
   }
 
@@ -2525,26 +2778,11 @@ async function placeOrder(
   const orderId = data?.order?.id;
   const success = !!orderId;
   
-  // Single leg - still use verification for consistency
   return {
     success,
     orderId,
     error: data?.errors?.error,
     signal,
-    pendingVerification: success ? {
-      orderId: String(orderId),
-      expectedLegs: [{
-        symbol: leg.symbol,
-        quantity: leg.quantity || 1,
-        side: leg.side || 'unknown',
-      }],
-      tradeGroupId,
-      strategyName: signal.strategyName || null,
-      strategyType: signal.type || null,
-      underlying: signal.underlying,
-      expiration: signal.expiration || null,
-    } : null,
-    requiresVerification: success,
   };
 }
 
