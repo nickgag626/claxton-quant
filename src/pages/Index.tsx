@@ -52,6 +52,9 @@ const Index = () => {
     isGroupedPosition,
     getGroupPositions,
     clearHistory,
+    // Structure Integrity Gate
+    entryBlockedReason,
+    clearEntryBlock,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -96,6 +99,8 @@ const Index = () => {
               getGroupPositions={getGroupPositions}
               dtbpRejection={dtbpRejection}
               onRetryCloseAsGroup={retryCloseAsGroup}
+              entryBlockedReason={entryBlockedReason}
+              onClearEntryBlock={clearEntryBlock}
             />
             <PnLChart dailyPnl={riskStatus.dailyPnl} pnlHistory={pnlHistory} />
             <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />

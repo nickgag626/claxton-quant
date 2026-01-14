@@ -3,7 +3,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import { X, Layers, AlertTriangle, RefreshCw, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, Layers, AlertTriangle, RefreshCw, ChevronDown, ChevronRight, ShieldOff, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Position } from '@/types/trading';
 import { useState, useMemo } from 'react';
@@ -52,6 +52,9 @@ interface PositionsPanelProps {
     timestamp: number;
   } | null;
   onRetryCloseAsGroup?: () => Promise<boolean>;
+  // Structure Integrity Gate
+  entryBlockedReason?: string | null;
+  onClearEntryBlock?: () => void;
 }
 
 interface GroupedPositionInfo {
@@ -108,6 +111,8 @@ export const PositionsPanel = ({
   getGroupPositions,
   dtbpRejection,
   onRetryCloseAsGroup,
+  entryBlockedReason,
+  onClearEntryBlock,
 }: PositionsPanelProps) => {
   const [closingPositions, setClosingPositions] = useState<Set<string>>(new Set());
   const [closingGroups, setClosingGroups] = useState<Set<string>>(new Set());
@@ -438,6 +443,30 @@ export const PositionsPanel = ({
           />
         </div>
       </div>
+
+      {/* ENTRIES HALTED Warning - Structure Integrity Gate */}
+      {entryBlockedReason && (
+        <Alert className="mb-3 border-panic-red bg-panic-red/20">
+          <ShieldOff className="h-4 w-4 text-panic-red" />
+          <AlertDescription className="text-sm text-panic-red flex items-center justify-between">
+            <div className="flex flex-col gap-0.5">
+              <span className="font-semibold">⛔ ENTRIES HALTED</span>
+              <span className="text-xs opacity-80">{entryBlockedReason}</span>
+            </div>
+            {onClearEntryBlock && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-3 text-xs border-panic-red/50 text-panic-red hover:bg-panic-red/20 gap-1.5"
+                onClick={onClearEntryBlock}
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Clear Entry Block
+              </Button>
+            )}
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Leg Out Mode Warning */}
       {legOutModeEnabled && (
