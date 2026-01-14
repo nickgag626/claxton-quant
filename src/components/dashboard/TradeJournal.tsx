@@ -842,8 +842,13 @@ export const TradeJournal = () => {
           className="flex items-center justify-between cursor-pointer border-b border-border pb-1.5 mb-3"
           onClick={() => setIsExpanded(!isExpanded)}
         >
-          <div className="text-[10px] text-muted-foreground uppercase tracking-widest">
-            Trade Journal
+          <div className="flex items-center gap-3">
+            <span className="text-[10px] text-muted-foreground uppercase tracking-widest">
+              Trade Journal
+            </span>
+            <span className="text-[10px] px-2 py-0.5 rounded bg-primary/20 text-primary font-medium">
+              {flatTrades.length} legs · {trades.filter(t => 'groupId' in t).length || Math.ceil(flatTrades.length / 4)} groups
+            </span>
           </div>
           <div className="flex items-center gap-4">
             <div className="flex gap-3 text-[10px]">
