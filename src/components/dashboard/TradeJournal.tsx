@@ -561,6 +561,8 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
 
 export const TradeJournal = () => {
   const [trades, setTrades] = useState<(TradeRecord | TradeGroup)[]>([]);
+  const [flatTrades, setFlatTrades] = useState<TradeRecord[]>([]);
+  const [viewMode, setViewMode] = useState<'grouped' | 'flat'>('grouped');
   const [stats, setStats] = useState<TradeStats>({
     totalTrades: 0,
     totalLegs: 0,
@@ -597,7 +599,7 @@ export const TradeJournal = () => {
   // Initial load
   useEffect(() => {
     loadTrades();
-  }, []);
+  }, [viewMode]); // Reload when view mode changes
 
   // Real-time subscription for trade updates
   useEffect(() => {
@@ -645,14 +647,24 @@ export const TradeJournal = () => {
       setIsRefreshing(true);
     }
     
-    const [tradesData, statsData, todayData] = await Promise.all([
+    const [groupedTradesData, statsData, todayData] = await Promise.all([
       tradeJournal.getGroupedTrades(),
       tradeJournal.getTradeStats(countByLeg),
       tradeJournal.getRealizedTodayPnl(),
     ]);
     
-    // Update data without clearing first to prevent flicker
-    setTrades(tradesData);
+    // Always fetch flat trades for count display
+    const allTrades = await tradeJournal.getTrades(500);
+    setFlatTrades(allTrades);
+    
+    // Update grouped or flat based on view mode
+    if (viewMode === 'grouped') {
+      setTrades(groupedTradesData);
+    } else {
+      // Flat view - show all individual legs
+      setTrades(allTrades);
+    }
+    
     setStats(statsData);
     setTodayRealized({ pnl: todayData.realized, count: todayData.tradeCount });
     
@@ -948,6 +960,22 @@ export const TradeJournal = () => {
                   )}
                   Reconcile from Tradier
                 </Button>
+              </div>
+
+              {/* View Mode Toggle */}
+              <div className="flex items-center space-x-2" onClick={(e) => e.stopPropagation()}>
+                <Select value={viewMode} onValueChange={(v) => setViewMode(v as 'grouped' | 'flat')}>
+                  <SelectTrigger className="h-7 w-[100px] text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="grouped">Grouped</SelectItem>
+                    <SelectItem value="flat">Flat</SelectItem>
+                  </SelectContent>
+                </Select>
+                <span className="text-[9px] text-muted-foreground">
+                  {flatTrades.length} legs / {trades.filter(t => 'groupId' in t || viewMode === 'flat').length} {viewMode === 'grouped' ? 'groups' : 'rows'}
+                </span>
               </div>
 
               {/* Count by Leg Toggle */}

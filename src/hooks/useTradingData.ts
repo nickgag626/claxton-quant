@@ -468,6 +468,9 @@ export const useTradingData = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
+  
+  // === STRUCTURE INTEGRITY GATE: Entry block when broken structures exist ===
+  const [entryBlockedReason, setEntryBlockedReason] = useState<string | null>(null);
   const [pnlHistory, setPnlHistory] = useState<{ time: string; pnl: number }[]>([]);
   const [strategyPositions, setStrategyPositions] = useState<
     Map<string, { strategyName: string; underlying: string; entryCredit: number; entryTime: Date }>
@@ -869,11 +872,85 @@ export const useTradingData = () => {
     }
   }, [fetchFastData, fetchSlowData, fetchDataLegacy]);
 
-  const toggleBot = useCallback(() => {
+  const toggleBot = useCallback(async () => {
     const newState = !isBotRunning;
     setIsBotRunning(newState);
     addActivity('BOT', newState ? 'Bot started by user' : 'Bot stopped by user');
+    
+    // Run cleanup on bot start
+    if (newState) {
+      try {
+        const cleanupResult = await strategyEngine.cleanupMaps();
+        if (cleanupResult.deletedCount > 0) {
+          addActivity('SYSTEM', `Cleaned up ${cleanupResult.deletedCount} stale position mappings`);
+        }
+      } catch (err) {
+        console.error('[toggleBot] Cleanup failed:', err);
+      }
+    }
   }, [isBotRunning, addActivity]);
+  
+  /**
+   * Clear entry block manually after user intervention.
+   * Called when user has resolved broken structures or partial fills.
+   */
+  const clearEntryBlock = useCallback(() => {
+    setEntryBlockedReason(null);
+    addActivity('SYSTEM', 'Entry block cleared by user - entries resumed');
+    toast({
+      title: "Entries Resumed",
+      description: "Manual entry block has been cleared. Bot will resume normal operations.",
+    });
+  }, [addActivity]);
+  
+  /**
+   * Check structure integrity of current positions.
+   * Returns { healthy, brokenGroups, orphanSymbols, reason }.
+   * Used to gate new entries when broken structures exist.
+   */
+  const checkStructureIntegrity = useCallback((): { 
+    healthy: boolean; 
+    brokenGroups: { groupId: string; expected: number; observed: number; strategyType: string }[]; 
+    orphanSymbols: string[];
+    reason: string;
+  } => {
+    const brokenGroups: { groupId: string; expected: number; observed: number; strategyType: string }[] = [];
+    const orphanSymbols: string[] = [];
+    
+    // Check for orphans (positions with IDs ending in '-orphan' from allocation mismatch)
+    for (const pos of positions) {
+      if (pos.id.endsWith('-orphan')) {
+        orphanSymbols.push(pos.symbol);
+      }
+    }
+    
+    // Check for broken groups (observed legs < expected legs)
+    const groupedPositions = new Map<string, Position[]>();
+    for (const pos of positions.filter(p => p.tradeGroupId)) {
+      const group = groupedPositions.get(pos.tradeGroupId!) || [];
+      group.push(pos);
+      groupedPositions.set(pos.tradeGroupId!, group);
+    }
+    
+    for (const [groupId, groupLegs] of groupedPositions) {
+      const strategyType = groupLegs[0]?.strategyType;
+      const expected = expectedLegCount(strategyType);
+      if (expected !== null && groupLegs.length < expected) {
+        brokenGroups.push({ 
+          groupId, 
+          expected, 
+          observed: groupLegs.length,
+          strategyType: strategyType || 'unknown',
+        });
+      }
+    }
+    
+    const healthy = brokenGroups.length === 0 && orphanSymbols.length === 0;
+    const reason = healthy ? '' : 
+      `${brokenGroups.length} broken group(s), ${orphanSymbols.length} orphan position(s)`;
+    
+    return { healthy, brokenGroups, orphanSymbols, reason };
+  }, [positions]);
 
   const toggleKillSwitch = useCallback(() => {
     const newStatus = !riskStatus.killSwitchActive;
@@ -1494,6 +1571,38 @@ export const useTradingData = () => {
         await fetchData();
       }
 
+      // === PRE-ENTRY STRUCTURE INTEGRITY GATE ===
+      // Check if there are any broken structures or orphan positions
+      // If so, block ALL new entries until manually resolved
+      
+      // First check if we have a manual entry block
+      if (entryBlockedReason) {
+        addActivity('RISK', 
+          `⛔ ENTRY BLOCKED: ${entryBlockedReason}. ` +
+          `Clear entry block before new entries.`
+        );
+        return;
+      }
+      
+      // Then check structure integrity
+      const integrity = checkStructureIntegrity();
+
+      if (!integrity.healthy) {
+        addActivity('RISK', 
+          `⛔ ENTRY GATE BLOCKED: ${integrity.reason}. ` +
+          `Resolve broken structures before new entries.`
+        );
+        toast({
+          title: "🚨 Entries Halted - Structure Integrity",
+          description: `Bot detected ${integrity.brokenGroups.length} broken groups and ` +
+            `${integrity.orphanSymbols.length} orphan positions. Manual intervention required.`,
+          variant: "destructive",
+          duration: 15000,
+        });
+        // Skip all entry signals this cycle
+        return;
+      }
+
       const entryResult = await strategyEngine.evaluateStrategies(strategies, positions);
 
       if (entryResult.signals.length > 0) {
@@ -1503,7 +1612,7 @@ export const useTradingData = () => {
           const execResult = await strategyEngine.executeSignal(signal);
 
           if (execResult.success) {
-            addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId})`);
+            addActivity('TRADE', `Order placed: ${signal.strategyName} (Order #${execResult.orderId}) - Verifying fills...`);
             setRiskStatus(prev => ({ ...prev, tradeCount: prev.tradeCount + 1 }));
 
             setStrategyPositions(prev => {
@@ -1518,6 +1627,49 @@ export const useTradingData = () => {
               });
               return newMap;
             });
+            
+            // === ATOMIC MAPPING: Verify fills before persisting ===
+            // Wait for broker to update, then verify
+            if (execResult.pendingVerification) {
+              // Wait a moment for broker to process
+              await new Promise(r => setTimeout(r, 3000));
+              
+              try {
+                const verifyResult = await strategyEngine.verifyFill(execResult.pendingVerification);
+                
+                if (verifyResult.verified) {
+                  addActivity('TRADE', `✅ All ${verifyResult.filledLegs?.length || signal.legs.length} legs verified for ${signal.strategyName}`);
+                } else if (verifyResult.critical) {
+                  // CRITICAL: Partial fill detected - halt entries
+                  const missing = verifyResult.missingLegs?.join(', ') || 'unknown';
+                  
+                  addActivity('RISK', 
+                    `🚨 CRITICAL: PARTIAL FILL - ${signal.strategyName} Order #${execResult.orderId}. ` +
+                    `Missing legs: ${missing}. ENTRIES HALTED.`
+                  );
+                  
+                  toast({
+                    title: "🚨 CRITICAL: Partial Fill Detected",
+                    description: `Order ${execResult.orderId} only filled ${verifyResult.filledLegs?.length || 0}/${signal.legs.length} legs.\n\n` +
+                      `Missing: ${missing}\n\n` +
+                      `Bot entries are HALTED until you manually resolve this.`,
+                    variant: "destructive",
+                    duration: 30000,
+                  });
+                  
+                  // Set critical block flag
+                  setEntryBlockedReason(`PARTIAL FILL: Order ${execResult.orderId} - ${verifyResult.missingLegs?.length || 'some'} leg(s) missing`);
+                  
+                  // Stop processing more entries this cycle
+                  await fetchData();
+                  return;
+                } else if (verifyResult.orderStatus === 'pending' || verifyResult.orderStatus === 'open') {
+                  addActivity('SYSTEM', `Order ${execResult.orderId} still pending - will verify on next cycle`);
+                }
+              } catch (verifyErr) {
+                addActivity('SYSTEM', `Verification failed: ${verifyErr} - will retry on next cycle`);
+              }
+            }
           } else if (execResult.blocked === 'cooldown') {
             addActivity('RISK', `Entry blocked (cooldown): ${signal.strategyName} - wait 2 minutes`);
             toast({
@@ -1550,7 +1702,7 @@ export const useTradingData = () => {
       console.error('Strategy engine error:', error);
       addActivity('SYSTEM', `Engine error: ${error instanceof Error ? error.message : 'Unknown'}`);
     }
-  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData, strategyPositions, requestClose, getGroupPositions]);
+  }, [isBotRunning, riskStatus.killSwitchActive, strategies, positions, addActivity, fetchData, strategyPositions, requestClose, getGroupPositions, checkStructureIntegrity, entryBlockedReason]);
 
   const copyLastCloseDebug = useCallback(async () => {
     try {
@@ -1841,5 +1993,10 @@ export const useTradingData = () => {
     dtbpRejection,
     isGroupedPosition,
     getGroupPositions,
+    
+    // === STRUCTURE INTEGRITY GATE ===
+    entryBlockedReason,
+    clearEntryBlock,
+    checkStructureIntegrity,
   };
 };
