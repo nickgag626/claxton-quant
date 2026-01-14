@@ -3,7 +3,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import { X, Layers, AlertTriangle, RefreshCw, ChevronDown, ChevronRight, ShieldOff, ShieldCheck } from 'lucide-react';
+import { X, Layers, AlertTriangle, RefreshCw, ChevronDown, ChevronRight, ShieldOff, ShieldCheck, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Position } from '@/types/trading';
 import { useState, useMemo } from 'react';
@@ -55,6 +55,8 @@ interface PositionsPanelProps {
   // Structure Integrity Gate
   entryBlockedReason?: string | null;
   onClearEntryBlock?: () => void;
+  // Mapping maintenance
+  onPurgeStaleMappings?: () => Promise<{ deletedCount: number }>;
 }
 
 interface GroupedPositionInfo {
@@ -113,11 +115,13 @@ export const PositionsPanel = ({
   onRetryCloseAsGroup,
   entryBlockedReason,
   onClearEntryBlock,
+  onPurgeStaleMappings,
 }: PositionsPanelProps) => {
   const [closingPositions, setClosingPositions] = useState<Set<string>>(new Set());
   const [closingGroups, setClosingGroups] = useState<Set<string>>(new Set());
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [brokenCloseConfirm, setBrokenCloseConfirm] = useState<GroupedPositionInfo | null>(null);
+  const [isPurging, setIsPurging] = useState(false);
   
   const handleClose = async (positionId: string) => {
     console.log('handleClose called with positionId:', positionId);
@@ -482,8 +486,29 @@ export const PositionsPanel = ({
       {hasBrokenGroups && (
         <Alert className="mb-3 border-panic-red/50 bg-panic-red/10">
           <AlertTriangle className="h-3 w-3 text-panic-red" />
-          <AlertDescription className="text-[10px] text-panic-red">
-            <strong>Broken Structure Detected:</strong> One or more strategy groups have missing legs. Bot will skip auto-exit on these positions.
+          <AlertDescription className="text-[10px] text-panic-red flex items-center justify-between">
+            <div>
+              <strong>Broken Structure Detected:</strong> One or more strategy groups have missing legs. This may be caused by stale mapping data.
+            </div>
+            {onPurgeStaleMappings && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 px-2 text-[9px] border-bloomberg-amber/50 text-bloomberg-amber hover:bg-bloomberg-amber/20 gap-1 ml-2 shrink-0"
+                onClick={async () => {
+                  setIsPurging(true);
+                  try {
+                    await onPurgeStaleMappings();
+                  } finally {
+                    setIsPurging(false);
+                  }
+                }}
+                disabled={isPurging}
+              >
+                <Trash2 className="h-3 w-3" />
+                {isPurging ? 'Purging...' : 'Purge Stale Mappings'}
+              </Button>
+            )}
           </AlertDescription>
         </Alert>
       )}

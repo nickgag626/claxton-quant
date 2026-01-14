@@ -2294,6 +2294,9 @@ serve(async (req) => {
     // === CLEANUP STALE MAPPINGS ===
     // Removes old position_group_map entries that no longer correspond to broker positions
     if (action === 'cleanup_maps') {
+      // Support aggressive mode (no 24h cutoff - deletes all mappings for closed positions)
+      const aggressive = body.aggressive === true;
+      
       // Fetch current broker positions
       let activeSymbols = new Set<string>();
       
@@ -2306,7 +2309,7 @@ serve(async (req) => {
         const rawPositions = posData?.positions?.position;
         const brokerPositions = rawPositions ? (Array.isArray(rawPositions) ? rawPositions : [rawPositions]) : [];
         activeSymbols = new Set(brokerPositions.map((p: any) => p.symbol));
-        console.log(`[cleanup_maps] Found ${activeSymbols.size} active broker positions`);
+        console.log(`[cleanup_maps] Found ${activeSymbols.size} active broker positions, aggressive=${aggressive}`);
       } catch (err) {
         console.error('[cleanup_maps] Error fetching positions:', err);
         return new Response(JSON.stringify({ 
@@ -2316,16 +2319,31 @@ serve(async (req) => {
         }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      // Fetch all mappings older than 24h
-      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      // In aggressive mode: fetch ALL mappings; otherwise only older than 24h
+      let staleMaps: any[] = [];
+      let fetchErr: any = null;
       
-      const { data: staleMaps, error: fetchErr } = await supabase
-        .from('position_group_map')
-        .select('id, symbol, trade_group_id, created_at')
-        .lt('created_at', cutoff);
+      if (aggressive) {
+        // AGGRESSIVE: Fetch ALL mappings for symbols NOT at broker
+        const { data, error } = await supabase
+          .from('position_group_map')
+          .select('id, symbol, trade_group_id, created_at');
+        staleMaps = data || [];
+        fetchErr = error;
+        console.log(`[cleanup_maps] AGGRESSIVE mode: checking ${staleMaps.length} total mappings`);
+      } else {
+        // NORMAL: Only mappings older than 24h
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const { data, error } = await supabase
+          .from('position_group_map')
+          .select('id, symbol, trade_group_id, created_at')
+          .lt('created_at', cutoff);
+        staleMaps = data || [];
+        fetchErr = error;
+      }
       
       if (fetchErr) {
-        console.error('[cleanup_maps] Error fetching stale maps:', fetchErr);
+        console.error('[cleanup_maps] Error fetching maps:', fetchErr);
         return new Response(JSON.stringify({ 
           error: fetchErr.message,
           deletedCount: 0,
@@ -2334,7 +2352,7 @@ serve(async (req) => {
       }
       
       // Filter to only delete if symbol is NOT in broker positions
-      const toDelete = (staleMaps || []).filter((m: any) => !activeSymbols.has(m.symbol));
+      const toDelete = staleMaps.filter((m: any) => !activeSymbols.has(m.symbol));
       
       let deletedCount = 0;
       if (toDelete.length > 0) {
@@ -2347,14 +2365,54 @@ serve(async (req) => {
           console.error('[cleanup_maps] Delete error:', deleteErr);
         } else {
           deletedCount = toDelete.length;
-          console.log(`[cleanup_maps] Deleted ${deletedCount} stale mappings`);
+          console.log(`[cleanup_maps] Deleted ${deletedCount} stale mappings (aggressive=${aggressive})`);
         }
       }
       
       return new Response(JSON.stringify({ 
         deletedCount,
         activeSymbolsCount: activeSymbols.size,
-        staleChecked: staleMaps?.length || 0,
+        staleChecked: staleMaps.length,
+        aggressive,
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // === DELETE GROUP MAPPINGS (called after successful close) ===
+    if (action === 'delete_group_mappings') {
+      const { tradeGroupId } = body;
+      
+      if (!tradeGroupId) {
+        return new Response(JSON.stringify({ 
+          success: false, 
+          error: 'Missing tradeGroupId',
+          deletedCount: 0,
+        }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      console.log(`[delete_group_mappings] Deleting mappings for group ${tradeGroupId}`);
+      
+      const { data: deleted, error: deleteErr } = await supabase
+        .from('position_group_map')
+        .delete()
+        .eq('trade_group_id', tradeGroupId)
+        .select('id');
+      
+      if (deleteErr) {
+        console.error('[delete_group_mappings] Delete error:', deleteErr);
+        return new Response(JSON.stringify({ 
+          success: false, 
+          error: deleteErr.message,
+          deletedCount: 0,
+        }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      const deletedCount = deleted?.length || 0;
+      console.log(`[delete_group_mappings] Deleted ${deletedCount} mappings for group ${tradeGroupId}`);
+      
+      return new Response(JSON.stringify({ 
+        success: true,
+        deletedCount,
+        tradeGroupId,
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 

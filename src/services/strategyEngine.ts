@@ -182,13 +182,15 @@ export const strategyEngine = {
   },
 
   /**
-   * Clean up stale position_group_map entries (older than 24h, no matching broker positions).
+   * Clean up stale position_group_map entries.
+   * @param aggressive - If true, deletes ALL mappings for symbols not at broker (no 24h cutoff)
    */
-  async cleanupMaps(): Promise<{ deletedCount: number; activeSymbolsCount: number }> {
+  async cleanupMaps(aggressive: boolean = false): Promise<{ deletedCount: number; activeSymbolsCount: number; aggressive?: boolean }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
         body: {
           action: 'cleanup_maps',
+          aggressive,
         },
       });
 
@@ -197,6 +199,27 @@ export const strategyEngine = {
     } catch (error) {
       console.error('Error cleaning up maps:', error);
       return { deletedCount: 0, activeSymbolsCount: 0 };
+    }
+  },
+
+  /**
+   * Delete position_group_map entries for a specific trade group.
+   * Call this after a successful close to prevent stale mapping accumulation.
+   */
+  async deleteGroupMappings(tradeGroupId: string): Promise<{ success: boolean; deletedCount: number }> {
+    try {
+      const { data, error } = await supabase.functions.invoke('strategy-engine', {
+        body: {
+          action: 'delete_group_mappings',
+          tradeGroupId,
+        },
+      });
+
+      if (error) throw error;
+      return data || { success: true, deletedCount: 0 };
+    } catch (error) {
+      console.error('Error deleting group mappings:', error);
+      return { success: false, deletedCount: 0 };
     }
   },
 };

@@ -276,11 +276,18 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
           });
         }
       } else {
-        // Mismatch - allocate oldest-first, any leftover stays ungrouped
-        console.log(`[enrichPositionsWithGroupIds] Qty mismatch for ${pos.symbol}: broker=${remainingQty}, mapped=${totalMappedQty}`);
+        // Mismatch - use SMART ALLOCATION: newest-first when overflow (stale mappings), oldest-first otherwise
+        const isOverflow = totalMappedQty > remainingQty;
         
-        const totalToAllocate = Math.min(remainingQty, totalMappedQty);
-        let allocated = 0;
+        if (isOverflow) {
+          // OVERFLOW: More mappings than broker qty → stale mappings exist
+          // Allocate NEWEST-FIRST so current positions get assigned to most recent trade groups
+          console.log(`[enrichPositionsWithGroupIds] ⚠️ OVERFLOW for ${pos.symbol}: broker=${remainingQty}, mapped=${totalMappedQty} → allocating NEWEST-FIRST (${totalMappedQty - remainingQty} stale mappings)`);
+          mappings.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        } else {
+          // UNDERFLOW: Broker has more than mapped → allocate oldest-first, remainder is orphan
+          console.log(`[enrichPositionsWithGroupIds] Qty mismatch for ${pos.symbol}: broker=${remainingQty}, mapped=${totalMappedQty}`);
+        }
         
         for (const mapping of mappings) {
           if (remainingQty <= 0) break;
@@ -302,11 +309,10 @@ async function enrichPositionsWithGroupIds(positions: Position[]): Promise<Posit
           });
           
           remainingQty -= allocQty;
-          allocated += allocQty;
         }
         
-        // Any remaining qty is ungrouped (requires manual reconcile)
-        if (remainingQty > 0) {
+        // Any remaining qty is ungrouped (requires manual reconcile) - only when broker has more than mapped
+        if (remainingQty > 0 && !isOverflow) {
           const fraction = remainingQty / Math.abs(pos.quantity);
           allocatedPositions.push({
             ...pos,
@@ -889,6 +895,37 @@ export const useTradingData = () => {
       }
     }
   }, [isBotRunning, addActivity]);
+
+  /**
+   * Purge stale mappings aggressively (no 24h cutoff).
+   * Deletes all position_group_map entries for symbols not currently at broker.
+   */
+  const purgeStaleMappings = useCallback(async (): Promise<{ deletedCount: number }> => {
+    try {
+      addActivity('SYSTEM', 'Purging stale position mappings...');
+      const result = await strategyEngine.cleanupMaps(true); // aggressive=true
+      if (result.deletedCount > 0) {
+        addActivity('SYSTEM', `✓ Purged ${result.deletedCount} stale mappings`);
+        toast({
+          title: "Mappings Purged",
+          description: `Removed ${result.deletedCount} stale mapping entries. Refresh positions to see corrected grouping.`,
+        });
+        // Refresh positions to re-run enrichment with clean mappings
+        await fetchData();
+      } else {
+        addActivity('SYSTEM', 'No stale mappings found to purge');
+        toast({
+          title: "No Stale Mappings",
+          description: "All position mappings are current.",
+        });
+      }
+      return { deletedCount: result.deletedCount };
+    } catch (err) {
+      console.error('[purgeStaleMappings] Error:', err);
+      addActivity('SYSTEM', `Purge failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      return { deletedCount: 0 };
+    }
+  }, [addActivity, fetchData]);
   
   /**
    * Clear entry block manually after user intervention.
@@ -1317,6 +1354,16 @@ export const useTradingData = () => {
           if (dtbpRejection?.tradeGroupId === tradeGroupId) {
             setDtbpRejection(null);
           }
+
+          // Phase 4: Delete mappings for this group to prevent stale accumulation
+          // Schedule async deletion (don't block the UI)
+          strategyEngine.deleteGroupMappings(tradeGroupId).then(deleteResult => {
+            if (deleteResult.deletedCount > 0) {
+              console.log(`[requestClose] Cleaned up ${deleteResult.deletedCount} mapping rows for group ${tradeGroupId}`);
+            }
+          }).catch(err => {
+            console.error('[requestClose] Failed to delete group mappings:', err);
+          });
 
           logAttempt('submitted', { orderId: result.orderId, journal: journalIds });
           await fetchData();
@@ -2001,5 +2048,8 @@ export const useTradingData = () => {
     entryBlockedReason,
     clearEntryBlock,
     checkStructureIntegrity,
+    
+    // === MAPPING MAINTENANCE ===
+    purgeStaleMappings,
   };
 };
