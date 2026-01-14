@@ -1588,6 +1588,9 @@ export const useTradingData = () => {
       const integrity = checkStructureIntegrity();
 
       if (!integrity.healthy) {
+        // SET THE STATE SO UI WARNING APPEARS
+        setEntryBlockedReason(integrity.reason);
+        
         addActivity('RISK', 
           `⛔ ENTRY GATE BLOCKED: ${integrity.reason}. ` +
           `Resolve broken structures before new entries.`
