@@ -1,5 +1,5 @@
 import { supabase } from '@/integrations/supabase/client';
-import { inferLegSides, getInferredSide, type InferredLeg } from '@/lib/legSideInference';
+import { inferLegSides, getInferredSide, computeNetExitDebit, type InferredLeg } from '@/lib/legSideInference';
 
 export type CloseStatus = 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired';
 
@@ -733,12 +733,14 @@ export const tradeJournal = {
 
       // Step 2: Process multi-leg groups using calculateGroupPnl
       for (const [groupId, groupLegs] of groupedTrades.entries()) {
-        // Sort by entry_time to ensure consistent first leg
-        groupLegs.sort((a, b) => 
-          new Date(a.entry_time || 0).getTime() - new Date(b.entry_time || 0).getTime()
-        );
+        // PHASE 1: Deterministic primary leg selection - sort by symbol, then by id
+        groupLegs.sort((a, b) => {
+          const symCmp = a.symbol.localeCompare(b.symbol);
+          if (symCmp !== 0) return symCmp;
+          return (a.id || '').localeCompare(b.id || '');
+        });
 
-        const firstLeg = groupLegs[0];
+        const primaryLeg = groupLegs[0];
         
         // Sanitize non-filled groups
         const allFilled = groupLegs.every(t => t.close_status === 'filled');
@@ -761,45 +763,61 @@ export const tradeJournal = {
 
         // Multi-leg group: use group-level P&L calculation with SELF-HEALING
         if (groupLegs.length > 1) {
-          const strategyType = firstLeg.strategy_type;
-          const contracts = Number(firstLeg.quantity) || 1;
+          const strategyType = primaryLeg.strategy_type;
+          
+          // PHASE 1: contracts = max(quantity) across all legs for robustness
+          const contracts = Math.max(...groupLegs.map(l => Number(l.quantity) || 1));
           const totalFees = groupLegs.reduce((sum, t) => sum + (Number(t.fees) || 0), 0);
           
-          // PHASE 1: Infer leg sides and recompute entry_credit from strikes
-          let inferredLegs: InferredLeg[] = [];
-          let computedEntryCredit = Number(firstLeg.entry_credit) || 0;
-          let entryCreditUpdated = false;
-          
-          // Try to infer from strikes for supported strategy types
+          // Build leg infos with exit prices for inference
           const legInfos = groupLegs.map(leg => ({
             symbol: leg.symbol,
             entryPrice: Number(leg.entry_price) || 0,
             exitPrice: Number(leg.exit_price) || undefined,
           }));
           
+          // PHASE 2: Prefer strike-based inference over position_group_map
           const inference = inferLegSides(legInfos, strategyType);
+          let inferredLegs: InferredLeg[] = [];
+          let computedEntryCredit = Number(primaryLeg.entry_credit) || 0;
+          let computedExitDebit = Number(primaryLeg.exit_debit) || 0;
+          let entryCreditUpdated = false;
+          let exitDebitUpdated = false;
           
           if (inference.success) {
             inferredLegs = inference.legs;
             
             // Check if stored entry_credit differs materially from inferred
-            const storedEntryCredit = Number(firstLeg.entry_credit) || 0;
+            const storedEntryCredit = Number(primaryLeg.entry_credit) || 0;
             const diff = Math.abs(storedEntryCredit - inference.netEntryCredit);
             
             if (diff > 0.005 || storedEntryCredit === 0) {
               console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit correction ${storedEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
               computedEntryCredit = inference.netEntryCredit;
               entryCreditUpdated = true;
-            } else {
-              computedEntryCredit = storedEntryCredit;
             }
+            
+            // PHASE 1: Compute netExitDebit from inferred sides if we have per-leg exit prices
+            if (inference.netExitDebit != null) {
+              const storedExitDebit = Number(primaryLeg.exit_debit) || 0;
+              const exitDiff = Math.abs(storedExitDebit - inference.netExitDebit);
+              
+              if (exitDiff > 0.005 || storedExitDebit === 0) {
+                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: exit_debit correction ${storedExitDebit.toFixed(4)} → ${inference.netExitDebit.toFixed(4)}`);
+                computedExitDebit = inference.netExitDebit;
+                exitDebitUpdated = true;
+              }
+            } else {
+              // Fall back to stored exit_debit or primary leg's exit_price (if it's a combo net price)
+              computedExitDebit = Number(primaryLeg.exit_debit) || Number(primaryLeg.exit_price) || 0;
+            }
+          } else {
+            // Inference failed - use stored values
+            computedExitDebit = Number(primaryLeg.exit_debit) || Number(primaryLeg.exit_price) || 0;
           }
           
-          // Use exit_debit if available, otherwise use first leg's exit_price (combo net price)
-          const exitDebit = Number(firstLeg.exit_debit) || Number(firstLeg.exit_price) || 0;
-          
           // Validate we have entry/exit data
-          if (computedEntryCredit === 0 && exitDebit === 0) {
+          if (computedEntryCredit === 0 && computedExitDebit === 0) {
             errors.push(`Group ${groupId.slice(0, 8)}: Missing entry_credit and exit_debit`);
             for (const leg of groupLegs) {
               await supabase.from('trades').update({ 
@@ -813,63 +831,63 @@ export const tradeJournal = {
             continue;
           }
 
-          // Calculate group P&L with corrected entry credit
-          const groupCalc = calculateGroupPnl(computedEntryCredit, exitDebit, contracts, 100, totalFees);
+          // Calculate group P&L with corrected values
+          const groupCalc = calculateGroupPnl(computedEntryCredit, computedExitDebit, contracts, 100, totalFees);
           
-          // PHASE 2: Determine leg sides - try position_group_map first, then use inference
+          // Build side data map from inference (preferred) - Phase 2
           const legSideData = new Map<string, { openSide: string; closeSide: string }>();
           
-          // First try position_group_map
-          for (const leg of groupLegs) {
-            const { data: mapping } = await supabase
-              .from('position_group_map')
-              .select('leg_side')
-              .eq('symbol', leg.symbol)
-              .eq('trade_group_id', leg.trade_group_id)
-              .maybeSingle();
-            if (mapping?.leg_side) {
-              const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
-                               mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : 'buy_to_close';
-              legSideData.set(leg.id!, { openSide: mapping.leg_side, closeSide });
+          // First use inference for all legs if available
+          if (inferredLegs.length > 0) {
+            for (const leg of groupLegs) {
+              const inferred = getInferredSide(inferredLegs, leg.symbol);
+              if (inferred) {
+                legSideData.set(leg.id!, { openSide: inferred.openSide, closeSide: inferred.closeSide });
+              }
             }
           }
           
-          // If mapping is incomplete, use strike-based inference
-          if (legSideData.size < groupLegs.length && inferredLegs.length > 0) {
-            for (const leg of groupLegs) {
-              if (!legSideData.has(leg.id!)) {
-                const inferred = getInferredSide(inferredLegs, leg.symbol);
-                if (inferred) {
-                  legSideData.set(leg.id!, { openSide: inferred.openSide, closeSide: inferred.closeSide });
-                }
+          // Only fall back to position_group_map for legs where inference failed
+          for (const leg of groupLegs) {
+            if (!legSideData.has(leg.id!)) {
+              const { data: mapping } = await supabase
+                .from('position_group_map')
+                .select('leg_side')
+                .eq('symbol', leg.symbol)
+                .eq('trade_group_id', leg.trade_group_id)
+                .maybeSingle();
+              if (mapping?.leg_side) {
+                const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
+                                 mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : 'buy_to_close';
+                legSideData.set(leg.id!, { openSide: mapping.leg_side, closeSide });
               }
             }
           }
 
-          // Update first leg with group P&L, corrected entry_credit, exit_debit, and sides
-          const firstLegSides = legSideData.get(firstLeg.id!);
-          const { error: firstLegError } = await supabase.from('trades').update({
+          // Update PRIMARY leg with group P&L, corrected entry_credit, exit_debit, and sides
+          const primaryLegSides = legSideData.get(primaryLeg.id!);
+          const { error: primaryLegError } = await supabase.from('trades').update({
             pnl: groupCalc.pnl,
             pnl_percent: groupCalc.pnlPercent,
             pnl_formula: groupCalc.formula,
             needs_reconcile: false,
-            // Persist corrected entry_credit and exit_debit
-            ...(entryCreditUpdated ? { entry_credit: computedEntryCredit } : {}),
-            exit_debit: exitDebit, // Always persist exit_debit on first leg
-            // Fix side labels
-            ...(firstLegSides ? { 
-              open_side: firstLegSides.openSide, 
-              close_side: firstLegSides.closeSide 
+            // Always persist entry_credit and exit_debit on primary leg
+            entry_credit: computedEntryCredit,
+            exit_debit: computedExitDebit,
+            // Fix side labels from inference
+            ...(primaryLegSides ? { 
+              open_side: primaryLegSides.openSide, 
+              close_side: primaryLegSides.closeSide 
             } : {}),
-          }).eq('id', firstLeg.id);
+          }).eq('id', primaryLeg.id);
 
-          if (firstLegError) {
-            errors.push(`Trade ${firstLeg.id}: ${firstLegError.message}`);
+          if (primaryLegError) {
+            errors.push(`Trade ${primaryLeg.id}: ${primaryLegError.message}`);
           } else {
             updated++;
           }
 
-          // Set other legs to 0 P&L (included in group total), update entry_credit if corrected, and fix their sides
+          // Set other legs to 0 P&L (included in group total), update entry_credit for consistency, and fix their sides
           for (let i = 1; i < groupLegs.length; i++) {
             const leg = groupLegs[i];
             const legSides = legSideData.get(leg.id!);
@@ -879,8 +897,8 @@ export const tradeJournal = {
               pnl_formula: 'Included in group total',
               needs_reconcile: false,
               // Persist corrected entry_credit on all legs for consistency
-              ...(entryCreditUpdated ? { entry_credit: computedEntryCredit } : {}),
-              // Fix side labels
+              entry_credit: computedEntryCredit,
+              // Fix side labels from inference
               ...(legSides ? { 
                 open_side: legSides.openSide, 
                 close_side: legSides.closeSide 
@@ -895,7 +913,7 @@ export const tradeJournal = {
           }
         } else {
           // Single-leg "group" - process as individual trade
-          ungroupedTrades.push(firstLeg);
+          ungroupedTrades.push(primaryLeg);
         }
       }
 
@@ -1189,25 +1207,33 @@ export const tradeJournal = {
 
       if (isMultiLeg && status === 'filled' && details?.avgFillPrice != null) {
         // === MULTI-LEG COMBO ORDER: Use GROUP-LEVEL NET P&L ===
-        // avgFillPrice from Tradier is the NET exit debit for the entire combo
-        const netExitDebit = Math.abs(details.avgFillPrice); // Ensure positive for debit
+        const typedTrades = trades.map(t => castToTradeRecord(t));
         
-        // Get net entry credit from first leg (should be same for all legs in group)
-        const firstTrade = castToTradeRecord(trades[0]);
-        const strategyType = firstTrade.strategy_type;
-        let netEntryCredit = firstTrade.entry_credit || 0;
-        const contracts = details.filledQty || firstTrade.quantity || 1;
+        // PHASE 3: Deterministic primary leg selection - sort by symbol, then by id
+        typedTrades.sort((a, b) => {
+          const symCmp = a.symbol.localeCompare(b.symbol);
+          if (symCmp !== 0) return symCmp;
+          return (a.id || '').localeCompare(b.id || '');
+        });
+        const primaryLeg = typedTrades[0];
+        
+        const strategyType = primaryLeg.strategy_type;
+        const contracts = details.filledQty || Math.max(...typedTrades.map(t => Number(t.quantity) || 1));
         const fees = details.fees || 0;
         
-        // PHASE 3: Try to infer leg sides and correct entry_credit if needed
-        const typedTrades = trades.map(t => castToTradeRecord(t));
+        // Build leg infos with exit prices for inference
+        // For combo orders, avgFillPrice is net debit - but we may also have per-leg fills
         const legInfos = typedTrades.map(t => ({
           symbol: t.symbol,
           entryPrice: Number(t.entry_price) || 0,
+          exitPrice: (details?.legFills?.[t.symbol]?.avgFillPrice ?? Number(t.exit_price)) || undefined,
         }));
         
+        // PHASE 3: Infer leg sides and compute entry_credit and exit_debit
         const inference = inferLegSides(legInfos, strategyType);
         let inferredLegs: InferredLeg[] = [];
+        let netEntryCredit = Number(primaryLeg.entry_credit) || 0;
+        let netExitDebit = Math.abs(details.avgFillPrice); // Combo net exit debit from Tradier
         
         if (inference.success) {
           inferredLegs = inference.legs;
@@ -1217,10 +1243,15 @@ export const tradeJournal = {
           if (diff > 0.005 || netEntryCredit === 0) {
             console.log(`[updateCloseStatus] Entry credit correction: ${netEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
             netEntryCredit = inference.netEntryCredit;
-            
-            // Persist corrected entry_credit on all legs
-            for (const trade of typedTrades) {
-              await supabase.from('trades').update({ entry_credit: netEntryCredit }).eq('id', trade.id);
+          }
+          
+          // If we have per-leg exit prices, compute exit_debit from inferred sides
+          if (inference.netExitDebit != null) {
+            const computedDiff = Math.abs(netExitDebit - inference.netExitDebit);
+            // Use computed if significantly different or if Tradier price is 0
+            if (computedDiff > 0.01 && netExitDebit === 0) {
+              console.log(`[updateCloseStatus] Exit debit from inference: ${inference.netExitDebit.toFixed(4)}`);
+              netExitDebit = inference.netExitDebit;
             }
           }
         }
@@ -1228,59 +1259,80 @@ export const tradeJournal = {
         // Calculate group P&L using net credit/debit formula
         let groupCalc: { pnl: number; pnlPercent: number; formula: string } | null = null;
         
-        if (netEntryCredit > 0) {
+        if (netEntryCredit > 0 || netExitDebit > 0) {
           groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, fees);
           groupPnl = groupCalc.pnl;
-          console.log(`[updateCloseStatus] Multi-leg combo P&L: Entry Credit=$${netEntryCredit}, Exit Debit=$${netExitDebit}, Contracts=${contracts}, P&L=$${groupCalc.pnl}`);
+          console.log(`[updateCloseStatus] Multi-leg combo P&L: Entry Credit=$${netEntryCredit.toFixed(4)}, Exit Debit=$${netExitDebit.toFixed(4)}, Contracts=${contracts}, P&L=$${groupCalc.pnl.toFixed(2)}`);
+        }
+        
+        // Build side data map from inference (preferred)
+        const legSideData = new Map<string, { openSide: string; closeSide: string }>();
+        
+        if (inferredLegs.length > 0) {
+          for (const trade of typedTrades) {
+            const inferred = getInferredSide(inferredLegs, trade.symbol);
+            if (inferred) {
+              legSideData.set(trade.id!, { openSide: inferred.openSide, closeSide: inferred.closeSide });
+            }
+          }
+        }
+        
+        // Fall back to position_group_map only for legs where inference failed
+        for (const trade of typedTrades) {
+          if (!legSideData.has(trade.id!)) {
+            const { data: mapping } = await supabase
+              .from('position_group_map')
+              .select('leg_qty, leg_side')
+              .eq('symbol', trade.symbol)
+              .eq('trade_group_id', trade.trade_group_id)
+              .maybeSingle();
+            
+            if (mapping?.leg_side) {
+              const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
+                               mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : null;
+              if (closeSide) {
+                legSideData.set(trade.id!, { openSide: mapping.leg_side, closeSide });
+              }
+            }
+          }
         }
         
         // Update all legs with group info
-        for (let i = 0; i < trades.length; i++) {
-          const trade = castToTradeRecord(trades[i]);
-          const isFirstLeg = i === 0;
-          
-          // Try to get leg-specific data from mapping first
-          const { data: mapping } = await supabase
-            .from('position_group_map')
-            .select('leg_qty, leg_side')
-            .eq('symbol', trade.symbol)
-            .eq('trade_group_id', trade.trade_group_id)
-            .maybeSingle();
-          
-          const legQty = mapping?.leg_qty || trade.quantity;
-          
-          // Determine open_side: prefer mapping, then inference, then existing value
-          let openSide = mapping?.leg_side || trade.open_side;
-          if (!openSide && inferredLegs.length > 0) {
-            const inferred = getInferredSide(inferredLegs, trade.symbol);
-            if (inferred) openSide = inferred.openSide;
-          }
-          
-          const closeSide = openSide === 'sell_to_open' ? 'buy_to_close' : 
-                           openSide === 'buy_to_open' ? 'sell_to_close' : 
-                           null;
+        for (let i = 0; i < typedTrades.length; i++) {
+          const trade = typedTrades[i];
+          const isPrimaryLeg = i === 0;
+          const sides = legSideData.get(trade.id!);
           
           const updates: Record<string, any> = {
             close_status: 'filled',
             close_filled_at: new Date().toISOString(),
             exit_time: new Date().toISOString(),
-            exit_debit: isFirstLeg ? netExitDebit : null, // Store exit debit on first leg only
-            quantity: legQty,
-            open_side: openSide,
-            close_side: closeSide,
             needs_reconcile: false,
+            // Persist consistent entry_credit on all legs
+            entry_credit: netEntryCredit,
           };
           
-          // P&L: Store group total on first leg, zero on others
+          // Store exit_debit only on primary leg
+          if (isPrimaryLeg) {
+            updates.exit_debit = netExitDebit;
+          }
+          
+          // Fix side labels from inference
+          if (sides) {
+            updates.open_side = sides.openSide;
+            updates.close_side = sides.closeSide;
+          }
+          
+          // P&L: Store group total on primary leg, zero on others
           if (groupCalc) {
-            if (isFirstLeg) {
+            if (isPrimaryLeg) {
               updates.pnl = groupCalc.pnl;
               updates.pnl_percent = groupCalc.pnlPercent;
               updates.pnl_formula = groupCalc.formula;
             } else {
-              updates.pnl = 0; // Other legs contribute 0 (total is on first leg)
+              updates.pnl = 0;
               updates.pnl_percent = 0;
-              updates.pnl_formula = 'Included in group total (see first leg)';
+              updates.pnl_formula = 'Included in group total';
             }
           }
           
