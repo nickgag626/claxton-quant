@@ -761,9 +761,9 @@ export const tradeJournal = {
         // Multi-leg group: use group-level P&L calculation
         if (groupLegs.length > 1) {
           const entryCredit = Number(firstLeg.entry_credit) || 0;
-          // Use exit_debit if available, otherwise sum exit_price as fallback
-          const exitDebit = Number(firstLeg.exit_debit) || 
-            groupLegs.reduce((sum, t) => sum + Math.abs(Number(t.exit_price || 0)), 0);
+          // Use exit_debit if available, otherwise use first leg's exit_price (which is the combo net price)
+          // DO NOT sum exit_price across legs - each leg stores the same combo net price
+          const exitDebit = Number(firstLeg.exit_debit) || Number(firstLeg.exit_price) || 0;
           const contracts = Number(firstLeg.quantity) || 1;
           const totalFees = groupLegs.reduce((sum, t) => sum + (Number(t.fees) || 0), 0);
 
@@ -783,13 +783,34 @@ export const tradeJournal = {
           }
 
           const groupCalc = calculateGroupPnl(entryCredit, exitDebit, contracts, 100, totalFees);
+          
+          // Also fix close_side labels by looking up from position_group_map
+          const legSideData = new Map<string, { openSide: string; closeSide: string | null }>();
+          for (const leg of groupLegs) {
+            const { data: mapping } = await supabase
+              .from('position_group_map')
+              .select('leg_side')
+              .eq('symbol', leg.symbol)
+              .eq('trade_group_id', leg.trade_group_id)
+              .maybeSingle();
+            if (mapping?.leg_side) {
+              const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
+                               mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : null;
+              legSideData.set(leg.id!, { openSide: mapping.leg_side, closeSide });
+            }
+          }
 
-          // Update first leg with group P&L
+          // Update first leg with group P&L and correct sides
+          const firstLegSides = legSideData.get(firstLeg.id!);
           const { error: firstLegError } = await supabase.from('trades').update({
             pnl: groupCalc.pnl,
             pnl_percent: groupCalc.pnlPercent,
             pnl_formula: groupCalc.formula,
             needs_reconcile: false,
+            ...(firstLegSides ? { 
+              open_side: firstLegSides.openSide, 
+              close_side: firstLegSides.closeSide 
+            } : {}),
           }).eq('id', firstLeg.id);
 
           if (firstLegError) {
@@ -798,17 +819,23 @@ export const tradeJournal = {
             updated++;
           }
 
-          // Set other legs to 0 P&L (included in group total)
+          // Set other legs to 0 P&L (included in group total) and fix their sides
           for (let i = 1; i < groupLegs.length; i++) {
+            const leg = groupLegs[i];
+            const legSides = legSideData.get(leg.id!);
             const { error: legError } = await supabase.from('trades').update({
               pnl: 0,
               pnl_percent: 0,
               pnl_formula: 'Included in group total',
               needs_reconcile: false,
-            }).eq('id', groupLegs[i].id);
+              ...(legSides ? { 
+                open_side: legSides.openSide, 
+                close_side: legSides.closeSide 
+              } : {}),
+            }).eq('id', leg.id);
 
             if (legError) {
-              errors.push(`Trade ${groupLegs[i].id}: ${legError.message}`);
+              errors.push(`Trade ${leg.id}: ${legError.message}`);
             } else {
               updated++;
             }
