@@ -9,6 +9,7 @@ export type EventType =
   | 'exit_filled' 
   | 'exit_rejected'
   | 'exit_blocked'
+  | 'exit_detected'
   | 'critical_auto_reconcile';
 
 export type Decision = 'PASS' | 'FAIL' | 'OPEN' | 'SKIP' | 'CLOSE' | 'HOLD';
