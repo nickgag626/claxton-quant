@@ -715,9 +715,112 @@ export const tradeJournal = {
       let sanitized = 0;
       const errors: string[] = [];
 
+      // Step 1: Group trades by trade_group_id
+      const groupedTrades = new Map<string, TradeRecord[]>();
+      const ungroupedTrades: TradeRecord[] = [];
+
       for (const row of trades || []) {
         const trade = castToTradeRecord(row);
+        if (trade.trade_group_id) {
+          const existing = groupedTrades.get(trade.trade_group_id) || [];
+          existing.push(trade);
+          groupedTrades.set(trade.trade_group_id, existing);
+        } else {
+          ungroupedTrades.push(trade);
+        }
+      }
+
+      // Step 2: Process multi-leg groups using calculateGroupPnl
+      for (const [groupId, groupLegs] of groupedTrades.entries()) {
+        // Sort by entry_time to ensure consistent first leg
+        groupLegs.sort((a, b) => 
+          new Date(a.entry_time || 0).getTime() - new Date(b.entry_time || 0).getTime()
+        );
+
+        const firstLeg = groupLegs[0];
         
+        // Sanitize non-filled groups
+        const allFilled = groupLegs.every(t => t.close_status === 'filled');
+        if (!allFilled) {
+          for (const leg of groupLegs) {
+            if (leg.pnl != null || leg.pnl_percent != null || !leg.needs_reconcile) {
+              await supabase.from('trades').update({ 
+                needs_reconcile: true,
+                pnl: null,
+                pnl_percent: null,
+                pnl_formula: null,
+              }).eq('id', leg.id);
+              sanitized++;
+            } else {
+              skipped++;
+            }
+          }
+          continue;
+        }
+
+        // Multi-leg group: use group-level P&L calculation
+        if (groupLegs.length > 1) {
+          const entryCredit = Number(firstLeg.entry_credit) || 0;
+          // Use exit_debit if available, otherwise sum exit_price as fallback
+          const exitDebit = Number(firstLeg.exit_debit) || 
+            groupLegs.reduce((sum, t) => sum + Math.abs(Number(t.exit_price || 0)), 0);
+          const contracts = Number(firstLeg.quantity) || 1;
+          const totalFees = groupLegs.reduce((sum, t) => sum + (Number(t.fees) || 0), 0);
+
+          // Validate we have entry/exit data
+          if (entryCredit === 0 && exitDebit === 0) {
+            errors.push(`Group ${groupId.slice(0, 8)}: Missing entry_credit and exit_debit`);
+            for (const leg of groupLegs) {
+              await supabase.from('trades').update({ 
+                needs_reconcile: true,
+                pnl: null,
+                pnl_percent: null,
+                pnl_formula: null,
+              }).eq('id', leg.id);
+            }
+            skipped += groupLegs.length;
+            continue;
+          }
+
+          const groupCalc = calculateGroupPnl(entryCredit, exitDebit, contracts, 100, totalFees);
+
+          // Update first leg with group P&L
+          const { error: firstLegError } = await supabase.from('trades').update({
+            pnl: groupCalc.pnl,
+            pnl_percent: groupCalc.pnlPercent,
+            pnl_formula: groupCalc.formula,
+            needs_reconcile: false,
+          }).eq('id', firstLeg.id);
+
+          if (firstLegError) {
+            errors.push(`Trade ${firstLeg.id}: ${firstLegError.message}`);
+          } else {
+            updated++;
+          }
+
+          // Set other legs to 0 P&L (included in group total)
+          for (let i = 1; i < groupLegs.length; i++) {
+            const { error: legError } = await supabase.from('trades').update({
+              pnl: 0,
+              pnl_percent: 0,
+              pnl_formula: 'Included in group total',
+              needs_reconcile: false,
+            }).eq('id', groupLegs[i].id);
+
+            if (legError) {
+              errors.push(`Trade ${groupLegs[i].id}: ${legError.message}`);
+            } else {
+              updated++;
+            }
+          }
+        } else {
+          // Single-leg "group" - process as individual trade
+          ungroupedTrades.push(firstLeg);
+        }
+      }
+
+      // Step 3: Process single-leg trades using per-leg calculation
+      for (const trade of ungroupedTrades) {
         // HARD RULE: If close_status is not 'filled', nullify P&L
         if (trade.close_status !== 'filled') {
           if (trade.pnl != null || trade.pnl_percent != null || !trade.needs_reconcile) {
@@ -734,9 +837,8 @@ export const tradeJournal = {
           continue;
         }
         
-        // Check if we have verified direction (close_status='filled' already checked above)
+        // Check if we have verified direction
         if (!hasVerifiedDirection(trade)) {
-          // Mark as needs reconcile, set pnl to NULL
           if (!trade.needs_reconcile || trade.pnl != null) {
             await supabase.from('trades').update({ 
               needs_reconcile: true,
