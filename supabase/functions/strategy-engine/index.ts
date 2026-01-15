@@ -60,6 +60,14 @@ function getInFlightSymbols(): Set<string> {
   return symbols;
 }
 
+/**
+ * Extract underlying from OCC option symbol (e.g., SPY260115P00580000 -> SPY)
+ */
+function extractUnderlyingFromOccSymbol(symbol: string): string | null {
+  const match = symbol.match(/^([A-Z]+)\d{6}[CP]/);
+  return match ? match[1] : null;
+}
+
 function generateEntryCooldownKey(strategyId: string, underlying: string, expiration: string, legs: any[]): string {
   const strikes = legs.map(l => l.strike).sort((a, b) => a - b).join('-');
   return `${strategyId}:${underlying}:${expiration}:${strikes}`;
@@ -2859,18 +2867,20 @@ serve(async (req) => {
       
       if (aggressive) {
         // AGGRESSIVE: Fetch ALL mappings for symbols NOT at broker
+        // Include extra fields for exit detection logging
         const { data, error } = await supabase
           .from('position_group_map')
-          .select('id, symbol, trade_group_id, created_at');
+          .select('id, symbol, trade_group_id, created_at, underlying, strategy_type, strategy_name, leg_qty');
         staleMaps = data || [];
         fetchErr = error;
         console.log(`[cleanup_maps] AGGRESSIVE mode: checking ${staleMaps.length} total mappings`);
       } else {
         // NORMAL: Only mappings older than 24h
+        // Include extra fields for exit detection logging
         const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
         const { data, error } = await supabase
           .from('position_group_map')
-          .select('id, symbol, trade_group_id, created_at')
+          .select('id, symbol, trade_group_id, created_at, underlying, strategy_type, strategy_name, leg_qty')
           .lt('created_at', cutoff);
         staleMaps = data || [];
         fetchErr = error;
@@ -2889,6 +2899,161 @@ serve(async (req) => {
       // Filter to only delete if symbol is NOT in broker positions
       const toDelete = staleMaps.filter((m: any) => !activeSymbols.has(m.symbol));
       
+      // === MANUAL EXIT DETECTION: Log exit_detected evaluations for closed groups ===
+      // Group toDelete mappings by trade_group_id to detect which trade groups were manually closed
+      const closedGroupsMap = new Map<string, { symbols: string[]; underlying: string; strategyType?: string; strategyName?: string; legQtys: number[] }>();
+      
+      for (const m of toDelete) {
+        if (!m.trade_group_id) continue;
+        const existing = closedGroupsMap.get(m.trade_group_id);
+        if (existing) {
+          existing.symbols.push(m.symbol);
+          existing.legQtys.push(m.leg_qty || 1);
+        } else {
+          closedGroupsMap.set(m.trade_group_id, {
+            symbols: [m.symbol],
+            underlying: m.underlying || extractUnderlyingFromOccSymbol(m.symbol) || 'UNKNOWN',
+            strategyType: m.strategy_type,
+            strategyName: m.strategy_name,
+            legQtys: [m.leg_qty || 1],
+          });
+        }
+      }
+      
+      // Fetch recent filled close orders from Tradier (last 30 minutes)
+      let recentCloseOrders: any[] = [];
+      if (closedGroupsMap.size > 0) {
+        try {
+          const ordersUrl = `${baseUrl}/accounts/${accountId}/orders`;
+          const ordersResp = await fetch(ordersUrl, { headers });
+          const ordersData = await ordersResp.json();
+          const rawOrders = ordersData?.orders?.order;
+          const allOrders = rawOrders ? (Array.isArray(rawOrders) ? rawOrders : [rawOrders]) : [];
+          
+          // Filter to filled closing orders in last 30 minutes
+          const thirtyMinAgo = Date.now() - 30 * 60 * 1000;
+          recentCloseOrders = allOrders.filter((o: any) => {
+            if (o.status !== 'filled') return false;
+            const isCloseOrder = o.side === 'buy_to_close' || o.side === 'sell_to_close' || 
+                                 (o.class === 'multileg' && o.leg?.some?.((l: any) => 
+                                   l.side === 'buy_to_close' || l.side === 'sell_to_close'));
+            if (!isCloseOrder) return false;
+            const txDate = new Date(o.transaction_date || o.create_date).getTime();
+            return txDate > thirtyMinAgo;
+          });
+          console.log(`[cleanup_maps] Found ${recentCloseOrders.length} recent close orders for exit detection`);
+        } catch (orderErr) {
+          console.error('[cleanup_maps] Error fetching recent orders for exit detection:', orderErr);
+        }
+      }
+      
+      // Log exit_detected evaluations for each closed group
+      let exitEvaluationsLogged = 0;
+      for (const [groupId, groupInfo] of closedGroupsMap) {
+        try {
+          // Find matching close order(s) by symbol
+          const groupSymbolSet = new Set(groupInfo.symbols);
+          let matchedOrders: any[] = [];
+          let realizedPnl: number | null = null;
+          let pnlBasis = 'unknown';
+          
+          for (const order of recentCloseOrders) {
+            // Check single-leg order
+            const orderSymbol = order.option_symbol || order.symbol;
+            if (groupSymbolSet.has(orderSymbol)) {
+              matchedOrders.push({
+                symbol: orderSymbol,
+                avg_fill_price: order.avg_fill_price,
+                exec_quantity: order.exec_quantity || order.quantity,
+                side: order.side,
+              });
+            }
+            // Check multi-leg order
+            if (order.leg && Array.isArray(order.leg)) {
+              for (const leg of order.leg) {
+                const legSymbol = leg.option_symbol || leg.symbol;
+                if (groupSymbolSet.has(legSymbol)) {
+                  matchedOrders.push({
+                    symbol: legSymbol,
+                    avg_fill_price: leg.avg_fill_price,
+                    exec_quantity: leg.exec_quantity || leg.quantity,
+                    side: leg.side,
+                  });
+                }
+              }
+            }
+          }
+          
+          if (matchedOrders.length > 0) {
+            pnlBasis = 'realized';
+          }
+          
+          // Try to find strategy_id from existing evaluations for this group
+          let strategyId: string | null = null;
+          const { data: existingEval } = await supabase
+            .from('strategy_evaluations')
+            .select('strategy_id')
+            .eq('trade_group_id', groupId)
+            .limit(1)
+            .single();
+          
+          if (existingEval?.strategy_id) {
+            strategyId = existingEval.strategy_id;
+          }
+          
+          // Get current time in ET
+          const nowET = new Date().toLocaleString('en-US', { timeZone: 'America/New_York' });
+          
+          // Insert exit_detected evaluation
+          const evalPayload = {
+            strategy_id: strategyId || groupId, // fallback to groupId if no strategy
+            underlying: groupInfo.underlying,
+            event_type: 'exit_detected',
+            decision: 'CLOSE',
+            reason: 'Manual close detected from broker',
+            config_json: {
+              strategy_type: groupInfo.strategyType,
+              strategy_name: groupInfo.strategyName,
+            },
+            inputs_json: {
+              market: {
+                now_et: nowET,
+                underlying_price: 0, // Unknown at cleanup time
+                pnl_basis: pnlBasis,
+                close_fills: matchedOrders.length > 0 ? matchedOrders : undefined,
+              },
+              account: {
+                open_positions_count: activeSymbols.size,
+                max_positions: 5,
+              },
+            },
+            gates_json: [{
+              name: 'broker_position_check',
+              expected: 'positions exist',
+              actual: 'no positions found for group symbols',
+              pass: true,
+              reason: `Symbols ${groupInfo.symbols.join(', ')} no longer at broker`,
+            }],
+            proposed_order_json: null,
+            trade_group_id: groupId,
+          };
+          
+          const { error: evalErr } = await supabase
+            .from('strategy_evaluations')
+            .insert(evalPayload);
+          
+          if (evalErr) {
+            console.error(`[cleanup_maps] Error logging exit_detected for group ${groupId}:`, evalErr);
+          } else {
+            exitEvaluationsLogged++;
+            console.log(`[cleanup_maps] Logged exit_detected for group ${groupId}: ${groupInfo.symbols.length} legs, pnl_basis=${pnlBasis}`);
+          }
+        } catch (evalError) {
+          console.error(`[cleanup_maps] Error processing exit detection for group ${groupId}:`, evalError);
+        }
+      }
+      
+      // Now delete the mappings
       let deletedCount = 0;
       if (toDelete.length > 0) {
         const { error: deleteErr } = await supabase
@@ -2911,6 +3076,8 @@ serve(async (req) => {
         aggressive,
         rejectedMappingsDeleted,
         rejectedOrdersChecked: rejectedOrderIds.length,
+        exitEvaluationsLogged,
+        closedGroupsDetected: closedGroupsMap.size,
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 

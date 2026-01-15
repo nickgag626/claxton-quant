@@ -57,6 +57,9 @@ export const DecisionTraceLink = ({ tradeGroupId }: DecisionTraceLinkProps) => {
       exit_attempt: 'bg-bloomberg-amber/20 text-bloomberg-amber',
       exit_filled: 'bg-trading-green/20 text-trading-green',
       exit_rejected: 'bg-panic-red/20 text-panic-red',
+      exit_detected: 'bg-bloomberg-amber/20 text-bloomberg-amber',
+      exit_blocked: 'bg-panic-red/20 text-panic-red',
+      critical_auto_reconcile: 'bg-panic-red/20 text-panic-red',
     };
     return variants[eventType] || variants.evaluation;
   };
@@ -127,6 +130,9 @@ const EvaluationCard = ({ evaluation }: EvaluationCardProps) => {
       exit_attempt: 'bg-bloomberg-amber/20 text-bloomberg-amber',
       exit_filled: 'bg-trading-green/20 text-trading-green',
       exit_rejected: 'bg-panic-red/20 text-panic-red',
+      exit_detected: 'bg-bloomberg-amber/20 text-bloomberg-amber',
+      exit_blocked: 'bg-panic-red/20 text-panic-red',
+      critical_auto_reconcile: 'bg-panic-red/20 text-panic-red',
     };
     return variants[eventType] || variants.evaluation;
   };
