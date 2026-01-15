@@ -1967,37 +1967,54 @@ export const useTradingData = () => {
         
         console.log('[reconcilePendingCloses] Found', pendingTrades.length, 'pending close orders');
         
+        // Group trades by close_order_id to detect multi-leg combo orders
+        const orderGroups = new Map<string, typeof pendingTrades>();
         for (const trade of pendingTrades) {
           if (!trade.close_order_id) continue;
-          
-          const orderStatus = await tradierApi.getOrderStatus(trade.close_order_id);
+          const existing = orderGroups.get(trade.close_order_id) || [];
+          existing.push(trade);
+          orderGroups.set(trade.close_order_id, existing);
+        }
+        
+        // Process each unique close order
+        for (const [closeOrderId, tradesInOrder] of orderGroups) {
+          const orderStatus = await tradierApi.getOrderStatus(closeOrderId);
           
           if (!orderStatus.success) {
-            console.warn('[reconcilePendingCloses] Could not fetch status for', trade.close_order_id);
+            console.warn('[reconcilePendingCloses] Could not fetch status for', closeOrderId);
             continue;
           }
           
           // Only update if status has changed from 'submitted'
           if (orderStatus.closeStatus !== 'submitted') {
+            // Detect if this is a multi-leg combo order based on number of trades sharing same close_order_id
+            const isComboOrder = tradesInOrder.length > 1;
+            
             const updateResult = await tradeJournal.updateCloseStatus(
-              trade.close_order_id,
+              closeOrderId,
               orderStatus.closeStatus,
               {
-                avgFillPrice: orderStatus.avgFillPrice,
+                avgFillPrice: orderStatus.avgFillPrice, // For combo: this is net debit
                 filledQty: orderStatus.filledQty,
                 rejectReason: orderStatus.rejectReason,
-                open_side: trade.open_side,
+                open_side: tradesInOrder[0]?.open_side,
                 fees: 0,
+                isComboOrder, // Signal to use group P&L calculation
               }
             );
             
             if (updateResult.success) {
-              console.log('[reconcilePendingCloses] Updated', trade.close_order_id, 'to', orderStatus.closeStatus);
+              console.log('[reconcilePendingCloses] Updated', closeOrderId, 'to', orderStatus.closeStatus, 
+                isComboOrder ? `(combo, groupPnl: $${updateResult.groupPnl?.toFixed(2) || '?'})` : '(single)');
               
               if (orderStatus.closeStatus === 'filled') {
-                addActivity('TRADE', `Trade filled: ${trade.symbol} @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'}`);
+                if (isComboOrder && updateResult.groupPnl !== undefined) {
+                  addActivity('TRADE', `Group close filled: ${tradesInOrder.length} legs @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'} net debit, P&L: $${updateResult.groupPnl.toFixed(2)}`);
+                } else {
+                  addActivity('TRADE', `Trade filled: ${tradesInOrder[0]?.symbol} @ $${orderStatus.avgFillPrice?.toFixed(2) || '?'}`);
+                }
               } else if (orderStatus.closeStatus === 'rejected' || orderStatus.closeStatus === 'canceled' || orderStatus.closeStatus === 'expired') {
-                addActivity('RISK', `Close ${orderStatus.closeStatus}: ${trade.symbol} - ${orderStatus.rejectReason || 'Unknown'}`);
+                addActivity('RISK', `Close ${orderStatus.closeStatus}: ${tradesInOrder[0]?.symbol} - ${orderStatus.rejectReason || 'Unknown'}`);
               }
             }
           }
