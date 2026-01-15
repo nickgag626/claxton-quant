@@ -26,7 +26,30 @@ export interface InferenceResult {
   success: boolean;
   legs: InferredLeg[];
   netEntryCredit: number;
+  netExitDebit?: number; // Computed from exit prices if available
   error?: string;
+}
+
+/**
+ * Compute net exit debit from inferred leg sides and exit prices
+ * For shorts (sell_to_open): closing = buy_to_close, contributes +exitPrice
+ * For longs (buy_to_open): closing = sell_to_close, contributes -exitPrice
+ */
+export function computeNetExitDebit(inferredLegs: InferredLeg[]): number | null {
+  if (inferredLegs.some(l => l.exitPrice == null)) return null;
+  
+  let netDebit = 0;
+  for (const leg of inferredLegs) {
+    const exitPrice = leg.exitPrice!;
+    if (leg.openSide === 'sell_to_open') {
+      // Short leg: buy_to_close = pay debit
+      netDebit += exitPrice;
+    } else {
+      // Long leg: sell_to_close = receive credit (reduces net debit)
+      netDebit -= exitPrice;
+    }
+  }
+  return netDebit;
 }
 
 /**
@@ -147,10 +170,14 @@ export function inferIronCondorLegs(legs: LegInfo[]): InferenceResult {
   // Net entry credit = what we received - what we paid
   const netEntryCredit = totalSellEntry - totalBuyEntry;
   
+  // Compute net exit debit if exit prices are available
+  const netExitDebit = computeNetExitDebit(inferredLegs);
+  
   return {
     success: true,
     legs: inferredLegs,
     netEntryCredit,
+    netExitDebit: netExitDebit ?? undefined,
   };
 }
 
@@ -232,10 +259,14 @@ export function inferCreditSpreadLegs(legs: LegInfo[], spreadType: 'put' | 'call
   
   const netEntryCredit = totalSellEntry - totalBuyEntry;
   
+  // Compute net exit debit if exit prices are available
+  const netExitDebit = computeNetExitDebit(inferredLegs);
+  
   return {
     success: true,
     legs: inferredLegs,
     netEntryCredit,
+    netExitDebit: netExitDebit ?? undefined,
   };
 }
 

@@ -580,10 +580,12 @@ export const TradeJournal = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const hasLoadedOnce = useRef(false);
+  const loadSeqRef = useRef(0); // Request-sequence guard for loadTrades
   const [expandedTradeId, setExpandedTradeId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editNotes, setEditNotes] = useState('');
   const [isRecalculating, setIsRecalculating] = useState(false);
+  const isRecalculatingRef = useRef(false); // Ref for realtime callback
   const [countByLeg, setCountByLeg] = useState(false);
   
   // Duplicate detection state
@@ -601,7 +603,7 @@ export const TradeJournal = () => {
     loadTrades();
   }, [viewMode]); // Reload when view mode changes
 
-  // Real-time subscription for trade updates
+  // Real-time subscription for trade updates - IGNORE during recompute to prevent partial state
   useEffect(() => {
     const channel = supabase
       .channel('trades-realtime')
@@ -613,6 +615,11 @@ export const TradeJournal = () => {
           table: 'trades'
         },
         (payload) => {
+          // STABILITY: Skip realtime refreshes while recomputing to prevent partial states
+          if (isRecalculatingRef.current) {
+            console.log('[TradeJournal] Ignoring realtime update during recompute');
+            return;
+          }
           console.log('[TradeJournal] Real-time update:', payload.eventType);
           loadTrades(true); // Refresh on any change
         }
@@ -640,6 +647,9 @@ export const TradeJournal = () => {
   }, [countByLeg]);
 
   const loadTrades = async (isPolling = false) => {
+    // STABILITY: Request-sequence guard to prevent out-of-order overwrites
+    const thisSeq = ++loadSeqRef.current;
+    
     // Only show loading state on initial load, not during background refresh
     if (!hasLoadedOnce.current) {
       setIsLoading(true);
@@ -655,6 +665,13 @@ export const TradeJournal = () => {
     
     // Always fetch flat trades for count display
     const allTrades = await tradeJournal.getTrades(500);
+    
+    // STABILITY: Only apply state if this is still the latest request
+    if (thisSeq !== loadSeqRef.current) {
+      console.log('[TradeJournal] Stale loadTrades result discarded', { thisSeq, current: loadSeqRef.current });
+      return;
+    }
+    
     setFlatTrades(allTrades);
     
     // Update grouped or flat based on view mode
@@ -703,6 +720,7 @@ export const TradeJournal = () => {
 
   const handleRecalculatePnl = async () => {
     setIsRecalculating(true);
+    isRecalculatingRef.current = true; // Set ref for realtime callback
     try {
       const result = await tradeJournal.recalculatePnl();
       if (result.success) {
@@ -711,7 +729,8 @@ export const TradeJournal = () => {
           console.warn('P&L recalculation warnings:', result.errors);
           toast.warning(`${result.errors.length} trades had issues - check console`);
         }
-        loadTrades();
+        // Single refresh after recompute completes
+        await loadTrades();
       } else {
         toast.error('Failed to recalculate P&L');
       }
@@ -720,6 +739,7 @@ export const TradeJournal = () => {
       toast.error('Error recalculating P&L');
     } finally {
       setIsRecalculating(false);
+      isRecalculatingRef.current = false; // Clear ref
     }
   };
 
