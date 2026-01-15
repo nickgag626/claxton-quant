@@ -780,9 +780,9 @@ export const tradeJournal = {
           const inference = inferLegSides(legInfos, strategyType);
           let inferredLegs: InferredLeg[] = [];
           let computedEntryCredit = Number(primaryLeg.entry_credit) || 0;
-          let computedExitDebit = Number(primaryLeg.exit_debit) || 0;
-          let entryCreditUpdated = false;
-          let exitDebitUpdated = false;
+          let computedExitDebit = 0;
+          let entryCreditSource = 'stored';
+          let exitDebitSource = 'unknown';
           
           if (inference.success) {
             inferredLegs = inference.legs;
@@ -794,26 +794,60 @@ export const tradeJournal = {
             if (diff > 0.005 || storedEntryCredit === 0) {
               console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit correction ${storedEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
               computedEntryCredit = inference.netEntryCredit;
-              entryCreditUpdated = true;
+              entryCreditSource = 'inferred';
             }
+          }
+          
+          // EXIT DEBIT RESOLVER - Priority-based selection for correct group exit debit
+          // Priority 1: Check if any leg already has a non-zero exit_debit (use median of non-zero values)
+          const existingExitDebits = groupLegs
+            .map(l => Number(l.exit_debit) || 0)
+            .filter(ed => ed > 0.001);
+          
+          if (existingExitDebits.length > 0) {
+            // Use median of existing non-zero exit_debit values
+            existingExitDebits.sort((a, b) => a - b);
+            const midIdx = Math.floor(existingExitDebits.length / 2);
+            computedExitDebit = existingExitDebits.length % 2 === 0
+              ? (existingExitDebits[midIdx - 1] + existingExitDebits[midIdx]) / 2
+              : existingExitDebits[midIdx];
+            exitDebitSource = 'existingExitDebit';
+            console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using existing exit_debit median=${computedExitDebit.toFixed(4)}`);
+          } else {
+            // Priority 2: Check if exit_price is duplicated combo net price (all legs have same exit_price)
+            const exitPrices = groupLegs
+              .map(l => Number(l.exit_price) || 0)
+              .filter(ep => ep > 0.001);
             
-            // PHASE 1: Compute netExitDebit from inferred sides if we have per-leg exit prices
-            if (inference.netExitDebit != null) {
-              const storedExitDebit = Number(primaryLeg.exit_debit) || 0;
-              const exitDiff = Math.abs(storedExitDebit - inference.netExitDebit);
+            if (exitPrices.length >= 2) {
+              const minExit = Math.min(...exitPrices);
+              const maxExit = Math.max(...exitPrices);
+              const isComboNetPrice = (maxExit - minExit) < 0.005; // All within 0.5 cents = duplicated combo price
               
-              if (exitDiff > 0.005 || storedExitDebit === 0) {
-                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: exit_debit correction ${storedExitDebit.toFixed(4)} → ${inference.netExitDebit.toFixed(4)}`);
+              if (isComboNetPrice && groupLegs.length >= 4) {
+                // Duplicated combo net close price - use the common value
+                computedExitDebit = exitPrices[0];
+                exitDebitSource = 'comboExitPriceRepeated';
+                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: detected duplicated combo exit_price=${computedExitDebit.toFixed(4)}`);
+              } else if (inference.success && inference.netExitDebit != null && Math.abs(inference.netExitDebit) > 0.001) {
+                // Priority 3: Per-leg netting from inference (only if result is non-zero)
                 computedExitDebit = inference.netExitDebit;
-                exitDebitUpdated = true;
+                exitDebitSource = 'perLegNet';
+                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using per-leg net exit_debit=${computedExitDebit.toFixed(4)}`);
+              } else if (!isComboNetPrice) {
+                // Exit prices differ but inference gave 0 - likely per-leg netting is correct
+                computedExitDebit = inference.netExitDebit ?? 0;
+                exitDebitSource = 'perLegNet';
+              } else {
+                // 2-3 leg spread with identical exit prices - use as combo price
+                computedExitDebit = exitPrices[0];
+                exitDebitSource = 'comboExitPrice';
               }
             } else {
-              // Fall back to stored exit_debit or primary leg's exit_price (if it's a combo net price)
-              computedExitDebit = Number(primaryLeg.exit_debit) || Number(primaryLeg.exit_price) || 0;
+              // Priority 4: Fallback to primary leg's exit_price
+              computedExitDebit = Number(primaryLeg.exit_price) || 0;
+              exitDebitSource = 'fallbackPrimaryExitPrice';
             }
-          } else {
-            // Inference failed - use stored values
-            computedExitDebit = Number(primaryLeg.exit_debit) || Number(primaryLeg.exit_price) || 0;
           }
           
           // Validate we have entry/exit data
@@ -833,7 +867,8 @@ export const tradeJournal = {
 
           // Calculate group P&L with corrected values
           const groupCalc = calculateGroupPnl(computedEntryCredit, computedExitDebit, contracts, 100, totalFees);
-          
+          // Add source tracing to formula for debugging
+          const formulaWithTrace = `${groupCalc.formula} [entry:${entryCreditSource}, exit:${exitDebitSource}]`;
           // Build side data map from inference (preferred) - Phase 2
           const legSideData = new Map<string, { openSide: string; closeSide: string }>();
           
@@ -869,7 +904,7 @@ export const tradeJournal = {
           const { error: primaryLegError } = await supabase.from('trades').update({
             pnl: groupCalc.pnl,
             pnl_percent: groupCalc.pnlPercent,
-            pnl_formula: groupCalc.formula,
+            pnl_formula: formulaWithTrace,
             needs_reconcile: false,
             // Always persist entry_credit and exit_debit on primary leg
             entry_credit: computedEntryCredit,
