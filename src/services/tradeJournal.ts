@@ -167,6 +167,40 @@ export function calculatePnl(
   return { pnl, pnlPercent, formula };
 }
 
+/**
+ * GROUP-LEVEL NET P&L CALCULATION (for multi-leg orders like iron condors)
+ * 
+ * Formula: P&L = (Net Entry Credit - Net Exit Debit) × multiplier × contracts
+ * 
+ * This is the CORRECT way to calculate P&L for combo orders:
+ * - Entry credit: The net premium received when opening the position
+ * - Exit debit: The net premium paid when closing the position
+ * - Contracts: Number of contracts (NOT number of legs)
+ * 
+ * Example:
+ * - Entry credit: $1.18 (sold for net $1.18 credit)
+ * - Exit debit: $1.19 (bought back for net $1.19 debit)
+ * - Contracts: 4
+ * - P&L = ($1.18 - $1.19) × 100 × 4 = -$4.00
+ */
+export function calculateGroupPnl(
+  netEntryCredit: number,  // Total net credit received at entry (from entry_credit)
+  netExitDebit: number,    // Total net debit paid at exit (combo order fill price)
+  contracts: number,       // Number of contracts (NOT number of legs)
+  multiplier: number = 100,
+  fees: number = 0
+): { pnl: number; pnlPercent: number; formula: string } {
+  // P&L = (Credit Received - Debit Paid) × multiplier × contracts - fees
+  const pnl = (netEntryCredit - netExitDebit) * multiplier * contracts - fees;
+  const pnlPercent = netEntryCredit > 0 
+    ? ((netEntryCredit - netExitDebit) / netEntryCredit) * 100 
+    : 0;
+  
+  const formula = `(${netEntryCredit.toFixed(4)} - ${netExitDebit.toFixed(4)}) × ${multiplier} × ${contracts} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
+  
+  return { pnl, pnlPercent, formula };
+}
+
 export const tradeJournal = {
   /**
    * Save a single trade with proper deduplication by close_order_id
@@ -399,11 +433,33 @@ export const tradeJournal = {
         if (trade.trade_group_id) {
           if (!processedGroupIds.has(trade.trade_group_id)) {
             const groupTrades = grouped.get(trade.trade_group_id)!;
-            // Only sum finalized P&L (close_status='filled' AND needs_reconcile=false AND pnl not null)
-            const finalizedLegs = groupTrades.filter(t => isFullyFinalized(t));
-            const totalPnl = finalizedLegs.reduce((sum, t) => sum + Number(t.pnl), 0);
-            // Group needs reconcile if ANY leg is not fully finalized
-            const hasUnfinalized = groupTrades.some(t => !isFullyFinalized(t));
+            
+            // Check if all legs are filled
+            const allFilled = groupTrades.every(t => t.close_status === 'filled');
+            const hasUnfinalized = !allFilled || groupTrades.some(t => t.needs_reconcile);
+            
+            // === GROUP-LEVEL NET P&L CALCULATION ===
+            // Use entry_credit and exit_debit for net calculation (not per-leg sums)
+            let totalPnl = 0;
+            
+            if (allFilled) {
+              // Get net entry credit (should be same for all legs in a group)
+              const netEntryCredit = groupTrades[0]?.entry_credit || 0;
+              // Get net exit debit (stored on first leg, or use exit_debit if available)
+              const netExitDebit = groupTrades[0]?.exit_debit || 0;
+              // Get contracts count (from first leg's quantity - NOT number of legs)
+              const contracts = groupTrades[0]?.quantity || 1;
+              
+              // If we have proper entry_credit and exit_debit, use group formula
+              if (netEntryCredit > 0 && netExitDebit > 0) {
+                const groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, 0);
+                totalPnl = groupCalc.pnl;
+              } else {
+                // Fallback: Sum individual leg P&Ls (legacy data)
+                const finalizedLegs = groupTrades.filter(t => isFullyFinalized(t));
+                totalPnl = finalizedLegs.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
+              }
+            }
             
             const group: TradeGroup = {
               groupId: trade.trade_group_id,
@@ -909,7 +965,15 @@ export const tradeJournal = {
 
   /**
    * Update close status after verifying with Tradier
-   * For multi-leg orders, legFills provides per-symbol fill prices
+   * For multi-leg combo orders, uses GROUP-LEVEL NET P&L calculation
+   * 
+   * @param closeOrderId - The Tradier order ID
+   * @param status - The new status (filled, rejected, etc.)
+   * @param details - Fill details
+   *   - avgFillPrice: For combo orders, this is the NET exit debit (not per-leg)
+   *   - filledQty: Number of contracts
+   *   - isComboOrder: If true, uses group-level P&L calculation
+   *   - legFills: Per-leg fill prices (for reference, not used in P&L calc for combos)
    */
   async updateCloseStatus(
     closeOrderId: string,
@@ -920,10 +984,12 @@ export const tradeJournal = {
       rejectReason?: string;
       open_side?: string;
       fees?: number;
-      /** Per-leg fill prices for multi-leg orders (keyed by OCC symbol) */
+      /** If true, this is a multi-leg combo order - use group P&L calculation */
+      isComboOrder?: boolean;
+      /** Per-leg fill prices for multi-leg orders (for reference only in combo mode) */
       legFills?: Record<string, { avgFillPrice: number; filledQty: number; side: string }>;
     }
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string; groupPnl?: number }> {
     try {
       const { data: trades, error: fetchError } = await supabase
         .from('trades')
@@ -935,6 +1001,80 @@ export const tradeJournal = {
         return { success: false, error: 'Trade not found for close_order_id' };
       }
 
+      // Detect multi-leg combo order
+      const isMultiLeg = trades.length > 1 || details?.isComboOrder;
+      let groupPnl: number | undefined;
+
+      if (isMultiLeg && status === 'filled' && details?.avgFillPrice != null) {
+        // === MULTI-LEG COMBO ORDER: Use GROUP-LEVEL NET P&L ===
+        // avgFillPrice from Tradier is the NET exit debit for the entire combo
+        const netExitDebit = Math.abs(details.avgFillPrice); // Ensure positive for debit
+        
+        // Get net entry credit from first leg (should be same for all legs in group)
+        const firstTrade = castToTradeRecord(trades[0]);
+        const netEntryCredit = firstTrade.entry_credit || 0;
+        const contracts = details.filledQty || firstTrade.quantity || 1;
+        const fees = details.fees || 0;
+        
+        // Calculate group P&L using net credit/debit formula
+        let groupCalc: { pnl: number; pnlPercent: number; formula: string } | null = null;
+        
+        if (netEntryCredit > 0) {
+          groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, fees);
+          groupPnl = groupCalc.pnl;
+          console.log(`[updateCloseStatus] Multi-leg combo P&L: Entry Credit=$${netEntryCredit}, Exit Debit=$${netExitDebit}, Contracts=${contracts}, P&L=$${groupCalc.pnl}`);
+        }
+        
+        // Update all legs with group info
+        for (let i = 0; i < trades.length; i++) {
+          const trade = castToTradeRecord(trades[i]);
+          const isFirstLeg = i === 0;
+          
+          // Get leg-specific data from mapping if available
+          const { data: mapping } = await supabase
+            .from('position_group_map')
+            .select('leg_qty, leg_side')
+            .eq('symbol', trade.symbol)
+            .eq('trade_group_id', trade.trade_group_id)
+            .maybeSingle();
+          
+          const legQty = mapping?.leg_qty || trade.quantity;
+          const openSide = mapping?.leg_side || trade.open_side;
+          const closeSide = openSide === 'sell_to_open' ? 'buy_to_close' : 
+                           openSide === 'buy_to_open' ? 'sell_to_close' : 
+                           null;
+          
+          const updates: Record<string, any> = {
+            close_status: 'filled',
+            close_filled_at: new Date().toISOString(),
+            exit_time: new Date().toISOString(),
+            exit_debit: isFirstLeg ? netExitDebit : null, // Store exit debit on first leg only
+            quantity: legQty,
+            open_side: openSide,
+            close_side: closeSide,
+            needs_reconcile: false,
+          };
+          
+          // P&L: Store group total on first leg, zero on others
+          if (groupCalc) {
+            if (isFirstLeg) {
+              updates.pnl = groupCalc.pnl;
+              updates.pnl_percent = groupCalc.pnlPercent;
+              updates.pnl_formula = groupCalc.formula;
+            } else {
+              updates.pnl = 0; // Other legs contribute 0 (total is on first leg)
+              updates.pnl_percent = 0;
+              updates.pnl_formula = 'Included in group total (see first leg)';
+            }
+          }
+          
+          await supabase.from('trades').update(updates).eq('id', trade.id);
+        }
+        
+        return { success: true, groupPnl };
+      }
+
+      // === SINGLE-LEG ORDER or non-filled status ===
       for (const row of trades) {
         const trade = castToTradeRecord(row);
         const updates: Record<string, any> = { close_status: status };
@@ -943,40 +1083,42 @@ export const tradeJournal = {
           updates.close_filled_at = new Date().toISOString();
           updates.exit_time = new Date().toISOString();
           
-          // For multi-leg orders, use per-leg fill price if available
+          // Get leg data from mapping for correct quantity and side
+          const { data: mapping } = await supabase
+            .from('position_group_map')
+            .select('leg_qty, leg_side')
+            .eq('symbol', trade.symbol)
+            .eq('trade_group_id', trade.trade_group_id)
+            .maybeSingle();
+          
           const legFill = details?.legFills?.[trade.symbol];
           const fillPrice = legFill?.avgFillPrice ?? details?.avgFillPrice;
-          const fillQty = legFill?.filledQty ?? details?.filledQty;
-          const fillSide = legFill?.side ?? details?.open_side;
+          const fillQty = mapping?.leg_qty ?? legFill?.filledQty ?? details?.filledQty ?? trade.quantity;
+          const openSide = mapping?.leg_side || details?.open_side || trade.open_side;
+          const closeSide = openSide === 'sell_to_open' ? 'buy_to_close' : 
+                           openSide === 'buy_to_open' ? 'sell_to_close' : 
+                           legFill?.side;
           
           if (fillPrice != null) {
             updates.close_avg_fill_price = fillPrice;
             updates.exit_price = fillPrice;
           }
-          if (fillQty != null) {
-            updates.close_filled_qty = fillQty;
-            updates.quantity = fillQty;
-          }
-          if (fillSide) {
-            // close_side from Tradier leg
-            updates.close_side = fillSide;
-          }
-          if (details?.open_side) {
-            updates.open_side = details.open_side;
-          }
+          updates.close_filled_qty = fillQty;
+          updates.quantity = fillQty;
+          updates.close_side = closeSide;
+          updates.open_side = openSide;
+          
           if (details?.fees != null) {
             updates.fees = details.fees;
           }
 
-          // Compute P&L if we have all required data
-          const openSide = details?.open_side || trade.open_side;
+          // Compute per-leg P&L for single-leg orders
           const openPrice = trade.entry_price;
           const closePrice = fillPrice ?? trade.exit_price;
-          const qty = fillQty ?? trade.quantity;
           const fees = details?.fees ?? trade.fees ?? 0;
 
-          if (openSide && openPrice && closePrice && qty) {
-            const pnlCalc = calculatePnl(openSide, openPrice, closePrice, qty, 100, fees);
+          if (openSide && openPrice && closePrice && fillQty) {
+            const pnlCalc = calculatePnl(openSide, openPrice, closePrice, fillQty, 100, fees);
             if (pnlCalc) {
               updates.pnl = pnlCalc.pnl;
               updates.pnl_percent = pnlCalc.pnlPercent;

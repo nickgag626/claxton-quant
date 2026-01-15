@@ -2560,6 +2560,7 @@ serve(async (req) => {
     
     // === CLEANUP STALE MAPPINGS ===
     // Removes old position_group_map entries that no longer correspond to broker positions
+    // ALSO removes mappings for rejected orders to prevent "Broken Structure" ghost warnings
     if (action === 'cleanup_maps') {
       // Support aggressive mode (no 24h cutoff - deletes all mappings for closed positions)
       const aggressive = body.aggressive === true;
@@ -2584,6 +2585,46 @@ serve(async (req) => {
           deletedCount: 0,
           activeSymbolsCount: 0,
         }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // === NEW: Clean up mappings for REJECTED entry orders ===
+      let rejectedOrderIds: string[] = [];
+      let rejectedMappingsDeleted = 0;
+      
+      try {
+        // Fetch recent orders (last 24h) to find rejected ones
+        const ordersUrl = `${baseUrl}/accounts/${accountId}/orders`;
+        const ordersResp = await fetch(ordersUrl, { headers });
+        const ordersData = await ordersResp.json();
+        const rawOrders = ordersData?.orders?.order;
+        const orders = rawOrders ? (Array.isArray(rawOrders) ? rawOrders : [rawOrders]) : [];
+        
+        // Find rejected orders
+        rejectedOrderIds = orders
+          .filter((o: any) => o.status === 'rejected' || o.status === 'canceled' || o.status === 'expired')
+          .map((o: any) => String(o.id));
+        
+        console.log(`[cleanup_maps] Found ${rejectedOrderIds.length} rejected/canceled/expired orders`);
+        
+        // Delete mappings for rejected orders
+        if (rejectedOrderIds.length > 0) {
+          const { data: deletedRejected, error: rejectDelErr } = await supabase
+            .from('position_group_map')
+            .delete()
+            .in('open_order_id', rejectedOrderIds)
+            .select('id');
+          
+          if (rejectDelErr) {
+            console.error('[cleanup_maps] Error deleting rejected mappings:', rejectDelErr);
+          } else {
+            rejectedMappingsDeleted = deletedRejected?.length || 0;
+            if (rejectedMappingsDeleted > 0) {
+              console.log(`[cleanup_maps] Deleted ${rejectedMappingsDeleted} mappings for rejected orders`);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[cleanup_maps] Error fetching orders for rejection cleanup:', err);
       }
       
       // In aggressive mode: fetch ALL mappings; otherwise only older than 24h
@@ -2613,8 +2654,9 @@ serve(async (req) => {
         console.error('[cleanup_maps] Error fetching maps:', fetchErr);
         return new Response(JSON.stringify({ 
           error: fetchErr.message,
-          deletedCount: 0,
+          deletedCount: rejectedMappingsDeleted,
           activeSymbolsCount: activeSymbols.size,
+          rejectedMappingsDeleted,
         }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
@@ -2637,10 +2679,12 @@ serve(async (req) => {
       }
       
       return new Response(JSON.stringify({ 
-        deletedCount,
+        deletedCount: deletedCount + rejectedMappingsDeleted,
         activeSymbolsCount: activeSymbols.size,
         staleChecked: staleMaps.length,
         aggressive,
+        rejectedMappingsDeleted,
+        rejectedOrdersChecked: rejectedOrderIds.length,
       }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
