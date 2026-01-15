@@ -1186,6 +1186,150 @@ async function evaluateStrategyWithTrace(
   };
 }
 
+// === IRON CONDOR VALIDATION TYPES ===
+interface CondorValidation {
+  valid: boolean;
+  reasons: string[];
+  structureValid: boolean; // LP < SP and SC < LC
+  symbolsUnique: boolean;  // all 4 symbols distinct
+}
+
+interface CondorLegs {
+  shortPut: OptionContract;
+  longPut: OptionContract;
+  shortCall: OptionContract;
+  longCall: OptionContract;
+}
+
+/**
+ * Validate iron condor structure:
+ * - longPut.strike < shortPut.strike
+ * - shortCall.strike < longCall.strike  
+ * - All 4 option symbols unique
+ */
+function validateCondorStructure(legs: CondorLegs): CondorValidation {
+  const reasons: string[] = [];
+  
+  // Check put side: long put must be LOWER than short put
+  const putValid = legs.longPut.strike < legs.shortPut.strike;
+  if (!putValid) {
+    reasons.push(`put_ordering_invalid: longPut=${legs.longPut.strike} >= shortPut=${legs.shortPut.strike}`);
+  }
+  
+  // Check call side: short call must be LOWER than long call
+  const callValid = legs.shortCall.strike < legs.longCall.strike;
+  if (!callValid) {
+    reasons.push(`call_ordering_invalid: shortCall=${legs.shortCall.strike} >= longCall=${legs.longCall.strike}`);
+  }
+  
+  // Check all symbols unique
+  const symbols = [legs.shortPut.symbol, legs.longPut.symbol, legs.shortCall.symbol, legs.longCall.symbol];
+  const uniqueSymbols = new Set(symbols);
+  const symbolsUnique = uniqueSymbols.size === 4;
+  if (!symbolsUnique) {
+    const duplicates = symbols.filter((s, i) => symbols.indexOf(s) !== i);
+    reasons.push(`duplicate_symbols: ${duplicates.join(', ')}`);
+  }
+  
+  return {
+    valid: putValid && callValid && symbolsUnique,
+    reasons,
+    structureValid: putValid && callValid,
+    symbolsUnique,
+  };
+}
+
+/**
+ * Attempt to repair invalid condor by widening long wings outward.
+ * - If longCall <= shortCall, move longCall UP by strikeStep increments
+ * - If longPut >= shortPut, move longPut DOWN by strikeStep increments
+ * Max attempts: 8 steps per wing
+ */
+function repairCondorLegs(
+  legs: CondorLegs,
+  strikeStep: number,
+  findByStrike: (optionType: 'put' | 'call', strike: number) => OptionContract | undefined,
+  symbolConflicts: (symbol: string) => boolean,
+  maxSteps: number = 8
+): { repaired: boolean; legs: CondorLegs; repairLog: string[] } {
+  const repairLog: string[] = [];
+  let repairedLegs = { ...legs };
+  let needsRepair = false;
+  
+  // Check if call side needs repair
+  if (repairedLegs.longCall.strike <= repairedLegs.shortCall.strike || 
+      repairedLegs.longCall.symbol === repairedLegs.shortCall.symbol) {
+    needsRepair = true;
+    repairLog.push(`[REPAIR] Call side invalid: longCall=${repairedLegs.longCall.strike} vs shortCall=${repairedLegs.shortCall.strike}`);
+    
+    let repaired = false;
+    for (let step = 1; step <= maxSteps; step++) {
+      const candidateStrike = repairedLegs.shortCall.strike + (step * strikeStep);
+      const candidate = findByStrike('call', candidateStrike);
+      
+      repairLog.push(`[REPAIR] Call step ${step}: trying strike ${candidateStrike}, found=${!!candidate}`);
+      
+      if (candidate && 
+          candidateStrike > repairedLegs.shortCall.strike && 
+          candidate.symbol !== repairedLegs.shortCall.symbol &&
+          !symbolConflicts(candidate.symbol)) {
+        repairedLegs.longCall = candidate;
+        repairLog.push(`[REPAIR] Call side FIXED: longCall moved to strike ${candidateStrike}`);
+        repaired = true;
+        break;
+      }
+    }
+    
+    if (!repaired) {
+      repairLog.push(`[REPAIR] Call side FAILED after ${maxSteps} steps`);
+      return { repaired: false, legs: repairedLegs, repairLog };
+    }
+  }
+  
+  // Check if put side needs repair
+  if (repairedLegs.longPut.strike >= repairedLegs.shortPut.strike || 
+      repairedLegs.longPut.symbol === repairedLegs.shortPut.symbol) {
+    needsRepair = true;
+    repairLog.push(`[REPAIR] Put side invalid: longPut=${repairedLegs.longPut.strike} vs shortPut=${repairedLegs.shortPut.strike}`);
+    
+    let repaired = false;
+    for (let step = 1; step <= maxSteps; step++) {
+      const candidateStrike = repairedLegs.shortPut.strike - (step * strikeStep);
+      const candidate = findByStrike('put', candidateStrike);
+      
+      repairLog.push(`[REPAIR] Put step ${step}: trying strike ${candidateStrike}, found=${!!candidate}`);
+      
+      if (candidate && 
+          candidateStrike < repairedLegs.shortPut.strike && 
+          candidate.symbol !== repairedLegs.shortPut.symbol &&
+          !symbolConflicts(candidate.symbol)) {
+        repairedLegs.longPut = candidate;
+        repairLog.push(`[REPAIR] Put side FIXED: longPut moved to strike ${candidateStrike}`);
+        repaired = true;
+        break;
+      }
+    }
+    
+    if (!repaired) {
+      repairLog.push(`[REPAIR] Put side FAILED after ${maxSteps} steps`);
+      return { repaired: false, legs: repairedLegs, repairLog };
+    }
+  }
+  
+  // Final validation after repair
+  const finalValidation = validateCondorStructure(repairedLegs);
+  if (!finalValidation.valid) {
+    repairLog.push(`[REPAIR] Final validation FAILED: ${finalValidation.reasons.join(', ')}`);
+    return { repaired: false, legs: repairedLegs, repairLog };
+  }
+  
+  if (needsRepair) {
+    repairLog.push(`[REPAIR] SUCCESS: Final structure valid`);
+  }
+  
+  return { repaired: !needsRepair || finalValidation.valid, legs: repairedLegs, repairLog };
+}
+
 function buildProposedOrder(
   strategy: Strategy, 
   options: OptionContract[], 
@@ -1206,8 +1350,19 @@ function buildProposedOrder(
   const calls = options.filter(o => o.option_type === 'call' && o.greeks && o.bid > 0)
     .sort((a, b) => Math.abs(b.greeks!.delta) - Math.abs(a.greeks!.delta));
   
-  const findByDelta = (opts: OptionContract[], targetDelta: number, above = false) => {
+  // Enhanced findByDelta with exclusions (Rule C)
+  const findByDelta = (
+    opts: OptionContract[], 
+    targetDelta: number, 
+    above = false,
+    excludeSymbols: string[] = [],
+    excludeStrikes: number[] = []
+  ) => {
     return opts.find(o => {
+      // Apply exclusions first
+      if (excludeSymbols.includes(o.symbol)) return false;
+      if (excludeStrikes.includes(o.strike)) return false;
+      
       const d = Math.abs(o.greeks!.delta);
       return above ? d >= targetDelta : d <= targetDelta + 0.05;
     });
@@ -1239,17 +1394,92 @@ function buildProposedOrder(
   switch (strategy.type) {
     case 'iron_condor':
     case 'iron_fly': {
-      // Find base strikes via delta targeting
+      // Find base strikes via delta targeting with exclusions (Rule C)
       const baseShortPut = findByDelta(puts, shortDeltaTarget);
-      const baseLongPut = findByDelta(puts, effectiveLongDelta);
-      const baseShortCall = findByDelta(calls, shortDeltaTarget);
-      const baseLongCall = findByDelta(calls, effectiveLongDelta);
+      if (!baseShortPut) {
+        console.log(`[CONDOR] No short put found at delta ${shortDeltaTarget}`);
+        return null;
+      }
       
-      if (!baseShortPut || !baseLongPut || !baseShortCall || !baseLongCall) return null;
+      // When finding long put, exclude short put's strike/symbol
+      const baseLongPut = findByDelta(
+        puts, 
+        effectiveLongDelta, 
+        false,
+        [baseShortPut.symbol],
+        [baseShortPut.strike]
+      );
+      if (!baseLongPut) {
+        console.log(`[CONDOR] No long put found at delta ${effectiveLongDelta} (excluding ${baseShortPut.symbol})`);
+        return null;
+      }
+      
+      const baseShortCall = findByDelta(calls, shortDeltaTarget);
+      if (!baseShortCall) {
+        console.log(`[CONDOR] No short call found at delta ${shortDeltaTarget}`);
+        return null;
+      }
+      
+      // When finding long call, exclude short call's strike/symbol
+      const baseLongCall = findByDelta(
+        calls, 
+        effectiveLongDelta, 
+        false,
+        [baseShortCall.symbol],
+        [baseShortCall.strike]
+      );
+      if (!baseLongCall) {
+        console.log(`[CONDOR] No long call found at delta ${effectiveLongDelta} (excluding ${baseShortCall.symbol})`);
+        return null;
+      }
       
       // Initialize jitter result
       const strikeStep = computeStrikeStep(options);
       const existingCondors = jitterConfig?.existingCondors ?? 0;
+      
+      // Log selected strikes/deltas (Rule F)
+      console.log(`[CONDOR_SELECT] shortPut: strike=${baseShortPut.strike}, delta=${baseShortPut.greeks?.delta}, symbol=${baseShortPut.symbol}`);
+      console.log(`[CONDOR_SELECT] longPut: strike=${baseLongPut.strike}, delta=${baseLongPut.greeks?.delta}, symbol=${baseLongPut.symbol}`);
+      console.log(`[CONDOR_SELECT] shortCall: strike=${baseShortCall.strike}, delta=${baseShortCall.greeks?.delta}, symbol=${baseShortCall.symbol}`);
+      console.log(`[CONDOR_SELECT] longCall: strike=${baseLongCall.strike}, delta=${baseLongCall.greeks?.delta}, symbol=${baseLongCall.symbol}`);
+      
+      // === RULE A: Validate base structure before proceeding ===
+      let baseLegs: CondorLegs = {
+        shortPut: baseShortPut,
+        longPut: baseLongPut,
+        shortCall: baseShortCall,
+        longCall: baseLongCall,
+      };
+      
+      let baseValidation = validateCondorStructure(baseLegs);
+      
+      // Compute baseAllUnique correctly (Rule D)
+      const baseSymbols = [baseShortPut.symbol, baseLongPut.symbol, baseShortCall.symbol, baseLongCall.symbol];
+      const baseAllUnique = new Set(baseSymbols).size === 4;
+      
+      console.log(`[CONDOR_VALIDATE] Base validation: valid=${baseValidation.valid}, structureValid=${baseValidation.structureValid}, symbolsUnique=${baseValidation.symbolsUnique}`);
+      if (!baseValidation.valid) {
+        console.log(`[CONDOR_VALIDATE] Base validation failed: ${baseValidation.reasons.join(', ')}`);
+      }
+      
+      // === RULE B: Attempt repair if base is invalid ===
+      if (!baseValidation.valid) {
+        console.log(`[CONDOR_REPAIR] Attempting repair for invalid base structure...`);
+        const repairResult = repairCondorLegs(baseLegs, strikeStep, findByStrike, symbolConflicts, 8);
+        
+        for (const log of repairResult.repairLog) {
+          console.log(log);
+        }
+        
+        if (repairResult.repaired) {
+          baseLegs = repairResult.legs;
+          baseValidation = validateCondorStructure(baseLegs);
+          console.log(`[CONDOR_REPAIR] Repair successful, using repaired legs`);
+        } else {
+          console.log(`[CONDOR_REPAIR] Repair FAILED - blocking entry`);
+          return null;
+        }
+      }
       
       jitterResult = {
         applied: false,
@@ -1258,37 +1488,38 @@ function buildProposedOrder(
         offset: 0,
         jitterSize: 0,
         originalStrikes: {
-          shortPut: baseShortPut.strike,
-          longPut: baseLongPut.strike,
-          shortCall: baseShortCall.strike,
-          longCall: baseLongCall.strike,
+          shortPut: baseLegs.shortPut.strike,
+          longPut: baseLegs.longPut.strike,
+          shortCall: baseLegs.shortCall.strike,
+          longCall: baseLegs.longCall.strike,
         },
         shiftedStrikes: {
-          shortPut: baseShortPut.strike,
-          longPut: baseLongPut.strike,
-          shortCall: baseShortCall.strike,
-          longCall: baseLongCall.strike,
+          shortPut: baseLegs.shortPut.strike,
+          longPut: baseLegs.longPut.strike,
+          shortCall: baseLegs.shortCall.strike,
+          longCall: baseLegs.longCall.strike,
         },
-        allUnique: true,
+        allUnique: baseAllUnique, // Rule D: correctly computed
         allExistInChain: true,
       };
       
       // Apply strike jitter if there are existing condors
-      let shortPut = baseShortPut;
-      let longPut = baseLongPut;
-      let shortCall = baseShortCall;
-      let longCall = baseLongCall;
+      let shortPut = baseLegs.shortPut;
+      let longPut = baseLegs.longPut;
+      let shortCall = baseLegs.shortCall;
+      let longCall = baseLegs.longCall;
       
       if (existingCondors > 0) {
         // Try jitterSize = 1, then 2
+        let jitterSuccess = false;
         for (const jitterSize of [1, 2]) {
           const offset = existingCondors * strikeStep * jitterSize;
           
           // Symmetric jitter: puts move DOWN, calls move UP
-          const newShortPutStrike = baseShortPut.strike - offset;
-          const newLongPutStrike = baseLongPut.strike - offset;
-          const newShortCallStrike = baseShortCall.strike + offset;
-          const newLongCallStrike = baseLongCall.strike + offset;
+          const newShortPutStrike = baseLegs.shortPut.strike - offset;
+          const newLongPutStrike = baseLegs.longPut.strike - offset;
+          const newShortCallStrike = baseLegs.shortCall.strike + offset;
+          const newLongCallStrike = baseLegs.longCall.strike + offset;
           
           // Find options at shifted strikes
           const shiftedShortPut = findByStrike('put', newShortPutStrike);
@@ -1299,16 +1530,57 @@ function buildProposedOrder(
           // Check all shifted strikes exist in chain
           const allExist = !!(shiftedShortPut && shiftedLongPut && shiftedShortCall && shiftedLongCall);
           
-          // Check all symbols are unique (no conflicts with existing positions)
-          const symbols = [
-            shiftedShortPut?.symbol,
-            shiftedLongPut?.symbol,
-            shiftedShortCall?.symbol,
-            shiftedLongCall?.symbol,
-          ].filter(Boolean) as string[];
+          if (!allExist) {
+            console.log(`[JITTER] jitterSize=${jitterSize} failed: not all strikes exist in chain`);
+            continue;
+          }
           
-          const hasSymbolConflict = symbols.some(s => symbolConflicts(s));
-          const allUnique = new Set(symbols).size === 4 && !hasSymbolConflict;
+          // === RULE A: Validate jittered structure ===
+          const jitteredLegs: CondorLegs = {
+            shortPut: shiftedShortPut!,
+            longPut: shiftedLongPut!,
+            shortCall: shiftedShortCall!,
+            longCall: shiftedLongCall!,
+          };
+          
+          let jitteredValidation = validateCondorStructure(jitteredLegs);
+          
+          // Check for position conflicts
+          const jitteredSymbols = [shiftedShortPut!.symbol, shiftedLongPut!.symbol, shiftedShortCall!.symbol, shiftedLongCall!.symbol];
+          const hasSymbolConflict = jitteredSymbols.some(s => symbolConflicts(s));
+          
+          if (hasSymbolConflict) {
+            console.log(`[JITTER] jitterSize=${jitterSize} failed: symbol conflict with existing positions`);
+            continue;
+          }
+          
+          // === RULE B: Attempt repair on jittered legs if invalid ===
+          if (!jitteredValidation.valid) {
+            console.log(`[JITTER] jitterSize=${jitterSize} needs repair: ${jitteredValidation.reasons.join(', ')}`);
+            const repairResult = repairCondorLegs(jitteredLegs, strikeStep, findByStrike, symbolConflicts, 8);
+            
+            for (const log of repairResult.repairLog) {
+              console.log(log);
+            }
+            
+            if (repairResult.repaired) {
+              shortPut = repairResult.legs.shortPut;
+              longPut = repairResult.legs.longPut;
+              shortCall = repairResult.legs.shortCall;
+              longCall = repairResult.legs.longCall;
+              jitteredValidation = validateCondorStructure(repairResult.legs);
+            } else {
+              console.log(`[JITTER] jitterSize=${jitterSize} repair failed, trying next jitter size`);
+              continue;
+            }
+          } else {
+            shortPut = shiftedShortPut!;
+            longPut = shiftedLongPut!;
+            shortCall = shiftedShortCall!;
+            longCall = shiftedLongCall!;
+          }
+          
+          const allUnique = new Set([shortPut.symbol, longPut.symbol, shortCall.symbol, longCall.symbol]).size === 4;
           
           jitterResult = {
             applied: true,
@@ -1317,42 +1589,34 @@ function buildProposedOrder(
             offset,
             jitterSize,
             originalStrikes: {
-              shortPut: baseShortPut.strike,
-              longPut: baseLongPut.strike,
-              shortCall: baseShortCall.strike,
-              longCall: baseLongCall.strike,
+              shortPut: baseLegs.shortPut.strike,
+              longPut: baseLegs.longPut.strike,
+              shortCall: baseLegs.shortCall.strike,
+              longCall: baseLegs.longCall.strike,
             },
             shiftedStrikes: {
-              shortPut: newShortPutStrike,
-              longPut: newLongPutStrike,
-              shortCall: newShortCallStrike,
-              longCall: newLongCallStrike,
+              shortPut: shortPut.strike,
+              longPut: longPut.strike,
+              shortCall: shortCall.strike,
+              longCall: longCall.strike,
             },
             allUnique,
-            allExistInChain: allExist,
+            allExistInChain: true,
           };
           
-          if (allExist && allUnique) {
-            // Success! Use shifted strikes
-            shortPut = shiftedShortPut!;
-            longPut = shiftedLongPut!;
-            shortCall = shiftedShortCall!;
-            longCall = shiftedLongCall!;
-            console.log(`[JITTER] Applied jitterSize=${jitterSize}, offset=${offset} for condor #${existingCondors + 1}`);
-            break;
-          } else {
-            console.log(`[JITTER] jitterSize=${jitterSize} failed: allExist=${allExist}, allUnique=${allUnique}`);
-            if (jitterSize === 2) {
-              // Both jitter sizes failed - return null to block entry
-              console.log(`[JITTER] All jitter attempts failed for ${strategy.underlying}, blocking entry`);
-              return null;
-            }
-          }
+          console.log(`[JITTER] Applied jitterSize=${jitterSize}, offset=${offset} for condor #${existingCondors + 1}`);
+          jitterSuccess = true;
+          break;
+        }
+        
+        if (!jitterSuccess) {
+          // Both jitter sizes failed - return null to block entry
+          console.log(`[JITTER] All jitter attempts failed for ${strategy.underlying}, blocking entry`);
+          return null;
         }
       } else {
         // No existing condors - still check for symbol conflicts with base strikes
-        const baseSymbols = [shortPut.symbol, longPut.symbol, shortCall.symbol, longCall.symbol];
-        const hasConflict = baseSymbols.some(s => symbolConflicts(s));
+        const hasConflict = [shortPut.symbol, longPut.symbol, shortCall.symbol, longCall.symbol].some(s => symbolConflicts(s));
         if (hasConflict) {
           console.log(`[JITTER] Base strikes conflict with existing positions, attempting jitter`);
           // Recursively try with existingCondors = 1 to force jitter
@@ -1361,6 +1625,17 @@ function buildProposedOrder(
             existingCondors: 1,
           });
         }
+      }
+      
+      // === FINAL VALIDATION before building legs ===
+      const finalLegs: CondorLegs = { shortPut, longPut, shortCall, longCall };
+      const finalValidation = validateCondorStructure(finalLegs);
+      
+      console.log(`[CONDOR_VALIDATE] Final validation: valid=${finalValidation.valid}, symbols=[${shortPut.symbol}, ${longPut.symbol}, ${shortCall.symbol}, ${longCall.symbol}]`);
+      
+      if (!finalValidation.valid) {
+        console.error(`[CONDOR_VALIDATE] BLOCKED: Final validation failed after all attempts: ${finalValidation.reasons.join(', ')}`);
+        return null;
       }
       
       legs.push(
@@ -1379,9 +1654,18 @@ function buildProposedOrder(
     
     case 'credit_put_spread': {
       const shortPut = findByDelta(puts, shortDeltaTarget);
-      const longPut = findByDelta(puts, effectiveLongDelta);
+      if (!shortPut) return null;
       
-      if (!shortPut || !longPut) return null;
+      // Exclude short put when finding long put
+      const longPut = findByDelta(puts, effectiveLongDelta, false, [shortPut.symbol], [shortPut.strike]);
+      
+      if (!longPut) return null;
+      
+      // Validate structure: longPut < shortPut
+      if (longPut.strike >= shortPut.strike) {
+        console.log(`[PUT_SPREAD] Invalid structure: longPut=${longPut.strike} >= shortPut=${shortPut.strike}`);
+        return null;
+      }
       
       legs.push(
         { role: 'long_put', option_symbol: longPut.symbol, strike: longPut.strike, delta: longPut.greeks!.delta, side: 'buy_to_open', quantity: positionSize },
@@ -1395,9 +1679,18 @@ function buildProposedOrder(
     
     case 'credit_call_spread': {
       const shortCall = findByDelta(calls, shortDeltaTarget);
-      const longCall = findByDelta(calls, effectiveLongDelta);
+      if (!shortCall) return null;
       
-      if (!shortCall || !longCall) return null;
+      // Exclude short call when finding long call
+      const longCall = findByDelta(calls, effectiveLongDelta, false, [shortCall.symbol], [shortCall.strike]);
+      
+      if (!longCall) return null;
+      
+      // Validate structure: shortCall < longCall
+      if (shortCall.strike >= longCall.strike) {
+        console.log(`[CALL_SPREAD] Invalid structure: shortCall=${shortCall.strike} >= longCall=${longCall.strike}`);
+        return null;
+      }
       
       legs.push(
         { role: 'short_call', option_symbol: shortCall.symbol, strike: shortCall.strike, delta: shortCall.greeks!.delta, side: 'sell_to_open', quantity: positionSize },
@@ -1428,6 +1721,13 @@ function buildProposedOrder(
     
     default:
       return null;
+  }
+  
+  // === FINAL POST-CONSTRUCTION VALIDATION (Rule E backup) ===
+  const allSymbols = legs.map(l => l.option_symbol).filter(Boolean);
+  if (new Set(allSymbols).size !== allSymbols.length) {
+    console.error(`[ORDER VALIDATION] BLOCKED: Duplicate symbols in proposed order: ${allSymbols.join(', ')}`);
+    return null;
   }
   
   return {
@@ -1897,6 +2197,66 @@ serve(async (req) => {
       const signalToExecute = conflictResult.nettingApplied
         ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
         : signal;
+
+      // === PREFLIGHT 4: PRE-EXECUTE DUPLICATE SYMBOL GUARD (Rule E) ===
+      const orderSymbols = signalToExecute.legs.map((l: any) => l.symbol);
+      const uniqueOrderSymbols = new Set(orderSymbols);
+      const hasDuplicateSymbols = uniqueOrderSymbols.size !== orderSymbols.length;
+      
+      gates.push({
+        name: 'Symbol Uniqueness',
+        expected: 'all leg symbols unique',
+        actual: { 
+          symbols: orderSymbols, 
+          uniqueCount: uniqueOrderSymbols.size, 
+          totalCount: orderSymbols.length,
+          hasDuplicates: hasDuplicateSymbols,
+        },
+        pass: !hasDuplicateSymbols,
+        reason: hasDuplicateSymbols 
+          ? `BLOCKED: Duplicate symbols detected in order: ${orderSymbols.join(', ')}`
+          : undefined,
+      });
+      
+      if (hasDuplicateSymbols) {
+        // Set cooldown to prevent spam retries
+        setEntryCooldown(cooldownKey);
+        
+        console.error(`[PRE-EXECUTE] BLOCKED: Duplicate symbols in order: ${orderSymbols.join(', ')}`);
+        
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: `BLOCKED: Duplicate symbols in order legs - ${orderSymbols.join(', ')}`,
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            { 
+              signal, 
+              blocked: 'duplicate_symbols',
+              symbols: orderSymbols,
+            },
+            effectiveTradeGroupId
+          );
+        }
+        
+        return new Response(
+          JSON.stringify({ 
+            success: false, 
+            error: `Order blocked - duplicate symbols detected: ${orderSymbols.join(', ')}`,
+            blocked: 'duplicate_symbols',
+            symbols: orderSymbols,
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
 
       // === SET IN-FLIGHT IMMEDIATELY (before order submission) ===
       setOrderInFlight(inFlightKey);
