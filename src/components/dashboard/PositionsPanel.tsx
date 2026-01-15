@@ -604,7 +604,10 @@ export const PositionsPanel = ({
                             "font-mono text-xs text-right py-1.5",
                             group.totalPnl >= 0 ? "text-trading-green" : "text-panic-red"
                           )}>
-                            {group.totalPnl >= 0 ? '+' : ''}${group.totalPnl.toFixed(0)}
+                            <div className="flex flex-col items-end">
+                              <span>{group.totalPnl >= 0 ? '+' : ''}${group.totalPnl.toFixed(0)}</span>
+                              <span className="text-[8px] text-muted-foreground">(mark)</span>
+                            </div>
                           </TableCell>
                           <TableCell className="font-mono text-xs text-right text-bloomberg-amber py-1.5">
                             {group.nearestDte !== null ? group.nearestDte : '--'}

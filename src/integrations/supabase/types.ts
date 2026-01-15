@@ -50,6 +50,7 @@ export type Database = {
       position_group_map: {
         Row: {
           created_at: string
+          entry_credit: number | null
           expiration: string | null
           id: string
           leg_qty: number
@@ -63,6 +64,7 @@ export type Database = {
         }
         Insert: {
           created_at?: string
+          entry_credit?: number | null
           expiration?: string | null
           id?: string
           leg_qty?: number
@@ -76,6 +78,7 @@ export type Database = {
         }
         Update: {
           created_at?: string
+          entry_credit?: number | null
           expiration?: string | null
           id?: string
           leg_qty?: number

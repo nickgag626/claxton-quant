@@ -77,6 +77,86 @@ function setEntryCooldown(key: string): void {
   entryCooldownCache.set(key, Date.now() + ENTRY_COOLDOWN_MS);
 }
 
+/**
+ * Normalize leg side to direction: 'short' or 'long'
+ * Short: sell_to_open, sold, short
+ * Long: buy_to_open, bought, long
+ */
+function normalizeLegDir(side: string | null | undefined): 'short' | 'long' | null {
+  if (!side) return null;
+  const s = side.toLowerCase();
+  if (s.includes('sell') || s === 'short' || s === 'sold') return 'short';
+  if (s.includes('buy') || s === 'long' || s === 'bought') return 'long';
+  return null;
+}
+
+/**
+ * Get mark price for a leg with fallbacks:
+ * 1. markPrice if present
+ * 2. mid = (bid + ask) / 2 if both exist
+ * 3. last price
+ * 4. 0 (invalid)
+ */
+function getMarkPrice(leg: any): number {
+  if (typeof leg.markPrice === 'number' && leg.markPrice > 0) {
+    return leg.markPrice;
+  }
+  const bid = Number(leg.bid ?? 0);
+  const ask = Number(leg.ask ?? 0);
+  if (bid > 0 && ask > 0) {
+    return (bid + ask) / 2;
+  }
+  const last = Number(leg.lastPrice ?? leg.last ?? 0);
+  if (last > 0) {
+    return last;
+  }
+  return 0;
+}
+
+/**
+ * Infer leg direction from option symbol strikes for iron condors
+ * Returns 'short' or 'long' based on iron condor structure:
+ * - Calls: lower strike = short, higher strike = long
+ * - Puts: higher strike = short, lower strike = long
+ */
+function inferLegDirFromStrikes(
+  legSymbol: string, 
+  allLegSymbols: string[]
+): 'short' | 'long' | null {
+  // Parse OCC symbol: ROOT + YYMMDD + C/P + 8-digit strike
+  const parseSymbol = (sym: string) => {
+    const match = sym.match(/^([A-Z]+)(\d{6})([CP])(\d{8})$/);
+    if (!match) return null;
+    return {
+      optionType: match[3] as 'C' | 'P',
+      strike: parseInt(match[4], 10) / 1000,
+    };
+  };
+  
+  const thisParsed = parseSymbol(legSymbol);
+  if (!thisParsed) return null;
+  
+  // Get all legs of same option type
+  const sameType = allLegSymbols
+    .map(s => ({ symbol: s, parsed: parseSymbol(s) }))
+    .filter(x => x.parsed && x.parsed.optionType === thisParsed.optionType);
+  
+  if (sameType.length !== 2) return null; // Need exactly 2 for spread
+  
+  // Sort by strike
+  sameType.sort((a, b) => a.parsed!.strike - b.parsed!.strike);
+  
+  const isLowerStrike = sameType[0].symbol === legSymbol;
+  
+  if (thisParsed.optionType === 'C') {
+    // Calls: lower = short, higher = long
+    return isLowerStrike ? 'short' : 'long';
+  } else {
+    // Puts: lower = long, higher = short
+    return isLowerStrike ? 'long' : 'short';
+  }
+}
+
 interface PositionConflict {
   symbol: string;
   proposedSide: string;
@@ -1859,6 +1939,7 @@ serve(async (req) => {
       let orderStatus = 'pending';
       let filledLegs: string[] = [];
       let lastBrokerPositions: Array<{ symbol: string; quantity: number }> = [];
+      let verifiedOrderData: any = null; // Capture order data for fill price extraction
       
       while (Date.now() - startTime < VERIFICATION_TIMEOUT_MS) {
         await new Promise(r => setTimeout(r, VERIFICATION_POLL_INTERVAL_MS));
@@ -1868,7 +1949,8 @@ serve(async (req) => {
           const orderStatusUrl = `${baseUrl}/accounts/${accountId}/orders/${orderResponse.orderId}`;
           const statusResponse = await fetch(orderStatusUrl, { headers });
           const statusData = await statusResponse.json();
-          orderStatus = statusData?.order?.status?.toLowerCase() || 'unknown';
+          verifiedOrderData = statusData?.order; // Capture for fill price extraction
+          orderStatus = verifiedOrderData?.status?.toLowerCase() || 'unknown';
           console.log(`[VERIFY] Order ${orderResponse.orderId} status: ${orderStatus} (elapsed: ${Date.now() - startTime}ms)`);
           
           // If order was rejected/canceled, exit immediately
@@ -1912,6 +1994,35 @@ serve(async (req) => {
         // SUCCESS: All legs filled - persist mapping
         console.log(`[VERIFIED] ✅ All ${expectedLegCount} legs filled for order ${orderResponse.orderId}`);
         
+        // === COMPUTE NET ENTRY CREDIT FROM ACTUAL FILLS ===
+        let netEntryCreditDollars = 0;
+        const orderLegs = verifiedOrderData?.leg 
+          ? (Array.isArray(verifiedOrderData.leg) ? verifiedOrderData.leg : [verifiedOrderData.leg]) 
+          : [];
+
+        console.log(`[ENTRY CREDIT] Computing from ${orderLegs.length} order legs (actual fills)`);
+
+        for (const signalLeg of signalToExecute.legs) {
+          const orderLeg = orderLegs.find((ol: any) => ol.option_symbol === signalLeg.symbol);
+          const fillPrice = Number(orderLeg?.avg_fill_price || 0);
+          const qty = Math.abs(Number(signalLeg.quantity) || 1);
+          
+          // Normalize leg_dir using helper
+          const legDir = normalizeLegDir(signalLeg.side);
+          
+          if (legDir === 'short') {
+            // Short leg (sell_to_open): receives credit
+            netEntryCreditDollars += fillPrice * qty * 100;
+          } else if (legDir === 'long') {
+            // Long leg (buy_to_open): pays debit
+            netEntryCreditDollars -= fillPrice * qty * 100;
+          }
+          
+          console.log(`[ENTRY CREDIT] Leg ${signalLeg.symbol}: side=${signalLeg.side}, dir=${legDir}, fill=${fillPrice}, qty=${qty}`);
+        }
+
+        console.log(`[ENTRY CREDIT] Total entry credit from fills: $${netEntryCreditDollars.toFixed(2)}`);
+        
         await persistPositionGroupMap(supabase, {
           tradeGroupId: effectiveTradeGroupId,
           openOrderId: String(orderResponse.orderId),
@@ -1924,6 +2035,7 @@ serve(async (req) => {
             quantity: leg.quantity || 1,
             side: leg.side || 'unknown',
           })),
+          entryCredit: netEntryCreditDollars, // NEW: computed from actual fills
         });
         
         if (signal.strategyId) {
@@ -2197,26 +2309,128 @@ serve(async (req) => {
           continue; // Skip this group - don't generate exit signal
         }
         
-        // Calculate aggregate P&L for the group
-        let totalCostBasis = 0;
-        let totalCurrentValue = 0;
-        
-        for (const leg of groupLegs) {
-          totalCostBasis += Number(leg.costBasis ?? 0);
-          totalCurrentValue += Number(leg.currentValue ?? 0);
+        // === FIXED: Direction-aware mark P&L for credit strategies ===
+
+        // Step 1: Fetch entry_credit and leg_side for ALL legs in this group
+        const { data: mappings } = await supabase
+          .from('position_group_map')
+          .select('entry_credit, symbol, leg_side')
+          .eq('trade_group_id', tradeGroupId);  // NO .limit(1) - fetch all legs
+
+        // Step 2: Validate entry_credit consistency
+        const entryCredits = (mappings || [])
+          .map((m: any) => m.entry_credit)
+          .filter((ec: any) => ec != null);
+        const distinctEntryCredits = [...new Set(entryCredits)];
+        if (distinctEntryCredits.length > 1) {
+          console.warn(`[EXIT] WARNING: Group ${tradeGroupId} has ${distinctEntryCredits.length} distinct entry_credit values: ${distinctEntryCredits.join(', ')}`);
         }
+        const entryCreditDollars = Number(distinctEntryCredits[0]) || 0;
+
+        // Step 3: Build leg side lookup from stored data
+        const legSideMap = new Map<string, string>();
+        for (const mapping of mappings || []) {
+          if (mapping.symbol && mapping.leg_side) {
+            legSideMap.set(mapping.symbol, mapping.leg_side);
+          }
+        }
+
+        // Step 4: Check for missing/zero mark prices
+        const allLegSymbols = groupLegs.map((l: any) => l.symbol);
+        const missingMarkLegs: string[] = [];
+        for (const leg of groupLegs) {
+          const mark = getMarkPrice(leg);
+          if (mark <= 0) {
+            missingMarkLegs.push(leg.symbol);
+          }
+        }
+
+        if (missingMarkLegs.length > 0) {
+          console.warn(`[EXIT] SKIPPING group ${tradeGroupId}: ${missingMarkLegs.length} legs have missing/zero markPrice: ${missingMarkLegs.join(', ')}`);
+          continue; // Skip this group - cannot evaluate exit without valid marks
+        }
+
+        // Step 5: Compute costToCloseDebit per-leg using abs(leg.quantity)
+        let costToCloseDebit = 0;
+        let legDirUnknown = false;
+        for (const leg of groupLegs) {
+          const markPrice = getMarkPrice(leg);
+          const qty = Math.abs(Number(leg.quantity ?? 0));
+          
+          // Get stored leg_side and normalize to direction (no costBasis fallback!)
+          const storedSide = legSideMap.get(leg.symbol);
+          let legDir = normalizeLegDir(storedSide);
+          
+          // Fallback: infer from strikes using iron condor rules
+          if (!legDir) {
+            legDir = inferLegDirFromStrikes(leg.symbol, allLegSymbols);
+            if (legDir) {
+              console.log(`[EXIT] Inferred leg_dir from strikes for ${leg.symbol}: ${legDir}`);
+            }
+          }
+          
+          // If still unknown, flag and skip this group
+          if (!legDir) {
+            console.warn(`[EXIT] Cannot determine leg_dir for ${leg.symbol} - skipping group`);
+            legDirUnknown = true;
+            break;
+          }
+          
+          if (legDir === 'short') {
+            // Short leg: buy_to_close = pay debit
+            costToCloseDebit += markPrice * qty * 100;
+          } else {
+            // Long leg: sell_to_close = receive credit (reduces net cost)
+            costToCloseDebit -= markPrice * qty * 100;
+          }
+        }
+
+        // Skip group if any leg direction is unknown
+        if (legDirUnknown) {
+          console.warn(`[EXIT] SKIPPING group ${tradeGroupId}: Unable to determine leg direction for all legs`);
+          continue;
+        }
+
+        // Clamp tiny negative to 0 (quote noise)
+        if (costToCloseDebit < 0 && costToCloseDebit > -1) {
+          costToCloseDebit = 0;
+        }
+
+        // Step 6: Compute unrealized P&L (entry_credit stored in DOLLARS)
+        const unrealizedPnlDollars = entryCreditDollars - costToCloseDebit;
+
+        // Step 7: Strategy type guard
+        // Only use credit P&L% formula when entryCreditDollars > 0
+        let unrealizedPnlPercent: number;
+        if (entryCreditDollars > 0) {
+          unrealizedPnlPercent = (unrealizedPnlDollars / entryCreditDollars) * 100;
+        } else {
+          // Debit strategy or missing entry credit: skip percentage-based triggers
+          console.warn(`[EXIT] Group ${tradeGroupId}: entryCreditDollars=${entryCreditDollars} <= 0, skipping P&L% triggers`);
+          unrealizedPnlPercent = 0;
+        }
+
+        // Use these for exit evaluation
+        const pnl = unrealizedPnlDollars;
+        const pnlPercent = unrealizedPnlPercent;
+
+        console.log(`[EXIT] Group ${tradeGroupId}: entryCredit=$${entryCreditDollars.toFixed(2)}, costToClose=$${costToCloseDebit.toFixed(2)}, unrealizedPnl=$${unrealizedPnlDollars.toFixed(2)}, pnl%=${unrealizedPnlPercent.toFixed(2)}%, pnl_basis=mark`);
         
-        const isShort = totalCostBasis < 0;
-        const pnl = isShort ? Math.abs(totalCostBasis) - totalCurrentValue : totalCurrentValue - totalCostBasis;
-        const pnlPercent = Math.abs(totalCostBasis) > 0 ? (pnl / Math.abs(totalCostBasis)) * 100 : 0;
+        // === SANITY GUARD: Skip absurd P&L% values ===
+        if (Math.abs(pnlPercent) > 200) {
+          console.warn(`[EXIT SANITY] Absurd P&L% detected: ${pnlPercent.toFixed(2)}% for group ${tradeGroupId}`);
+          console.warn(`[EXIT SANITY] Debug: entryCreditDollars=${entryCreditDollars.toFixed(2)}, costToClose=${costToCloseDebit.toFixed(2)}, legs=${observedLegs}`);
+          console.warn(`[EXIT SANITY] Skipping exit trigger - requires manual review`);
+          continue; // Skip this group
+        }
         
         let exitReason: string | null = null;
-        
-        // Check profit target
-        if (pnlPercent >= strategy.exitConditions.profitTargetPercent) {
+
+        // === profit_target: Only trigger on POSITIVE P&L ===
+        if (pnlPercent >= strategy.exitConditions.profitTargetPercent && pnlPercent > 0) {
           exitReason = 'profit_target';
         }
-        // Check stop loss
+        // Check stop loss (unchanged)
         else if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
           exitReason = 'stop_loss';
         }
@@ -2236,7 +2450,10 @@ serve(async (req) => {
         }
         
         if (exitReason) {
-          // Save exit_attempt evaluation
+          // Get current timestamp for trigger snapshot
+          const { isoET } = getETTime();
+          
+          // Save exit_attempt evaluation with trigger snapshot in inputs.market
           if (strategy.id) {
             await saveEvaluation(
               supabase,
@@ -2253,15 +2470,24 @@ serve(async (req) => {
                     : exitReason === 'stop_loss'
                     ? `P&L <= -${strategy.exitConditions.stopLossPercent}%`
                     : `DTE <= ${strategy.exitConditions.timeStopDte}`,
-                  actual: { pnl_percent: pnlPercent, legs: observedLegs },
+                  actual: { 
+                    pnl_percent: pnlPercent, 
+                    legs: observedLegs,
+                    pnl_basis: 'mark', // NEW: Indicate this is mark-to-market
+                  },
                   pass: true,
                 }],
                 inputs: { 
                   market: { 
-                    pnl_percent: pnlPercent, 
-                    total_cost_basis: totalCostBasis, 
-                    total_current_value: totalCurrentValue,
+                    pnl_percent: pnlPercent,
+                    pnl_basis: 'mark',  // NEW: Indicate this is mark-to-market
+                    entry_credit_dollars: entryCreditDollars,
+                    cost_to_close_debit: costToCloseDebit,
+                    unrealized_pnl_dollars: unrealizedPnlDollars,
                     leg_count: observedLegs,
+                    leg_sides: Object.fromEntries(legSideMap),
+                    distinct_entry_credits: distinctEntryCredits.length,
+                    trigger_timestamp: isoET, // NEW: Trigger snapshot timestamp
                   }, 
                   account: {} 
                 },
@@ -2847,9 +3073,10 @@ async function persistPositionGroupMap(
     strategyName: string | null;
     strategyType: string | null;
     legs: Array<{ symbol: string; quantity: number; side: string }>;
+    entryCredit?: number; // NEW: in DOLLARS for whole group (computed from actual fills)
   }
 ): Promise<void> {
-  const { tradeGroupId, openOrderId, underlying, expiration, strategyName, strategyType, legs } = params;
+  const { tradeGroupId, openOrderId, underlying, expiration, strategyName, strategyType, legs, entryCredit } = params;
   
   const records = legs.map(leg => ({
     trade_group_id: tradeGroupId,
@@ -2861,6 +3088,7 @@ async function persistPositionGroupMap(
     strategy_type: strategyType,
     leg_qty: leg.quantity,
     leg_side: leg.side,
+    entry_credit: entryCredit, // Same value for all legs in group (DOLLARS)
   }));
   
   try {
@@ -2872,7 +3100,7 @@ async function persistPositionGroupMap(
     if (error) {
       console.error('[persistPositionGroupMap] Error inserting:', error);
     } else {
-      console.log(`[persistPositionGroupMap] Saved ${legs.length} leg mappings for order ${openOrderId}, group ${tradeGroupId}`);
+      console.log(`[persistPositionGroupMap] Saved ${legs.length} leg mappings for order ${openOrderId}, group ${tradeGroupId}, entryCredit=$${entryCredit?.toFixed(2) || 'N/A'}`);
     }
   } catch (err) {
     console.error('[persistPositionGroupMap] Exception:', err);
