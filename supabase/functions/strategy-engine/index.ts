@@ -2081,7 +2081,13 @@ serve(async (req) => {
       
       for (const strategy of strategies as Strategy[]) {
         if (!strategy.enabled) continue;
-        
+
+        // SAFETY: Block undefined-risk strategies (straddle/strangle) from automated trading
+        if (strategy.type === 'straddle' || strategy.type === 'strangle') {
+          console.warn(`[SAFETY] BLOCKED: Strategy "${strategy.name}" is type "${strategy.type}" with UNLIMITED LOSS potential. Not allowed for automated trading.`);
+          continue;
+        }
+
         // Run full evaluation with trace
         const result = await evaluateStrategyWithTrace(
           strategy,
@@ -3200,9 +3206,14 @@ serve(async (req) => {
               groupLegCount: observedLegs,
             });
           }
+        } else {
+          // Log WHY no exit triggered for debugging
+          console.log(`[EXIT] Group ${tradeGroupId}: NO TRIGGER - pnl%=${pnlPercent.toFixed(2)}%, ` +
+            `profitTarget=${strategy.exitConditions.profitTargetPercent}%, ` +
+            `stopLoss=${strategy.exitConditions.stopLossPercent}%`);
         }
       }
-      
+
       // Process ungrouped positions individually
       for (const position of ungroupedPositions) {
         const strategy = (strategies as Strategy[]).find(s => s.name === position.strategyName);
