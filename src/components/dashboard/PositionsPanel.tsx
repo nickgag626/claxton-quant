@@ -36,6 +36,18 @@ import {
   type GroupHealthInfo 
 } from '@/lib/strategyLegs';
 
+// Exit status info from strategy engine
+interface ExitStatusInfo {
+  pnlPercent: number;
+  profitTargetPercent: number;
+  stopLossPercent: number;
+  dte?: number;
+  timeStopDte?: number;
+  triggered: boolean;
+  reason: string | null;
+  blockedReason?: string;
+}
+
 interface PositionsPanelProps {
   positions: Position[];
   isApiConnected: boolean;
@@ -45,6 +57,7 @@ interface PositionsPanelProps {
   onLegOutModeChange?: (enabled: boolean) => void;
   isGroupedPosition?: (position: Position) => boolean;
   getGroupPositions?: (tradeGroupId: string | undefined) => Position[];
+  getExitStatus?: (position: Position) => ExitStatusInfo | undefined;
   dtbpRejection?: {
     symbol: string;
     tradeGroupId: string;
@@ -68,6 +81,7 @@ interface GroupedPositionInfo {
   health: GroupHealthInfo;
   totalPnl: number;
   nearestDte: number | null;
+  exitStatus?: ExitStatusInfo;
 }
 
 const computeDte = (expirationDate?: string): number | null => {
@@ -102,15 +116,16 @@ const computePnl = (position: Position): number => {
   return position.currentValue - position.costBasis;
 };
 
-export const PositionsPanel = ({ 
-  positions, 
-  isApiConnected, 
+export const PositionsPanel = ({
+  positions,
+  isApiConnected,
   onClosePosition,
   onCloseGroup,
   legOutModeEnabled = false,
   onLegOutModeChange,
   isGroupedPosition,
   getGroupPositions,
+  getExitStatus,
   dtbpRejection,
   onRetryCloseAsGroup,
   entryBlockedReason,
@@ -216,15 +231,18 @@ export const PositionsPanel = ({
       const strategyType = stratPos?.strategyType || null;
       const strategyName = stratPos?.strategyName || null;
       const underlying = stratPos?.underlying || positions[0]?.underlying || '';
-      
+
       // Compute health
       const health = computeGroupHealth(strategyType, positions.length);
-      
+
       // Compute aggregate metrics
       const totalPnl = positions.reduce((sum, p) => sum + computePnl(p), 0);
       const dtes = positions.map(p => computeDte(p.expirationDate)).filter((d): d is number => d !== null);
       const nearestDte = dtes.length > 0 ? Math.min(...dtes) : null;
-      
+
+      // Get exit status from strategy engine (shows why position hasn't exited)
+      const exitStatus = getExitStatus?.(positions[0]);
+
       grouped.push({
         tradeGroupId,
         positions,
@@ -234,11 +252,99 @@ export const PositionsPanel = ({
         health,
         totalPnl,
         nearestDte,
+        exitStatus,
       });
     });
-    
+
     return { groupedPositions: grouped, ungroupedPositions: ungrouped };
-  }, [brokerPositions]);
+  }, [brokerPositions, getExitStatus]);
+
+  // Render exit status badge (shows why position hasn't exited)
+  const renderExitStatus = (exitStatus: ExitStatusInfo | undefined) => {
+    if (!exitStatus) return null;
+
+    // If blocked, show blocked reason
+    if (exitStatus.blockedReason) {
+      return (
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="px-1.5 py-0.5 rounded bg-panic-red/20 text-panic-red text-[9px] cursor-help">
+                BLOCKED
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs">
+              <p className="text-xs font-semibold text-panic-red">{exitStatus.blockedReason}</p>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      );
+    }
+
+    // If triggered, show the reason
+    if (exitStatus.triggered && exitStatus.reason) {
+      return (
+        <span className="px-1.5 py-0.5 rounded bg-bloomberg-amber/20 text-bloomberg-amber text-[9px]">
+          {exitStatus.reason.replace('_', ' ').toUpperCase()}
+        </span>
+      );
+    }
+
+    // Not triggered - show P&L vs target
+    const pnl = exitStatus.pnlPercent;
+    const profit = exitStatus.profitTargetPercent;
+    const stop = exitStatus.stopLossPercent;
+
+    // Determine which threshold is closer to being hit
+    const profitDistance = profit - pnl; // How far from profit target
+    const stopDistance = pnl + stop; // How far from stop loss (stop is negative, pnl could be negative)
+
+    let statusText: string;
+    let statusColor: string;
+
+    if (pnl >= 0) {
+      // Positive P&L - show progress toward profit target
+      const pctOfTarget = Math.min(100, Math.round((pnl / profit) * 100));
+      statusText = `${pnl.toFixed(0)}% / ${profit}%`;
+      statusColor = pctOfTarget >= 75 ? 'text-trading-green' : 'text-muted-foreground';
+    } else {
+      // Negative P&L - show distance from stop loss
+      const pctOfStop = Math.round((Math.abs(pnl) / stop) * 100);
+      statusText = `${pnl.toFixed(0)}% / -${stop}%`;
+      statusColor = pctOfStop >= 75 ? 'text-panic-red' : 'text-muted-foreground';
+    }
+
+    return (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className={cn("font-mono text-[9px] cursor-help", statusColor)}>
+              {statusText}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="top" className="max-w-xs">
+            <div className="space-y-1 text-xs">
+              <div className="font-semibold">Exit Thresholds</div>
+              <div className={pnl >= 0 ? 'text-trading-green' : 'text-panic-red'}>
+                Current P&L: {pnl >= 0 ? '+' : ''}{pnl.toFixed(1)}%
+              </div>
+              <div className="text-trading-green">
+                Profit Target: +{profit}%
+              </div>
+              <div className="text-panic-red">
+                Stop Loss: -{stop}%
+              </div>
+              {exitStatus.dte !== undefined && exitStatus.timeStopDte !== undefined && (
+                <div className="text-bloomberg-amber">
+                  Time Stop: {exitStatus.dte} DTE (triggers at {exitStatus.timeStopDte} DTE)
+                </div>
+              )}
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  };
 
   // Render health badge
   const renderHealthBadge = (health: GroupHealthInfo) => {
@@ -562,7 +668,8 @@ export const PositionsPanel = ({
                     <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase">POS</TableHead>
                     <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">P&L</TableHead>
                     <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-right">DTE</TableHead>
-                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-center">STATUS</TableHead>
+                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-center">HEALTH</TableHead>
+                    <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-center">EXIT</TableHead>
                     <TableHead className="text-bloomberg-amber font-mono text-[10px] uppercase text-center w-24"></TableHead>
                   </TableRow>
                 </TableHeader>
@@ -614,6 +721,9 @@ export const PositionsPanel = ({
                           </TableCell>
                           <TableCell className="py-1.5 text-center">
                             {renderHealthBadge(group.health)}
+                          </TableCell>
+                          <TableCell className="py-1.5 text-center">
+                            {renderExitStatus(group.exitStatus)}
                           </TableCell>
                           <TableCell className="py-1.5 text-center">
                             {renderGroupCloseButton(group)}
@@ -687,6 +797,9 @@ export const PositionsPanel = ({
                                 </TooltipProvider>
                               </TableCell>
                               <TableCell className="py-1 text-center">
+                                {/* Exit status shown at group level */}
+                              </TableCell>
+                              <TableCell className="py-1 text-center">
                                 {renderLegCloseButton(pos)}
                               </TableCell>
                             </TableRow>
@@ -727,6 +840,10 @@ export const PositionsPanel = ({
                           {dte !== null ? dte : '--'}
                         </TableCell>
                         <TableCell className="font-mono text-[9px] text-center py-1.5">
+                          <span className="text-muted-foreground">—</span>
+                        </TableCell>
+                        <TableCell className="font-mono text-[9px] text-center py-1.5">
+                          {/* Exit status N/A for ungrouped */}
                           <span className="text-muted-foreground">—</span>
                         </TableCell>
                         <TableCell className="py-1.5 text-center">

@@ -11,6 +11,7 @@ interface StatusRibbonProps {
   positionCount: number;
   nearestDte: number | null;
   lastUpdate: Date;
+  lastCheckExitsTime?: Date | null;
 }
 
 export const StatusRibbon = ({
@@ -22,7 +23,27 @@ export const StatusRibbon = ({
   positionCount,
   nearestDte,
   lastUpdate,
+  lastCheckExitsTime,
 }: StatusRibbonProps) => {
+  // Calculate heartbeat status for check_exits
+  const getHeartbeatStatus = (): { variant: 'green' | 'amber' | 'red' | 'gray'; text: string } => {
+    if (!lastCheckExitsTime) {
+      return { variant: 'gray', text: 'EXITS:--' };
+    }
+    const ageMs = Date.now() - lastCheckExitsTime.getTime();
+    const ageSec = Math.floor(ageMs / 1000);
+
+    if (ageSec < 45) {
+      return { variant: 'green', text: `EXITS:${ageSec}s` };
+    } else if (ageSec < 90) {
+      return { variant: 'amber', text: `EXITS:${ageSec}s` };
+    } else {
+      return { variant: 'red', text: `EXITS:${ageSec}s` };
+    }
+  };
+
+  const heartbeat = getHeartbeatStatus();
+
   return (
     <motion.div
       initial={{ opacity: 0, y: -10 }}
@@ -40,7 +61,11 @@ export const StatusRibbon = ({
       <StatusBadge variant={isBotRunning ? 'green' : 'gray'}>
         BOT:{isBotRunning ? 'RUNNING' : 'STOPPED'}
       </StatusBadge>
-      
+
+      <StatusBadge variant={heartbeat.variant}>
+        {heartbeat.text}
+      </StatusBadge>
+
       <StatusBadge variant={killSwitchActive ? 'red' : 'gray'}>
         KILL:{killSwitchActive ? 'ACTIVE' : 'OFF'}
       </StatusBadge>

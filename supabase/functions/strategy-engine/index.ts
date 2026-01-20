@@ -2922,6 +2922,21 @@ serve(async (req) => {
       // Check if any positions should be closed
       // CRITICAL: Return group-level exit signals, not per-leg
       const exitSignals: any[] = [];
+
+      // Track exit status for ALL groups (for UI visibility into why positions aren't exiting)
+      const exitStatus: Array<{
+        tradeGroupId: string | null;
+        symbol: string;
+        strategyName: string;
+        pnlPercent: number;
+        profitTargetPercent: number;
+        stopLossPercent: number;
+        dte?: number;
+        timeStopDte?: number;
+        triggered: boolean;
+        reason: string | null;
+        blockedReason?: string;
+      }> = [];
       
       // Helper: Get expected leg count for strategy type
       function getExpectedLegCount(strategyType: string | null | undefined): number | null {
@@ -3001,9 +3016,22 @@ serve(async (req) => {
             );
           }
           
+          // Record blocked status for UI visibility
+          exitStatus.push({
+            tradeGroupId,
+            symbol: firstLeg.symbol,
+            strategyName: strategy.name,
+            pnlPercent: 0, // Cannot calculate without full structure
+            profitTargetPercent: strategy.exitConditions.profitTargetPercent,
+            stopLossPercent: strategy.exitConditions.stopLossPercent,
+            triggered: false,
+            reason: null,
+            blockedReason: `Broken structure (${observedLegs}/${expectedLegs} legs)`,
+          });
+
           continue; // Skip this group - don't generate exit signal
         }
-        
+
         // === FIXED: Direction-aware mark P&L for credit strategies ===
 
         // Step 1: Fetch entry_credit and leg_side for ALL legs in this group
@@ -3206,11 +3234,39 @@ serve(async (req) => {
               groupLegCount: observedLegs,
             });
           }
+
+          // Record exit status (triggered)
+          exitStatus.push({
+            tradeGroupId,
+            symbol: firstLeg.symbol,
+            strategyName: strategy.name,
+            pnlPercent,
+            profitTargetPercent: strategy.exitConditions.profitTargetPercent,
+            stopLossPercent: strategy.exitConditions.stopLossPercent,
+            dte: expirationDate ? Math.ceil((expirationDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : undefined,
+            timeStopDte: strategy.exitConditions.timeStopDte,
+            triggered: true,
+            reason: exitReason,
+          });
         } else {
           // Log WHY no exit triggered for debugging
           console.log(`[EXIT] Group ${tradeGroupId}: NO TRIGGER - pnl%=${pnlPercent.toFixed(2)}%, ` +
             `profitTarget=${strategy.exitConditions.profitTargetPercent}%, ` +
             `stopLoss=${strategy.exitConditions.stopLossPercent}%`);
+
+          // Record exit status (not triggered)
+          exitStatus.push({
+            tradeGroupId,
+            symbol: firstLeg.symbol,
+            strategyName: strategy.name,
+            pnlPercent,
+            profitTargetPercent: strategy.exitConditions.profitTargetPercent,
+            stopLossPercent: strategy.exitConditions.stopLossPercent,
+            dte: expirationDate ? Math.ceil((expirationDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : undefined,
+            timeStopDte: strategy.exitConditions.timeStopDte,
+            triggered: false,
+            reason: null,
+          });
         }
       }
 
@@ -3259,7 +3315,7 @@ serve(async (req) => {
       }
 
       return new Response(
-        JSON.stringify({ exitSignals, marketState }),
+        JSON.stringify({ exitSignals, exitStatus, marketState }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }

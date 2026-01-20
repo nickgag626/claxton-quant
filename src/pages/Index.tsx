@@ -28,6 +28,7 @@ const Index = () => {
     isApiConnected,
     isBotRunning,
     lastUpdate,
+    lastCheckExitsTime,
     deltaHistory,
     pnlHistory,
     toggleBot,
@@ -52,6 +53,7 @@ const Index = () => {
     dtbpRejection,
     isGroupedPosition,
     getGroupPositions,
+    getExitStatus,
     clearHistory,
     // Structure Integrity Gate
     entryBlockedReason,
@@ -81,6 +83,7 @@ const Index = () => {
           positionCount={positions.length}
           nearestDte={nearestDte}
           lastUpdate={lastUpdate}
+          lastCheckExitsTime={lastCheckExitsTime}
         />
         
         <KPIStrip
@@ -93,8 +96,8 @@ const Index = () => {
         
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="lg:col-span-2 space-y-4">
-            <PositionsPanel 
-              positions={positions} 
+            <PositionsPanel
+              positions={positions}
               isApiConnected={isApiConnected}
               onClosePosition={closePosition}
               onCloseGroup={closeGroup}
@@ -102,6 +105,7 @@ const Index = () => {
               onLegOutModeChange={setLegOutModeEnabled}
               isGroupedPosition={isGroupedPosition}
               getGroupPositions={getGroupPositions}
+              getExitStatus={getExitStatus}
               dtbpRejection={dtbpRejection}
               onRetryCloseAsGroup={retryCloseAsGroup}
               entryBlockedReason={entryBlockedReason}

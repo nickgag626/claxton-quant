@@ -23,6 +23,21 @@ export interface ExitSignal {
   dte?: number;
 }
 
+// Exit status for ALL positions (shows why positions didn't trigger exit)
+export interface ExitStatus {
+  tradeGroupId: string | null;
+  symbol: string;
+  strategyName: string;
+  pnlPercent: number;
+  profitTargetPercent: number;
+  stopLossPercent: number;
+  dte?: number;
+  timeStopDte?: number;
+  triggered: boolean;
+  reason: string | null;
+  blockedReason?: string;
+}
+
 export interface VerifyFillParams {
   orderId: string;
   expectedLegs: { symbol: string; quantity: number; side: string }[];
@@ -148,6 +163,7 @@ export const strategyEngine = {
 
   async checkExits(strategies: Strategy[], positions: Position[]): Promise<{
     exitSignals: ExitSignal[];
+    exitStatus?: ExitStatus[];
     marketState: string;
     error?: StrategyEngineError;
   }> {
