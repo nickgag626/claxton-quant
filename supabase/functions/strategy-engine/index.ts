@@ -3370,7 +3370,38 @@ serve(async (req) => {
       }
       
       if (verified) {
-        // SUCCESS: Persist the mapping NOW
+        // SUCCESS: Fetch order fill prices to calculate entry credit
+        let entryCredit: number | undefined;
+        try {
+          const orderDetailUrl = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
+          const orderDetailResp = await fetch(orderDetailUrl, { headers });
+          const orderDetail = await orderDetailResp.json();
+
+          // For multi-leg orders, Tradier provides leg array with fill prices
+          const legs = orderDetail?.order?.leg;
+          if (legs && Array.isArray(legs)) {
+            let totalCredit = 0;
+            for (const leg of legs) {
+              const avgFill = Number(leg.avg_fill_price) || 0;
+              const qty = Math.abs(Number(leg.quantity) || 0);
+              const side = leg.side?.toLowerCase();
+
+              if (side === 'sell_to_open') {
+                totalCredit += avgFill * qty * 100; // Credit received
+              } else if (side === 'buy_to_open') {
+                totalCredit -= avgFill * qty * 100; // Debit paid
+              }
+            }
+            entryCredit = totalCredit; // Net credit in dollars
+            console.log(`[verify_fill] Calculated entry credit: $${entryCredit.toFixed(2)} from ${legs.length} legs`);
+          } else {
+            console.warn(`[verify_fill] No leg array found in order ${orderId}, entry_credit will be null`);
+          }
+        } catch (err) {
+          console.error('[verify_fill] Error fetching order fill prices:', err);
+        }
+
+        // Persist the mapping with entry credit
         await persistPositionGroupMap(supabase, {
           tradeGroupId,
           openOrderId: String(orderId),
@@ -3379,6 +3410,7 @@ serve(async (req) => {
           strategyName: strategyName || null,
           strategyType: strategyType || null,
           legs: expectedLegs,
+          entryCredit,
         });
         
         console.log(`[verify_fill] SUCCESS: All ${filledLegs.length} legs verified and mapping persisted for order ${orderId}`);
