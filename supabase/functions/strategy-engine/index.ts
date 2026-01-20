@@ -22,6 +22,14 @@ const VERIFICATION_TIMEOUT_MS = 60 * 1000; // 60 seconds max wait for fill
 const VERIFICATION_POLL_INTERVAL_MS = 3000; // Poll every 3 seconds
 const BAILOUT_ORDER_DELAY_MS = 300; // 300ms between bail-out orders to avoid throttling
 
+// === SAFETY CONSTANTS ===
+const DEFAULT_MAX_BID_ASK_SPREAD_PERCENT = 10; // Default max spread 10%
+const ORDER_TIMEOUT_MS = 60 * 1000; // Mark order as timeout_unknown after 60s in submitted state
+
+// === MAX DAILY LOSS TRACKING ===
+const dailyLossTracker = new Map<string, { date: string; realizedLoss: number; haltTriggered: boolean }>();
+const DEFAULT_MAX_DAILY_LOSS_DOLLARS = 1000; // Default max daily loss $1000
+
 function generateInFlightKey(underlying: string, expiration: string, legs: any[]): string {
   // Use sorted option symbols for exact match (catches duplicate condors with same strikes)
   const symbols = legs.map(l => l.option_symbol || l.symbol).filter(Boolean).sort().join(',');
@@ -96,6 +104,182 @@ function normalizeLegDir(side: string | null | undefined): 'short' | 'long' | nu
   if (s.includes('sell') || s === 'short' || s === 'sold') return 'short';
   if (s.includes('buy') || s === 'long' || s === 'bought') return 'long';
   return null;
+}
+
+/**
+ * Validate bid/ask spread for all legs before order submission.
+ * Returns validation result with spread details per leg.
+ */
+interface SpreadValidationResult {
+  valid: boolean;
+  maxSpreadPercent: number;
+  legs: Array<{
+    symbol: string;
+    bid: number;
+    ask: number;
+    spreadPercent: number;
+    exceedsMax: boolean;
+  }>;
+  failedSymbols: string[];
+  reason?: string;
+}
+
+async function validateBidAskSpreads(
+  legSymbols: string[],
+  maxSpreadPercent: number,
+  apiToken: string,
+  baseUrl: string
+): Promise<SpreadValidationResult> {
+  const result: SpreadValidationResult = {
+    valid: true,
+    maxSpreadPercent,
+    legs: [],
+    failedSymbols: [],
+  };
+
+  if (legSymbols.length === 0) {
+    return result;
+  }
+
+  try {
+    // Fetch quotes for all leg symbols
+    const quotesUrl = `${baseUrl}/markets/quotes?symbols=${legSymbols.join(',')}`;
+    const headers = { 'Authorization': `Bearer ${apiToken}`, 'Accept': 'application/json' };
+    const response = await fetch(quotesUrl, { headers });
+    const data = await response.json();
+
+    const quotesRaw = data?.quotes?.quote;
+    const quotes = quotesRaw ? (Array.isArray(quotesRaw) ? quotesRaw : [quotesRaw]) : [];
+    const quoteMap = new Map<string, { bid: number; ask: number }>();
+
+    for (const q of quotes) {
+      if (q.symbol) {
+        quoteMap.set(q.symbol, { bid: q.bid || 0, ask: q.ask || 0 });
+      }
+    }
+
+    // Validate each leg
+    for (const symbol of legSymbols) {
+      const quote = quoteMap.get(symbol);
+      if (!quote) {
+        result.legs.push({
+          symbol,
+          bid: 0,
+          ask: 0,
+          spreadPercent: 100,
+          exceedsMax: true,
+        });
+        result.failedSymbols.push(symbol);
+        result.valid = false;
+        continue;
+      }
+
+      const { bid, ask } = quote;
+      const midpoint = (bid + ask) / 2;
+      const spreadPercent = midpoint > 0 ? ((ask - bid) / midpoint) * 100 : 100;
+      const exceedsMax = spreadPercent > maxSpreadPercent;
+
+      result.legs.push({
+        symbol,
+        bid,
+        ask,
+        spreadPercent: Math.round(spreadPercent * 100) / 100,
+        exceedsMax,
+      });
+
+      if (exceedsMax) {
+        result.failedSymbols.push(symbol);
+        result.valid = false;
+      }
+    }
+
+    if (!result.valid) {
+      result.reason = `Bid/ask spread exceeds ${maxSpreadPercent}% on: ${result.failedSymbols.join(', ')}`;
+    }
+
+  } catch (error) {
+    console.error('[validateBidAskSpreads] Error fetching quotes:', error);
+    result.valid = false;
+    result.reason = 'Failed to fetch quotes for spread validation';
+  }
+
+  return result;
+}
+
+/**
+ * Get current ET date string (YYYY-MM-DD)
+ */
+function getETDateString(): string {
+  const now = new Date();
+  const etString = now.toLocaleString('en-US', { timeZone: 'America/New_York' });
+  const etDate = new Date(etString);
+  return `${etDate.getFullYear()}-${String(etDate.getMonth() + 1).padStart(2, '0')}-${String(etDate.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Check if max daily loss has been triggered.
+ * Returns true if trading should be halted.
+ */
+function checkMaxDailyLoss(
+  accountId: string,
+  currentLoss: number,
+  maxDailyLoss: number = DEFAULT_MAX_DAILY_LOSS_DOLLARS
+): { halted: boolean; currentLoss: number; maxDailyLoss: number; reason?: string } {
+  const today = getETDateString();
+  let tracker = dailyLossTracker.get(accountId);
+
+  // Reset tracker if it's a new day
+  if (!tracker || tracker.date !== today) {
+    tracker = { date: today, realizedLoss: 0, haltTriggered: false };
+    dailyLossTracker.set(accountId, tracker);
+  }
+
+  // If halt was already triggered today, maintain it
+  if (tracker.haltTriggered) {
+    return {
+      halted: true,
+      currentLoss: tracker.realizedLoss,
+      maxDailyLoss,
+      reason: `Max daily loss of $${maxDailyLoss} was triggered earlier today`,
+    };
+  }
+
+  // Check if current loss exceeds max
+  if (currentLoss >= maxDailyLoss) {
+    tracker.realizedLoss = currentLoss;
+    tracker.haltTriggered = true;
+    dailyLossTracker.set(accountId, tracker);
+    return {
+      halted: true,
+      currentLoss,
+      maxDailyLoss,
+      reason: `Max daily loss of $${maxDailyLoss} exceeded (current: $${currentLoss.toFixed(2)})`,
+    };
+  }
+
+  return {
+    halted: false,
+    currentLoss,
+    maxDailyLoss,
+  };
+}
+
+/**
+ * Update daily loss tracker with realized loss from a trade.
+ */
+function recordRealizedLoss(accountId: string, lossAmount: number): void {
+  const today = getETDateString();
+  let tracker = dailyLossTracker.get(accountId);
+
+  if (!tracker || tracker.date !== today) {
+    tracker = { date: today, realizedLoss: 0, haltTriggered: false };
+  }
+
+  if (lossAmount > 0) {
+    tracker.realizedLoss += lossAmount;
+    dailyLossTracker.set(accountId, tracker);
+    console.log(`[DAILY_LOSS] Recorded loss of $${lossAmount.toFixed(2)}, total today: $${tracker.realizedLoss.toFixed(2)}`);
+  }
 }
 
 /**
@@ -1971,7 +2155,81 @@ serve(async (req) => {
       // Generate trade_group_id if not provided
       const effectiveTradeGroupId = tradeGroupId || crypto.randomUUID();
       const gates: Gate[] = [];
-      
+
+      // PREFLIGHT 0: MAX DAILY LOSS CHECK
+      // Fetch today's realized P&L from database to check if we've hit the daily loss limit
+      const maxDailyLossLimit = signal.maxDailyLoss ?? DEFAULT_MAX_DAILY_LOSS_DOLLARS;
+      let todayRealizedLoss = 0;
+
+      try {
+        const today = getETDateString();
+        const { data: todayTrades } = await supabase
+          .from('trades')
+          .select('realized_pnl')
+          .gte('exit_time', `${today}T00:00:00`)
+          .lt('exit_time', `${today}T23:59:59`)
+          .eq('close_status', 'filled');
+
+        if (todayTrades) {
+          todayRealizedLoss = todayTrades
+            .filter((t: any) => t.realized_pnl < 0)
+            .reduce((sum: number, t: any) => sum + Math.abs(t.realized_pnl || 0), 0);
+        }
+      } catch (err) {
+        console.error('[PREFLIGHT] Error fetching daily P&L:', err);
+      }
+
+      const dailyLossCheck = checkMaxDailyLoss(accountId, todayRealizedLoss, maxDailyLossLimit);
+
+      gates.push({
+        name: 'Max Daily Loss',
+        expected: `realized loss < $${maxDailyLossLimit}`,
+        actual: {
+          halted: dailyLossCheck.halted,
+          currentLoss: dailyLossCheck.currentLoss,
+          maxDailyLoss: dailyLossCheck.maxDailyLoss,
+        },
+        pass: !dailyLossCheck.halted,
+        reason: dailyLossCheck.reason,
+      });
+
+      if (dailyLossCheck.halted) {
+        console.log(`[PREFLIGHT] Entry blocked by max daily loss: ${dailyLossCheck.reason}`);
+
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: dailyLossCheck.reason || 'Max daily loss limit reached',
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            {
+              signal,
+              blocked: 'max_daily_loss',
+              dailyLossCheck,
+            },
+            effectiveTradeGroupId
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: dailyLossCheck.reason || 'Max daily loss limit reached',
+            blocked: 'max_daily_loss',
+            dailyLossCheck,
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
       // PREFLIGHT 1: Entry cooldown check
       const cooldownKey = generateEntryCooldownKey(
         signal.strategyId || 'unknown',
@@ -2198,7 +2456,70 @@ serve(async (req) => {
         ? { ...signal, legs: conflictResult.adjustedLegs.map(l => ({ symbol: l.option_symbol, side: l.side, quantity: l.quantity })) }
         : signal;
 
-      // === PREFLIGHT 4: PRE-EXECUTE DUPLICATE SYMBOL GUARD (Rule E) ===
+      // === PREFLIGHT 4: BID/ASK SPREAD VALIDATION ===
+      // Prevent slippage on wide-spread options
+      const maxSpreadPercent = signal.maxBidAskSpreadPercent ?? DEFAULT_MAX_BID_ASK_SPREAD_PERCENT;
+      const legSymbolsForSpread = signalToExecute.legs.map((l: any) => l.symbol).filter(Boolean);
+
+      const spreadValidation = await validateBidAskSpreads(
+        legSymbolsForSpread,
+        maxSpreadPercent,
+        apiToken,
+        baseUrl
+      );
+
+      gates.push({
+        name: 'Bid/Ask Spread',
+        expected: `spread <= ${maxSpreadPercent}%`,
+        actual: {
+          valid: spreadValidation.valid,
+          maxSpreadPercent,
+          legs: spreadValidation.legs,
+          failedSymbols: spreadValidation.failedSymbols,
+        },
+        pass: spreadValidation.valid,
+        reason: spreadValidation.reason,
+      });
+
+      if (!spreadValidation.valid) {
+        console.log(`[PREFLIGHT] Entry blocked by wide bid/ask spread: ${spreadValidation.reason}`);
+        setEntryCooldown(cooldownKey);
+
+        if (signal.strategyId) {
+          await saveEvaluation(
+            supabase,
+            signal.strategyId,
+            signal.underlying,
+            'entry_attempt',
+            {
+              decision: 'FAIL',
+              reason: `Wide bid/ask spread: ${spreadValidation.reason}`,
+              gates,
+              inputs: { market: {}, account: {} },
+              proposedOrder: signal.proposedOrder,
+            },
+            {
+              signal,
+              blocked: 'wide_spread',
+              spreadValidation,
+            },
+            effectiveTradeGroupId
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: `Entry blocked - wide bid/ask spread. ${spreadValidation.reason}`,
+            blocked: 'wide_spread',
+            spreadValidation,
+            tradeGroupId: effectiveTradeGroupId,
+          }),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // === PREFLIGHT 5: PRE-EXECUTE DUPLICATE SYMBOL GUARD (Rule E) ===
       const orderSymbols = signalToExecute.legs.map((l: any) => l.symbol);
       const uniqueOrderSymbols = new Set(orderSymbols);
       const hasDuplicateSymbols = uniqueOrderSymbols.size !== orderSymbols.length;

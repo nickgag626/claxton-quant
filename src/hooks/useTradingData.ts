@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { tradierApi, calculatePortfolioGreeks, parseOptionSymbol } from '@/services/tradierApi';
 import { strategyEngine } from '@/services/strategyEngine';
-import { tradeJournal, TradeRecord } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, ORDER_TIMEOUT_MS } from '@/services/tradeJournal';
 import { settingsService } from '@/services/settingsService';
 import { toast } from '@/hooks/use-toast';
 import { expectedLegCount, strategyDisplayName } from '@/lib/strategyLegs';
@@ -38,6 +38,70 @@ const SLOW_POLL_INTERVAL = 30_000;     // 30s for positions + balances + chains
 const HIDDEN_POLL_INTERVAL = 120_000;  // 2min when tab is hidden
 const CLOSED_POLL_INTERVAL = 60_000;   // 1min when market closed
 const BACKOFF_MAX_INTERVAL = 120_000;  // 2min max backoff
+
+// Circuit breaker configuration
+const CIRCUIT_BREAKER_THRESHOLD = 5;   // Consecutive failures before opening circuit
+const CIRCUIT_BREAKER_RESET_MS = 60_000; // Time to reset after opening
+
+// Jitter configuration - adds randomness to prevent thundering herd
+const JITTER_MAX_PERCENT = 0.2;        // Max 20% jitter
+
+/**
+ * Add jitter to an interval to prevent synchronized polling across instances.
+ * Returns the interval plus or minus up to JITTER_MAX_PERCENT.
+ */
+function addJitter(intervalMs: number): number {
+  const jitterRange = intervalMs * JITTER_MAX_PERCENT;
+  const jitter = (Math.random() - 0.5) * 2 * jitterRange;
+  return Math.round(intervalMs + jitter);
+}
+
+/**
+ * Circuit breaker state manager.
+ * Opens circuit after consecutive failures, resets after timeout.
+ */
+interface CircuitBreakerState {
+  consecutiveFailures: number;
+  isOpen: boolean;
+  lastFailureTime: number;
+  lastOpenTime: number;
+}
+
+const createCircuitBreaker = () => {
+  const state: CircuitBreakerState = {
+    consecutiveFailures: 0,
+    isOpen: false,
+    lastFailureTime: 0,
+    lastOpenTime: 0,
+  };
+
+  return {
+    recordSuccess: () => {
+      state.consecutiveFailures = 0;
+      state.isOpen = false;
+    },
+    recordFailure: () => {
+      state.consecutiveFailures++;
+      state.lastFailureTime = Date.now();
+      if (state.consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+        state.isOpen = true;
+        state.lastOpenTime = Date.now();
+        console.warn(`[CIRCUIT_BREAKER] Circuit OPENED after ${state.consecutiveFailures} failures`);
+      }
+    },
+    shouldAllow: (): boolean => {
+      if (!state.isOpen) return true;
+      // Check if enough time has passed to try again
+      if (Date.now() - state.lastOpenTime > CIRCUIT_BREAKER_RESET_MS) {
+        console.log('[CIRCUIT_BREAKER] Reset timeout passed, allowing half-open request');
+        return true; // Half-open state - allow one request through
+      }
+      return false;
+    },
+    isOpen: () => state.isOpen,
+    getState: () => ({ ...state }),
+  };
+};
 
 // Heuristic grouping window: positions opened within this many minutes are considered same group
 const HEURISTIC_GROUP_TIME_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
@@ -514,6 +578,9 @@ export const useTradingData = () => {
   const marketStateRef = useRef<MarketState>('unknown');
   const isPageVisible = useRef(true);
 
+  // Circuit breaker for API failures - prevents hammering failed endpoints
+  const circuitBreaker = useRef(createCircuitBreaker());
+
   // === ALL useCallback DECLARATIONS START HERE ===
   const addActivity = useCallback((type: ActivityEvent['type'], message: string) => {
     setActivity(prev => [
@@ -572,6 +639,13 @@ export const useTradingData = () => {
   // === FAST LOOP: Clock + Quotes only ===
   const fetchFastData = useCallback(async () => {
     if (fastLoopInFlight.current) return;
+
+    // Circuit breaker check - skip if circuit is open
+    if (!circuitBreaker.current.shouldAllow()) {
+      console.log('[FAST_LOOP] Circuit breaker open, skipping fetch');
+      return;
+    }
+
     fastLoopInFlight.current = true;
 
     try {
@@ -587,15 +661,17 @@ export const useTradingData = () => {
       setIsApiConnected(true);
       setError(null);
       setLastUpdate(new Date());
-      
+
       // Reset backoff on success
       backoffMultiplier.current = 1;
+      circuitBreaker.current.recordSuccess();
     } catch (err) {
       console.error('Error in fast fetch:', err);
       // Apply backoff on error (for 429/5xx)
       backoffMultiplier.current = Math.min(backoffMultiplier.current * 2, BACKOFF_MAX_INTERVAL / FAST_POLL_INTERVAL);
       setError(err instanceof Error ? err.message : 'Failed to fetch data');
       setIsApiConnected(false);
+      circuitBreaker.current.recordFailure();
     } finally {
       fastLoopInFlight.current = false;
     }
@@ -604,6 +680,13 @@ export const useTradingData = () => {
   // === SLOW LOOP: Positions + Balances + Chains/Greeks ===
   const fetchSlowData = useCallback(async (forceChains = false) => {
     if (slowLoopInFlight.current) return;
+
+    // Circuit breaker check - skip if circuit is open
+    if (!circuitBreaker.current.shouldAllow()) {
+      console.log('[SLOW_LOOP] Circuit breaker open, skipping fetch');
+      return;
+    }
+
     slowLoopInFlight.current = true;
 
     try {
@@ -737,14 +820,16 @@ export const useTradingData = () => {
       setError(null);
       setLastUpdate(new Date());
       lastSlowFetch.current = Date.now();
-      
+
       // Reset backoff on success
       backoffMultiplier.current = 1;
+      circuitBreaker.current.recordSuccess();
     } catch (err) {
       console.error('Error in slow fetch:', err);
       backoffMultiplier.current = Math.min(backoffMultiplier.current * 2, BACKOFF_MAX_INTERVAL / SLOW_POLL_INTERVAL);
       setError(err instanceof Error ? err.message : 'Failed to fetch data');
       setIsApiConnected(false);
+      circuitBreaker.current.recordFailure();
     } finally {
       slowLoopInFlight.current = false;
       setIsLoading(false);
@@ -1866,11 +1951,12 @@ export const useTradingData = () => {
     fetchSlowData(true);
     addActivity('SYSTEM', 'Dashboard connected - fetching market data (stability mode)');
 
-    // Fast loop: clock + quotes
+    // Fast loop: clock + quotes (with jitter to prevent thundering herd)
+    const fastIntervalWithJitter = addJitter(FAST_POLL_INTERVAL);
     const fastIntervalId = setInterval(() => {
       // Apply backoff multiplier
       const effectiveInterval = FAST_POLL_INTERVAL * backoffMultiplier.current;
-      
+
       // If hidden tab, slow down
       if (!isPageVisible.current) {
         if (Date.now() % HIDDEN_POLL_INTERVAL < FAST_POLL_INTERVAL) {
@@ -1888,9 +1974,10 @@ export const useTradingData = () => {
       }
 
       fetchFastData();
-    }, FAST_POLL_INTERVAL);
+    }, fastIntervalWithJitter);
 
-    // Slow loop: positions + balances + chains
+    // Slow loop: positions + balances + chains (with jitter)
+    const slowIntervalWithJitter = addJitter(SLOW_POLL_INTERVAL);
     const slowIntervalId = setInterval(() => {
       const timeSinceLastSlow = Date.now() - lastSlowFetch.current;
 
@@ -1914,7 +2001,7 @@ export const useTradingData = () => {
       if (timeSinceLastSlow >= SLOW_POLL_INTERVAL * backoffMultiplier.current) {
         fetchSlowData(true);
       }
-    }, SLOW_POLL_INTERVAL);
+    }, slowIntervalWithJitter);
 
     return () => {
       clearInterval(fastIntervalId);
@@ -1978,13 +2065,52 @@ export const useTradingData = () => {
         
         // Process each unique close order
         for (const [closeOrderId, tradesInOrder] of orderGroups) {
+          // Check for order timeout FIRST - if order has been pending too long
+          const firstTrade = tradesInOrder[0];
+          const submittedAt = firstTrade?.close_submitted_at
+            ? new Date(firstTrade.close_submitted_at).getTime()
+            : 0;
+          const elapsedMs = submittedAt > 0 ? Date.now() - submittedAt : 0;
+          const isTimedOut = elapsedMs > ORDER_TIMEOUT_MS;
+
           const orderStatus = await tradierApi.getOrderStatus(closeOrderId);
-          
+
           if (!orderStatus.success) {
-            console.warn('[reconcilePendingCloses] Could not fetch status for', closeOrderId);
+            // If we can't fetch status AND it's been too long, mark as timeout_unknown
+            if (isTimedOut) {
+              console.warn('[reconcilePendingCloses] Order', closeOrderId, 'timed out after', Math.round(elapsedMs / 1000), 's - marking as timeout_unknown');
+              await tradeJournal.updateCloseStatus(closeOrderId, 'timeout_unknown', {
+                rejectReason: `Order status unknown after ${Math.round(elapsedMs / 1000)}s - API fetch failed`,
+              });
+              addActivity('RISK', `⚠️ Order timeout: ${firstTrade?.symbol || closeOrderId} - status unknown after ${Math.round(elapsedMs / 1000)}s`);
+              toast({
+                title: '⚠️ Order Timeout Detected',
+                description: `Close order for ${firstTrade?.symbol || closeOrderId} has been pending for ${Math.round(elapsedMs / 1000)}s. Status unknown - manual verification required.`,
+                variant: 'destructive',
+                duration: 15000,
+              });
+            } else {
+              console.warn('[reconcilePendingCloses] Could not fetch status for', closeOrderId);
+            }
             continue;
           }
-          
+
+          // If Tradier still shows 'submitted' but we've exceeded timeout, mark as timeout_unknown
+          if (orderStatus.closeStatus === 'submitted' && isTimedOut) {
+            console.warn('[reconcilePendingCloses] Order', closeOrderId, 'still submitted after', Math.round(elapsedMs / 1000), 's - marking as timeout_unknown');
+            await tradeJournal.updateCloseStatus(closeOrderId, 'timeout_unknown', {
+              rejectReason: `Order still pending after ${Math.round(elapsedMs / 1000)}s - manual verification required`,
+            });
+            addActivity('RISK', `⚠️ Order timeout: ${firstTrade?.symbol || closeOrderId} - still pending after ${Math.round(elapsedMs / 1000)}s`);
+            toast({
+              title: '⚠️ Order Timeout Detected',
+              description: `Close order for ${firstTrade?.symbol || closeOrderId} has been pending for ${Math.round(elapsedMs / 1000)}s. Please verify manually in Tradier.`,
+              variant: 'destructive',
+              duration: 15000,
+            });
+            continue;
+          }
+
           // Only update if status has changed from 'submitted'
           if (orderStatus.closeStatus !== 'submitted') {
             // Detect if this is a multi-leg combo order based on number of trades sharing same close_order_id

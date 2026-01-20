@@ -1,7 +1,10 @@
 import { supabase } from '@/integrations/supabase/client';
 import { inferLegSides, getInferredSide, computeNetExitDebit, type InferredLeg } from '@/lib/legSideInference';
 
-export type CloseStatus = 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired';
+export type CloseStatus = 'submitted' | 'filled' | 'rejected' | 'canceled' | 'expired' | 'timeout_unknown';
+
+// Order timeout - after 60 seconds in 'submitted' status, mark as timeout_unknown
+export const ORDER_TIMEOUT_MS = 60 * 1000;
 
 export interface TradeRecord {
   id?: string;
@@ -120,7 +123,14 @@ export function isClosePending(trade: Partial<TradeRecord>): boolean {
  * Check if close was rejected or failed
  */
 export function isCloseRejected(trade: Partial<TradeRecord>): boolean {
-  return trade.close_status === 'rejected' || trade.close_status === 'canceled' || trade.close_status === 'expired';
+  return trade.close_status === 'rejected' || trade.close_status === 'canceled' || trade.close_status === 'expired' || trade.close_status === 'timeout_unknown';
+}
+
+/**
+ * Check if close timed out (order status unknown after 60s)
+ */
+export function isCloseTimedOut(trade: Partial<TradeRecord>): boolean {
+  return trade.close_status === 'timeout_unknown';
 }
 
 /**
@@ -1469,6 +1479,87 @@ export const tradeJournal = {
     } catch (error) {
       console.error('Error fetching trades with pending close:', error);
       return [];
+    }
+  },
+
+  /**
+   * Get trades that need manual recovery (timeout_unknown, rejected, canceled, expired)
+   * These are orders that failed or timed out and require user intervention
+   */
+  async getTradesNeedingRecovery(): Promise<TradeRecord[]> {
+    try {
+      const { data, error } = await supabase
+        .from('trades')
+        .select('*')
+        .in('close_status', ['timeout_unknown', 'rejected', 'canceled', 'expired'])
+        .order('close_submitted_at', { ascending: false });
+
+      if (error) throw error;
+      return (data || []).map(castToTradeRecord);
+    } catch (error) {
+      console.error('Error fetching trades needing recovery:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Mark a timed-out trade as manually verified (either filled or still open)
+   * Called by recovery UI when user has verified the order status in Tradier
+   *
+   * @param tradeId - The trade record ID
+   * @param actualStatus - The verified status: 'filled' (close completed) or 'open' (close failed, position still exists)
+   * @param details - Fill details if status is 'filled'
+   */
+  async resolveTimedOutTrade(
+    tradeId: string,
+    actualStatus: 'filled' | 'open',
+    details?: {
+      avgFillPrice?: number;
+      filledQty?: number;
+      fees?: number;
+    }
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      if (actualStatus === 'filled') {
+        // User verified the order was filled - update with provided details
+        const updates: Record<string, any> = {
+          close_status: 'filled',
+          close_filled_at: new Date().toISOString(),
+          needs_reconcile: true, // Still needs P&L reconciliation
+        };
+
+        if (details?.avgFillPrice != null) {
+          updates.close_avg_fill_price = details.avgFillPrice;
+          updates.exit_price = details.avgFillPrice;
+        }
+        if (details?.filledQty != null) {
+          updates.close_filled_qty = details.filledQty;
+        }
+        if (details?.fees != null) {
+          updates.fees = details.fees;
+        }
+
+        const { error } = await supabase
+          .from('trades')
+          .update(updates)
+          .eq('id', tradeId);
+
+        if (error) throw error;
+        return { success: true };
+      } else {
+        // User verified the order was NOT filled - position is still open
+        // Delete the trade record so it doesn't show as a ghost trade
+        const { error } = await supabase
+          .from('trades')
+          .delete()
+          .eq('id', tradeId);
+
+        if (error) throw error;
+        return { success: true };
+      }
+    } catch (error) {
+      console.error('Error resolving timed-out trade:', error);
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   },
 

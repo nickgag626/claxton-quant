@@ -11,8 +11,9 @@ import { GreeksChart } from '@/components/dashboard/GreeksChart';
 import { DataLagWarning } from '@/components/dashboard/DataLagWarning';
 import { TradeJournal } from '@/components/dashboard/TradeJournal';
 import { OptionsChain } from '@/components/dashboard/OptionsChain';
+import { RecoveryPanel } from '@/components/dashboard/RecoveryPanel';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { BookOpen, Grid3X3, Activity } from 'lucide-react';
+import { BookOpen, Grid3X3, Activity, AlertTriangle } from 'lucide-react';
 
 const Index = () => {
   const {
@@ -57,6 +58,8 @@ const Index = () => {
     clearEntryBlock,
     // Mapping maintenance
     purgeStaleMappings,
+    // Refetch
+    refetch,
   } = useTradingData();
 
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
@@ -136,7 +139,7 @@ const Index = () => {
         />
         
         <Tabs defaultValue="journal" className="w-full">
-          <TabsList className="grid w-full grid-cols-3 max-w-md">
+          <TabsList className="grid w-full grid-cols-4 max-w-lg">
             <TabsTrigger value="journal" className="flex items-center gap-2">
               <BookOpen className="h-4 w-4" />
               <span className="hidden sm:inline">Trade Journal</span>
@@ -146,6 +149,11 @@ const Index = () => {
               <Grid3X3 className="h-4 w-4" />
               <span className="hidden sm:inline">Options Chain</span>
               <span className="sm:hidden">Chain</span>
+            </TabsTrigger>
+            <TabsTrigger value="recovery" className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4" />
+              <span className="hidden sm:inline">Recovery</span>
+              <span className="sm:hidden">Recover</span>
             </TabsTrigger>
             <TabsTrigger value="activity" className="flex items-center gap-2">
               <Activity className="h-4 w-4" />
@@ -158,6 +166,9 @@ const Index = () => {
           </TabsContent>
           <TabsContent value="chain" className="mt-4">
             <OptionsChain />
+          </TabsContent>
+          <TabsContent value="recovery" className="mt-4">
+            <RecoveryPanel onRefresh={refetch} />
           </TabsContent>
           <TabsContent value="activity" className="mt-4">
             <ActivityLog events={activity} onClearHistory={clearHistory} />
