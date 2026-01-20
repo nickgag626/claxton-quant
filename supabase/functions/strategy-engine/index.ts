@@ -3200,9 +3200,14 @@ serve(async (req) => {
               groupLegCount: observedLegs,
             });
           }
+        } else {
+          // Log WHY no exit triggered for debugging
+          console.log(`[EXIT] Group ${tradeGroupId}: NO TRIGGER - pnl%=${pnlPercent.toFixed(2)}%, ` +
+            `profitTarget=${strategy.exitConditions.profitTargetPercent}%, ` +
+            `stopLoss=${strategy.exitConditions.stopLossPercent}%`);
         }
       }
-      
+
       // Process ungrouped positions individually
       for (const position of ungroupedPositions) {
         const strategy = (strategies as Strategy[]).find(s => s.name === position.strategyName);
