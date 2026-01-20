@@ -145,6 +145,18 @@ const STRATEGY_TYPES: { value: StrategyType; label: string; description: string;
 
 const UNDERLYINGS = ['SPX', 'NDX', 'SPY', 'QQQ', 'IWM', 'AAPL', 'TSLA', 'NVDA', 'AMD'];
 
+// Default minPremium values by strategy type (prevents tiny credits causing random exits)
+const MIN_PREMIUM_DEFAULTS: Record<StrategyType, number> = {
+  iron_condor: 1.00,
+  iron_fly: 3.00,
+  credit_put_spread: 0.75,
+  credit_call_spread: 0.75,
+  butterfly: 0.50,
+  strangle: 1.00,  // (disabled - undefined risk)
+  straddle: 1.00,  // (disabled - undefined risk)
+  custom: 0.50,
+};
+
 // MA filter preset rules
 const MA_PRESETS: { label: string; rules: MAFilterRule[] }[] = [
   { label: 'Price above SMA20', rules: [{ left: 'price', op: 'above', right: 'sma20' }] },
@@ -215,7 +227,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
   const [shortDeltaTarget, setShortDeltaTarget] = useState(0.10);
   const [longDeltaTarget, setLongDeltaTarget] = useState(0.05);
   const [wingWidth, setWingWidth] = useState(10);
-  const [minPremium, setMinPremium] = useState(0);
+  const [minPremium, setMinPremium] = useState(MIN_PREMIUM_DEFAULTS['iron_condor']);
   const [useIvFilter, setUseIvFilter] = useState(false);
   const [minIvRank, setMinIvRank] = useState(20);
   const [maxIvRank, setMaxIvRank] = useState(80);
@@ -342,10 +354,17 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
     }
   }, [shortDeltaTarget, strategyType]);
 
+  // Auto-set minPremium when strategy type changes (only if not editing existing)
+  useEffect(() => {
+    if (!editingStrategy) {
+      setMinPremium(MIN_PREMIUM_DEFAULTS[strategyType] ?? 0.50);
+    }
+  }, [strategyType, editingStrategy]);
+
   const loadPreset = (presetName: string) => {
     const preset = STRATEGY_PRESETS[presetName as keyof typeof STRATEGY_PRESETS];
     if (!preset) return;
-    
+
     setName(presetName);
     setStrategyType(preset.type);
     setUnderlying(preset.underlying);
@@ -354,6 +373,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
     setShortDeltaTarget(preset.shortDeltaTarget);
     setLongDeltaTarget(preset.longDeltaTarget ?? preset.shortDeltaTarget * 0.5);
     setWingWidth(preset.wingWidth);
+    setMinPremium(preset.minPremium);
     setProfitTarget(preset.profitTarget);
     setStopLoss(preset.stopLoss);
     setCustomLegs(preset.legs as StrategyLeg[]);
