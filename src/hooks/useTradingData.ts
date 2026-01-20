@@ -537,6 +537,17 @@ export const useTradingData = () => {
   const [isApiConnected, setIsApiConnected] = useState(false);
   const [isBotRunning, setIsBotRunning] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(new Date());
+  const [lastCheckExitsTime, setLastCheckExitsTime] = useState<Date | null>(null);
+  const [exitStatusMap, setExitStatusMap] = useState<Map<string, {
+    pnlPercent: number;
+    profitTargetPercent: number;
+    stopLossPercent: number;
+    dte?: number;
+    timeStopDte?: number;
+    triggered: boolean;
+    reason: string | null;
+    blockedReason?: string;
+  }>>(new Map());
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deltaHistory, setDeltaHistory] = useState<DeltaDataPoint[]>([]);
@@ -1315,6 +1326,13 @@ export const useTradingData = () => {
     return positions.filter(p => p.tradeGroupId === tradeGroupId);
   }, [positions]);
 
+  // Get exit status for a position (by group ID or symbol)
+  const getExitStatus = useCallback((position: Position) => {
+    // Try group ID first, fall back to symbol
+    const key = position.tradeGroupId || position.symbol;
+    return exitStatusMap.get(key);
+  }, [exitStatusMap]);
+
   // Check if a position is part of a multi-leg group
   const isGroupedPosition = useCallback((position: Position): boolean => {
     if (!position.tradeGroupId) return false;
@@ -1332,8 +1350,9 @@ export const useTradingData = () => {
     tradeGroupId?: string;
     symbol?: string;
     forceBrokenStructure?: boolean; // Allow closing broken structures when explicitly confirmed
+    forceClose?: boolean; // Bypass spread safety check (for emergency closes)
   }): Promise<boolean> => {
-    const { source, exitReason, tradeGroupId, symbol, forceBrokenStructure } = params;
+    const { source, exitReason, tradeGroupId, symbol, forceBrokenStructure, forceClose } = params;
 
     const allowFlagKey = '__ALLOW_BROKER_CLOSE__';
 
@@ -1396,10 +1415,19 @@ export const useTradingData = () => {
           clientRequestId,
           trade_group_id: tradeGroupId,
           source: source === 'bot' ? 'bot_engine_group' : source === 'emergency' ? 'emergency_close' : 'manual_ui_group',
+          forceClose: forceClose || source === 'emergency', // Always bypass spread check for emergency closes
         });
 
         if (result.skipped) {
           logAttempt('blocked', { reason: result.error || 'cooldown/lock', clientRequestId });
+          return false;
+        }
+
+        // Handle spread safety gate blocking
+        if (result.blocked && result.blockReason === 'wide_spread') {
+          const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent}%`).join(', ') || 'unknown';
+          logAttempt('blocked', { reason: `Wide spread: ${spreadDesc}`, clientRequestId, spreadIssues: result.spreadIssues });
+          addActivity('RISK', `EXIT BLOCKED: Bid/ask spread too wide (${spreadDesc}). Use emergency close to override.`);
           return false;
         }
 
@@ -1505,12 +1533,21 @@ export const useTradingData = () => {
           source === 'bot' ? 'bot_engine_single' :
           source === 'emergency' ? 'emergency_close' :
           legOutModeEnabled ? 'manual_ui_legout' : 'manual_ui',
+        forceClose: forceClose || source === 'emergency', // Always bypass spread check for emergency closes
       });
 
       setLastCloseDebug({ source, clientRequestId, symbol: position.symbol, result, edgeDebug: result.debug });
 
       if (result.skipped) {
         logAttempt('blocked', { reason: result.error || 'cooldown/lock', clientRequestId });
+        return false;
+      }
+
+      // Handle spread safety gate blocking
+      if (result.blocked && result.blockReason === 'wide_spread') {
+        const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent}%`).join(', ') || 'unknown';
+        logAttempt('blocked', { reason: `Wide spread: ${spreadDesc}`, clientRequestId, spreadIssues: result.spreadIssues });
+        addActivity('RISK', `EXIT BLOCKED: Bid/ask spread too wide (${spreadDesc}). Use emergency close to override.`);
         return false;
       }
 
@@ -1633,6 +1670,29 @@ export const useTradingData = () => {
       addActivity('SYSTEM', 'Strategy engine scanning...');
 
       const exitResult = await strategyEngine.checkExits(strategies, positions);
+
+      // Update heartbeat timestamp for monitoring
+      setLastCheckExitsTime(new Date());
+
+      // Store exit status for UI visibility (shows why positions aren't exiting)
+      if (exitResult.exitStatus) {
+        const newMap = new Map<string, typeof exitStatusMap extends Map<string, infer V> ? V : never>();
+        for (const status of exitResult.exitStatus) {
+          // Key by tradeGroupId or symbol for ungrouped
+          const key = status.tradeGroupId || status.symbol;
+          newMap.set(key, {
+            pnlPercent: status.pnlPercent,
+            profitTargetPercent: status.profitTargetPercent,
+            stopLossPercent: status.stopLossPercent,
+            dte: status.dte,
+            timeStopDte: status.timeStopDte,
+            triggered: status.triggered,
+            reason: status.reason,
+            blockedReason: status.blockedReason,
+          });
+        }
+        setExitStatusMap(newMap);
+      }
 
       let placedAnyExitOrder = false;
       
@@ -2172,6 +2232,7 @@ export const useTradingData = () => {
     isApiConnected,
     isBotRunning,
     lastUpdate,
+    lastCheckExitsTime,
     isLoading,
     error,
     deltaHistory,
@@ -2201,7 +2262,8 @@ export const useTradingData = () => {
     dtbpRejection,
     isGroupedPosition,
     getGroupPositions,
-    
+    getExitStatus,
+
     // === STRUCTURE INTEGRITY GATE ===
     entryBlockedReason,
     clearEntryBlock,

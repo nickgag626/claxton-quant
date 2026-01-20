@@ -72,6 +72,9 @@ interface TradierRequest {
   clientRequestId?: string;
   trade_group_id?: string;
   source?: "manual_ui" | "bot_engine" | string;
+
+  // SAFETY: Force close even if spread is wide (for emergency situations)
+  forceClose?: boolean;
 }
 
 type TradierPosition = Record<string, unknown> & {
@@ -104,7 +107,19 @@ type CloseInstructionError = {
 const closeLocks = new Map<string, { inFlight: boolean; lastAcceptedAt: number }>();
 const CLOSE_COOLDOWN_MS = 120_000;
 
+// SAFETY: Maximum bid/ask spread percentage allowed for exit orders
+// Wider spreads during fast markets can significantly impact fill quality
+const MAX_EXIT_SPREAD_PERCENT = 15;
+
 const isOccOptionSymbol = (s: string) => /^[A-Z]+\d{6}[CP]\d{8}$/.test(s);
+
+// Calculate bid/ask spread as a percentage of the midpoint
+function calculateSpreadPercent(bid: number, ask: number): number {
+  if (bid <= 0 || ask <= 0) return Infinity; // Invalid quote
+  const mid = (bid + ask) / 2;
+  if (mid <= 0) return Infinity;
+  return ((ask - bid) / mid) * 100;
+}
 
 function normalizeNumber(n: unknown): number {
   if (typeof n === "number") return n;
@@ -580,6 +595,61 @@ serve(async (req) => {
             });
           }
 
+          // SAFETY: Check bid/ask spreads before placing close order
+          const forceClose = !!body.forceClose;
+          if (!forceClose) {
+            const quoteUrl = `${baseUrl}/markets/quotes?symbols=${symbolsSorted.join(",")}`;
+            const quoteResp = await fetch(quoteUrl, { headers });
+            const quoteData = await safeParseTradierResponse(quoteResp);
+            const quotesRaw = quoteData?.quotes?.quote;
+            const quotesArray = Array.isArray(quotesRaw) ? quotesRaw : quotesRaw ? [quotesRaw] : [];
+
+            const spreadIssues: Array<{ symbol: string; bid: number; ask: number; spreadPercent: number }> = [];
+
+            for (const sym of symbolsSorted) {
+              const quote = quotesArray.find((q: any) => q.symbol === sym);
+              if (!quote) {
+                console.warn("SPREAD_CHECK_NO_QUOTE", { symbol: sym, clientRequestId });
+                continue; // Allow if no quote available
+              }
+              const bid = normalizeNumber(quote.bid);
+              const ask = normalizeNumber(quote.ask);
+              const spreadPercent = calculateSpreadPercent(bid, ask);
+
+              if (spreadPercent > MAX_EXIT_SPREAD_PERCENT) {
+                spreadIssues.push({ symbol: sym, bid, ask, spreadPercent: Math.round(spreadPercent * 10) / 10 });
+              }
+            }
+
+            if (spreadIssues.length > 0) {
+              console.warn("CLOSE_GROUP_BLOCKED_WIDE_SPREAD", {
+                source,
+                clientRequestId,
+                trade_group_id,
+                maxAllowed: MAX_EXIT_SPREAD_PERCENT,
+                issues: spreadIssues,
+              });
+              closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+              return new Response(
+                JSON.stringify({
+                  blocked: true,
+                  reason: "wide_spread",
+                  maxAllowedSpreadPercent: MAX_EXIT_SPREAD_PERCENT,
+                  spreadIssues,
+                  clientRequestId,
+                  hint: "Set forceClose=true to override this safety check",
+                }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+          } else {
+            console.warn("CLOSE_GROUP_FORCE_CLOSE_BYPASSING_SPREAD_CHECK", {
+              source,
+              clientRequestId,
+              trade_group_id,
+            });
+          }
+
           const orderUrl = `${baseUrl}/accounts/${accountId}/orders`;
 
           const orderParams: Record<string, string> = {
@@ -713,16 +783,61 @@ serve(async (req) => {
             );
           }
 
-          // Pull quote to get instrument type if possible
+          // Pull quote to get instrument type and check spread
           let quoteType: string | undefined;
+          let quoteBid: number = 0;
+          let quoteAsk: number = 0;
           try {
             const qUrl = `${baseUrl}/markets/quotes?symbols=${encodeURIComponent(positionSymbol)}`;
             const qResp = await fetch(qUrl, { headers });
             const qData = await safeParseTradierResponse(qResp);
             const q = qData?.quotes?.quote;
-            quoteType = (Array.isArray(q) ? q[0]?.type : q?.type) as string | undefined;
+            const quote = Array.isArray(q) ? q[0] : q;
+            quoteType = quote?.type as string | undefined;
+            quoteBid = normalizeNumber(quote?.bid);
+            quoteAsk = normalizeNumber(quote?.ask);
           } catch (e) {
             console.warn("QUOTE_FETCH_FAILED", { symbol: positionSymbol });
+          }
+
+          // SAFETY: Check bid/ask spread before placing close order
+          const forceClose = !!body.forceClose;
+          if (!forceClose && quoteBid > 0 && quoteAsk > 0) {
+            const spreadPercent = calculateSpreadPercent(quoteBid, quoteAsk);
+            if (spreadPercent > MAX_EXIT_SPREAD_PERCENT) {
+              console.warn("CLOSE_POSITION_BLOCKED_WIDE_SPREAD", {
+                source,
+                clientRequestId,
+                trade_group_id,
+                symbol: positionSymbol,
+                bid: quoteBid,
+                ask: quoteAsk,
+                spreadPercent: Math.round(spreadPercent * 10) / 10,
+                maxAllowed: MAX_EXIT_SPREAD_PERCENT,
+              });
+              closeLocks.set(lockKey, { inFlight: false, lastAcceptedAt: lock?.lastAcceptedAt || 0 });
+              return new Response(
+                JSON.stringify({
+                  blocked: true,
+                  reason: "wide_spread",
+                  symbol: positionSymbol,
+                  bid: quoteBid,
+                  ask: quoteAsk,
+                  spreadPercent: Math.round(spreadPercent * 10) / 10,
+                  maxAllowedSpreadPercent: MAX_EXIT_SPREAD_PERCENT,
+                  clientRequestId,
+                  hint: "Set forceClose=true to override this safety check",
+                }),
+                { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+              );
+            }
+          } else if (forceClose) {
+            console.warn("CLOSE_POSITION_FORCE_CLOSE_BYPASSING_SPREAD_CHECK", {
+              source,
+              clientRequestId,
+              trade_group_id,
+              symbol: positionSymbol,
+            });
           }
 
           const qty = normalizeNumber(matched.quantity);

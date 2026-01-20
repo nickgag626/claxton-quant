@@ -260,6 +260,7 @@ export const tradierApi = {
       clientRequestId?: string;
       trade_group_id?: string;
       source?: 'manual_ui' | 'bot_engine' | string;
+      forceClose?: boolean; // Bypass spread safety check (for emergency)
     }
   ): Promise<{
     success: boolean;
@@ -279,6 +280,10 @@ export const tradierApi = {
       costBasis: number;
       side?: string;
     };
+    // Spread blocked (safety gate)
+    blocked?: boolean;
+    blockReason?: string;
+    spreadIssues?: Array<{ symbol: string; bid: number; ask: number; spreadPercent: number }>;
   }> {
     const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
     const url = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/tradier-api`;
@@ -320,6 +325,7 @@ export const tradierApi = {
           clientRequestId,
           trade_group_id: opts?.trade_group_id,
           source: opts?.source,
+          forceClose: opts?.forceClose, // Bypass spread safety check
         },
         headers: { 'x-client-request-id': clientRequestId },
       });
@@ -341,13 +347,32 @@ export const tradierApi = {
         }
         
         console.log('[tradierApi.closePosition] Error context parsed:', { parsedBody, errorMessage: error.message, clientRequestId });
-        
+
         if (parsedBody?.error === 'Position not found') {
           console.log('[tradierApi.closePosition] Position not found (already closed or never existed):', { symbol, clientRequestId });
           return {
             success: false,
             notFound: true,
             error: 'Position not found at broker',
+            debug: { parsedBody },
+            clientRequestId,
+          };
+        }
+
+        // Handle spread safety gate block
+        if (parsedBody?.blocked && parsedBody?.reason === 'wide_spread') {
+          console.warn('[tradierApi.closePosition] Blocked by spread safety gate:', {
+            symbol,
+            spreadPercent: parsedBody.spreadPercent,
+            maxAllowed: parsedBody.maxAllowedSpreadPercent,
+            clientRequestId,
+          });
+          return {
+            success: false,
+            blocked: true,
+            blockReason: 'wide_spread',
+            spreadIssues: [{ symbol, bid: parsedBody.bid, ask: parsedBody.ask, spreadPercent: parsedBody.spreadPercent }],
+            error: `Exit blocked: bid/ask spread ${parsedBody.spreadPercent}% exceeds ${parsedBody.maxAllowedSpreadPercent}% limit`,
             debug: { parsedBody },
             clientRequestId,
           };
@@ -426,6 +451,7 @@ export const tradierApi = {
       clientRequestId?: string;
       trade_group_id?: string;
       source?: 'manual_ui_group' | 'bot_engine_group' | 'emergency_close' | string;
+      forceClose?: boolean; // Bypass spread safety check (for emergency)
     }
   ): Promise<{
     success: boolean;
@@ -437,6 +463,10 @@ export const tradierApi = {
     debug?: any;
     clientRequestId?: string;
     legs?: Array<{ symbol: string; closeSide: string; closeQty: number; positionSide?: string }>;
+    // Spread blocked (safety gate)
+    blocked?: boolean;
+    blockReason?: string;
+    spreadIssues?: Array<{ symbol: string; bid: number; ask: number; spreadPercent: number }>;
   }> {
     const clientRequestId = opts?.clientRequestId || crypto.randomUUID();
 
@@ -463,6 +493,7 @@ export const tradierApi = {
           clientRequestId,
           trade_group_id: opts?.trade_group_id,
           source: opts?.source,
+          forceClose: opts?.forceClose, // Bypass spread safety check
         },
         headers: { 'x-client-request-id': clientRequestId },
       });
@@ -479,6 +510,24 @@ export const tradierApi = {
 
         if (parsedBody?.error === 'Position not found') {
           return { success: false, notFound: true, error: 'Position not found at broker', debug: { parsedBody }, clientRequestId };
+        }
+
+        // Handle spread safety gate block
+        if (parsedBody?.blocked && parsedBody?.reason === 'wide_spread') {
+          console.warn('[tradierApi.closeGroup] Blocked by spread safety gate:', {
+            spreadIssues: parsedBody.spreadIssues,
+            maxAllowed: parsedBody.maxAllowedSpreadPercent,
+            clientRequestId,
+          });
+          return {
+            success: false,
+            blocked: true,
+            blockReason: 'wide_spread',
+            spreadIssues: parsedBody.spreadIssues,
+            error: `Exit blocked: bid/ask spreads exceed ${parsedBody.maxAllowedSpreadPercent}% limit`,
+            debug: { parsedBody },
+            clientRequestId,
+          };
         }
 
         const isCors = error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError');
