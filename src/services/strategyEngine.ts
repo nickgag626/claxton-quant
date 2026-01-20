@@ -50,10 +50,17 @@ export interface StructureIntegrityResult {
   reason: string;
 }
 
+export interface StrategyEngineError {
+  error: true;
+  message: string;
+  code?: string;
+}
+
 export const strategyEngine = {
   async evaluateStrategies(strategies: Strategy[], positions: Position[]): Promise<{
     signals: TradeSignal[];
     marketState: string;
+    error?: StrategyEngineError;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
@@ -64,11 +71,30 @@ export const strategyEngine = {
         },
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error evaluating strategies:', error);
+        return {
+          signals: [],
+          marketState: 'error',
+          error: {
+            error: true,
+            message: error.message || 'Failed to evaluate strategies',
+            code: 'EVALUATE_ERROR',
+          },
+        };
+      }
       return data;
     } catch (error) {
       console.error('Error evaluating strategies:', error);
-      return { signals: [], marketState: 'unknown' };
+      return {
+        signals: [],
+        marketState: 'error',
+        error: {
+          error: true,
+          message: error instanceof Error ? error.message : 'Unknown error evaluating strategies',
+          code: 'EVALUATE_EXCEPTION',
+        },
+      };
     }
   },
 
@@ -123,6 +149,7 @@ export const strategyEngine = {
   async checkExits(strategies: Strategy[], positions: Position[]): Promise<{
     exitSignals: ExitSignal[];
     marketState: string;
+    error?: StrategyEngineError;
   }> {
     try {
       const { data, error } = await supabase.functions.invoke('strategy-engine', {
@@ -133,11 +160,30 @@ export const strategyEngine = {
         },
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error checking exits:', error);
+        return {
+          exitSignals: [],
+          marketState: 'error',
+          error: {
+            error: true,
+            message: error.message || 'Failed to check exits',
+            code: 'CHECK_EXITS_ERROR',
+          },
+        };
+      }
       return data;
     } catch (error) {
       console.error('Error checking exits:', error);
-      return { exitSignals: [], marketState: 'unknown' };
+      return {
+        exitSignals: [],
+        marketState: 'error',
+        error: {
+          error: true,
+          message: error instanceof Error ? error.message : 'Unknown error checking exits',
+          code: 'CHECK_EXITS_EXCEPTION',
+        },
+      };
     }
   },
 
