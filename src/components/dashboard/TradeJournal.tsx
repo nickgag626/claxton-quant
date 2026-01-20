@@ -7,7 +7,7 @@ import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
-import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection, isClosePending, isCloseRejected, CloseStatus } from '@/services/tradeJournal';
+import { tradeJournal, TradeRecord, TradeGroup, TradeStats, DuplicateCandidate, hasVerifiedDirection, isClosePending, isCloseRejected, isPnlFinalized, CloseStatus, PnlStatus } from '@/services/tradeJournal';
 import { reconcileFromTradierFills, importMissingTrades } from '@/services/tradierReconcile';
 import { supabase } from '@/integrations/supabase/client';
 import { format, subDays } from 'date-fns';
@@ -111,6 +111,42 @@ const TradeDetailsRow = ({
     );
   };
 
+  // P&L status badge helper
+  const getPnlStatusBadge = () => {
+    const status = trade.pnl_status as PnlStatus | undefined;
+    switch (status) {
+      case 'final':
+        return (
+          <div className="flex items-center gap-1 text-xs text-trading-green bg-trading-green/10 px-2 py-0.5 rounded">
+            <CheckCircle className="h-3 w-3" />
+            <span>Final (Locked)</span>
+          </div>
+        );
+      case 'computed':
+        return (
+          <div className="flex items-center gap-1 text-xs text-bloomberg-blue bg-bloomberg-blue/10 px-2 py-0.5 rounded">
+            <Calculator className="h-3 w-3" />
+            <span>Computed</span>
+          </div>
+        );
+      case 'missing_fills':
+        return (
+          <div className="flex items-center gap-1 text-xs text-bloomberg-amber bg-bloomberg-amber/10 px-2 py-0.5 rounded">
+            <AlertTriangle className="h-3 w-3" />
+            <span>Missing Fills</span>
+          </div>
+        );
+      case 'pending':
+      default:
+        return (
+          <div className="flex items-center gap-1 text-xs text-muted-foreground bg-muted/10 px-2 py-0.5 rounded">
+            <Clock className="h-3 w-3" />
+            <span>Pending</span>
+          </div>
+        );
+    }
+  };
+
   return (
     <motion.tr
       initial={{ opacity: 0, height: 0 }}
@@ -149,9 +185,15 @@ const TradeDetailsRow = ({
             </div>
           )}
 
-          {/* Verification Status Badge */}
-          <div className="flex items-center gap-2">
+          {/* Verification Status Badges */}
+          <div className="flex items-center gap-2 flex-wrap">
             {getCloseStatusBadge()}
+            {getPnlStatusBadge()}
+            {trade.pnl_computed_at && (
+              <span className="text-[10px] text-muted-foreground">
+                P&L computed: {format(new Date(trade.pnl_computed_at), 'MM/dd HH:mm')}
+              </span>
+            )}
           </div>
 
           {/* Trade Details Grid */}
@@ -208,8 +250,10 @@ const TradeDetailsRow = ({
               </div>
               <div className="space-y-1 text-xs">
                 <div className="flex justify-between">
-                  <span className="text-muted-foreground">P&L:</span>
-                  {pnlDisplay != null ? (
+                  <span className="text-muted-foreground">Realized P&L:</span>
+                  {trade.pnl_status === 'missing_fills' ? (
+                    <span className="font-mono text-bloomberg-amber" title="Incomplete fill data">—</span>
+                  ) : pnlDisplay != null ? (
                     <span className={cn("font-mono font-semibold", pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red")}>
                       {pnlDisplay >= 0 ? '+' : ''}${Number(pnlDisplay).toFixed(2)}
                     </span>
@@ -219,7 +263,9 @@ const TradeDetailsRow = ({
                 </div>
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">P&L %:</span>
-                  {trade.pnl_percent != null ? (
+                  {trade.pnl_status === 'missing_fills' ? (
+                    <span className="font-mono text-bloomberg-amber">—</span>
+                  ) : trade.pnl_percent != null ? (
                     <span className={cn("font-mono", trade.pnl_percent >= 0 ? "text-trading-green" : "text-panic-red")}>
                       {trade.pnl_percent >= 0 ? '+' : ''}{Number(trade.pnl_percent).toFixed(1)}%
                     </span>
@@ -227,16 +273,26 @@ const TradeDetailsRow = ({
                     <span className="font-mono text-muted-foreground">--</span>
                   )}
                 </div>
-                {trade.entry_credit != null && (
+                {(trade.entry_credit != null || trade.entry_credit_dollars != null) && (
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Entry Credit:</span>
-                    <span className="font-mono">${Number(trade.entry_credit).toFixed(2)}</span>
+                    <span className="font-mono">
+                      ${Number(trade.entry_credit_dollars ?? trade.entry_credit).toFixed(2)}
+                      {trade.entry_credit_dollars != null && (
+                        <span className="text-[9px] text-trading-green ml-1" title="From actual fills">✓</span>
+                      )}
+                    </span>
                   </div>
                 )}
-                {trade.exit_debit != null && (
+                {(trade.exit_debit != null || trade.exit_debit_dollars != null) && (
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Exit Debit:</span>
-                    <span className="font-mono">${Number(trade.exit_debit).toFixed(2)}</span>
+                    <span className="font-mono">
+                      ${Number(trade.exit_debit_dollars ?? trade.exit_debit).toFixed(2)}
+                      {trade.exit_debit_dollars != null && (
+                        <span className="text-[9px] text-trading-green ml-1" title="From actual fills">✓</span>
+                      )}
+                    </span>
                   </div>
                 )}
               </div>
@@ -419,7 +475,12 @@ interface TradeGroupRowProps {
 
 const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
   const pnlDisplay = group.needsReconcile ? null : group.totalPnl;
-  
+  // Get P&L status from primary leg (first trade)
+  const primaryLeg = group.trades[0];
+  const pnlStatus = primaryLeg?.pnl_status as PnlStatus | undefined;
+  const isPnlFinal = pnlStatus === 'computed' || pnlStatus === 'final';
+  const isMissingFills = pnlStatus === 'missing_fills';
+
   return (
     <React.Fragment key={group.groupId}>
       <TableRow 
@@ -463,9 +524,17 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
         </TableCell>
         <TableCell className={cn(
           "font-mono text-xs text-right py-1.5 font-semibold",
+          isMissingFills ? "text-bloomberg-amber" :
           pnlDisplay != null ? (pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red") : "text-muted-foreground"
         )}>
-          {pnlDisplay != null ? `${pnlDisplay >= 0 ? '+' : ''}$${Number(pnlDisplay).toFixed(2)}` : '--'}
+          {isMissingFills ? (
+            <span title="Incomplete fill data">—</span>
+          ) : pnlDisplay != null ? (
+            <span className="flex items-center justify-end gap-1">
+              {pnlDisplay >= 0 ? '+' : ''}${Number(pnlDisplay).toFixed(2)}
+              {isPnlFinal && <CheckCircle className="h-3 w-3 text-trading-green/60" title="Computed from fills" />}
+            </span>
+          ) : '--'}
         </TableCell>
         <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
           <div className="flex items-center gap-2">
@@ -538,9 +607,21 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                   <span className="text-[10px] text-muted-foreground uppercase">
                     Combined P&L {group.needsReconcile && '(partial)'}
                   </span>
+                  {isPnlFinal && (
+                    <span className="text-[9px] text-trading-green bg-trading-green/10 px-1.5 py-0.5 rounded">
+                      Computed
+                    </span>
+                  )}
+                  {isMissingFills && (
+                    <span className="text-[9px] text-bloomberg-amber bg-bloomberg-amber/10 px-1.5 py-0.5 rounded">
+                      Missing Fills
+                    </span>
+                  )}
                   <DecisionTraceLink tradeGroupId={group.groupId} />
                 </div>
-                {pnlDisplay != null ? (
+                {isMissingFills ? (
+                  <span className="font-mono text-bloomberg-amber" title="Incomplete fill data">—</span>
+                ) : pnlDisplay != null ? (
                   <span className={cn(
                     "font-mono font-semibold",
                     pnlDisplay >= 0 ? "text-trading-green" : "text-panic-red"
@@ -718,13 +799,18 @@ export const TradeJournal = () => {
 
   // Manual override removed - direction is inferred automatically from Tradier executions
 
-  const handleRecalculatePnl = async () => {
+  const handleRecalculatePnl = async (force = false) => {
     setIsRecalculating(true);
     isRecalculatingRef.current = true; // Set ref for realtime callback
     try {
-      const result = await tradeJournal.recalculatePnl();
+      const result = await tradeJournal.recalculatePnl({ force });
       if (result.success) {
-        toast.success(`Verified: ${result.updated} | Skipped (no direction): ${result.skipped}`);
+        const parts = [];
+        if (result.updated > 0) parts.push(`Updated: ${result.updated}`);
+        if (result.finalized > 0) parts.push(`Skipped (finalized): ${result.finalized}`);
+        if (result.skipped > 0) parts.push(`Skipped (no direction): ${result.skipped}`);
+        if (result.sanitized > 0) parts.push(`Sanitized: ${result.sanitized}`);
+        toast.success(parts.join(' | ') || 'No changes needed');
         if (result.errors.length > 0) {
           console.warn('P&L recalculation warnings:', result.errors);
           toast.warning(`${result.errors.length} trades had issues - check console`);
@@ -940,9 +1026,10 @@ export const TradeJournal = () => {
                   className="h-7 text-xs"
                   onClick={(e) => {
                     e.stopPropagation();
-                    handleRecalculatePnl();
+                    handleRecalculatePnl(false);
                   }}
                   disabled={isRecalculating}
+                  title="Recompute P&L for pending trades (skips finalized)"
                 >
                   {isRecalculating ? (
                     <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
@@ -950,6 +1037,21 @@ export const TradeJournal = () => {
                     <Calculator className="h-3 w-3 mr-1" />
                   )}
                   Recompute P&L
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 text-xs text-muted-foreground hover:text-panic-red"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm('Force recompute will recalculate ALL trades, even finalized ones. Continue?')) {
+                      handleRecalculatePnl(true);
+                    }
+                  }}
+                  disabled={isRecalculating}
+                  title="Force recompute ALL trades (dev only)"
+                >
+                  Force
                 </Button>
                 <Button
                   variant="outline"

@@ -6,6 +6,8 @@ export type CloseStatus = 'submitted' | 'filled' | 'rejected' | 'canceled' | 'ex
 // Order timeout - after 60 seconds in 'submitted' status, mark as timeout_unknown
 export const ORDER_TIMEOUT_MS = 60 * 1000;
 
+export type PnlStatus = 'pending' | 'computed' | 'final' | 'missing_fills';
+
 export interface TradeRecord {
   id?: string;
   symbol: string;
@@ -40,13 +42,19 @@ export interface TradeRecord {
   close_reject_reason?: string;
   close_avg_fill_price?: number;
   close_filled_qty?: number;
+  // Immutable P&L tracking columns
+  pnl_status?: PnlStatus;
+  entry_credit_dollars?: number;
+  exit_debit_dollars?: number;
+  pnl_computed_at?: string;
 }
 
-// Helper to cast DB row to TradeRecord (handles string → CloseStatus)
+// Helper to cast DB row to TradeRecord (handles string → CloseStatus and PnlStatus)
 function castToTradeRecord(row: any): TradeRecord {
   return {
     ...row,
     close_status: row.close_status as CloseStatus | undefined,
+    pnl_status: row.pnl_status as PnlStatus | undefined,
   };
 }
 
@@ -131,6 +139,32 @@ export function isCloseRejected(trade: Partial<TradeRecord>): boolean {
  */
 export function isCloseTimedOut(trade: Partial<TradeRecord>): boolean {
   return trade.close_status === 'timeout_unknown';
+}
+
+/**
+ * Check if trade has complete fill data for immutable P&L calculation
+ * Returns true if we have actual fill prices (not inferred values)
+ */
+export function hasCompleteFillData(trade: TradeRecord): boolean {
+  if (trade.trade_group_id) {
+    // Multi-leg trade: need both entry and exit dollars from actual fills
+    return trade.entry_credit_dollars != null &&
+           trade.exit_debit_dollars != null &&
+           trade.close_status === 'filled';
+  }
+  // Single-leg trade: need entry/exit prices and direction
+  return trade.entry_price != null &&
+         trade.exit_price != null &&
+         trade.open_side != null &&
+         trade.close_status === 'filled';
+}
+
+/**
+ * Check if P&L is finalized and should NOT be recomputed
+ * Returns true for 'computed' or 'final' status
+ */
+export function isPnlFinalized(trade: Partial<TradeRecord>): boolean {
+  return trade.pnl_status === 'computed' || trade.pnl_status === 'final';
 }
 
 /**
@@ -712,8 +746,12 @@ export const tradeJournal = {
    * - direction is unknown
    * - close_status is not 'filled'
    * In these cases, marks needs_reconcile=true and pnl=NULL
+   *
+   * IMMUTABILITY: Skips trades with pnl_status 'computed' or 'final' unless force=true
+   *
+   * @param options.force - If true, recompute even finalized trades (use sparingly)
    */
-  async recalculatePnl(): Promise<{ success: boolean; updated: number; skipped: number; sanitized: number; errors: string[] }> {
+  async recalculatePnl(options?: { force?: boolean }): Promise<{ success: boolean; updated: number; skipped: number; sanitized: number; finalized: number; errors: string[] }> {
     try {
       const { data: trades, error } = await supabase
         .from('trades')
@@ -724,7 +762,9 @@ export const tradeJournal = {
       let updated = 0;
       let skipped = 0;
       let sanitized = 0;
+      let finalized = 0; // Count of trades skipped due to immutability
       const errors: string[] = [];
+      const now = new Date().toISOString();
 
       // Step 1: Group trades by trade_group_id
       const groupedTrades = new Map<string, TradeRecord[]>();
@@ -751,17 +791,25 @@ export const tradeJournal = {
         });
 
         const primaryLeg = groupLegs[0];
-        
+
+        // IMMUTABILITY CHECK: Skip if already computed (unless force mode)
+        if (!options?.force && isPnlFinalized(primaryLeg)) {
+          console.log(`[recalculatePnl] Skipping finalized group ${groupId.slice(0, 8)} (pnl_status=${primaryLeg.pnl_status})`);
+          finalized += groupLegs.length;
+          continue;
+        }
+
         // Sanitize non-filled groups
         const allFilled = groupLegs.every(t => t.close_status === 'filled');
         if (!allFilled) {
           for (const leg of groupLegs) {
             if (leg.pnl != null || leg.pnl_percent != null || !leg.needs_reconcile) {
-              await supabase.from('trades').update({ 
+              await supabase.from('trades').update({
                 needs_reconcile: true,
                 pnl: null,
                 pnl_percent: null,
                 pnl_formula: null,
+                pnl_status: 'pending',
               }).eq('id', leg.id);
               sanitized++;
             } else {
@@ -774,18 +822,22 @@ export const tradeJournal = {
         // Multi-leg group: use group-level P&L calculation with SELF-HEALING
         if (groupLegs.length > 1) {
           const strategyType = primaryLeg.strategy_type;
-          
+
           // PHASE 1: contracts = max(quantity) across all legs for robustness
           const contracts = Math.max(...groupLegs.map(l => Number(l.quantity) || 1));
           const totalFees = groupLegs.reduce((sum, t) => sum + (Number(t.fees) || 0), 0);
-          
+
+          // IMMUTABLE P&L: Prefer stored _dollars values from actual fills
+          const storedEntryCreditDollars = Number(primaryLeg.entry_credit_dollars) || 0;
+          const storedExitDebitDollars = Number(primaryLeg.exit_debit_dollars) || 0;
+
           // Build leg infos with exit prices for inference
           const legInfos = groupLegs.map(leg => ({
             symbol: leg.symbol,
             entryPrice: Number(leg.entry_price) || 0,
             exitPrice: Number(leg.exit_price) || undefined,
           }));
-          
+
           // PHASE 2: Prefer strike-based inference over position_group_map
           const inference = inferLegSides(legInfos, strategyType);
           let inferredLegs: InferredLeg[] = [];
@@ -793,27 +845,99 @@ export const tradeJournal = {
           let computedExitDebit = 0;
           let entryCreditSource = 'stored';
           let exitDebitSource = 'unknown';
-          
+          let pnlStatus: PnlStatus = 'computed';
+
+          // Use stored dollars values if available (IMMUTABLE - from actual fills)
+          if (storedEntryCreditDollars > 0 && storedExitDebitDollars !== 0) {
+            // Use immutable values from actual fills
+            const finalPnl = storedEntryCreditDollars - storedExitDebitDollars;
+            const finalPnlPercent = storedEntryCreditDollars > 0
+              ? ((storedEntryCreditDollars - storedExitDebitDollars) / storedEntryCreditDollars) * 100 : 0;
+
+            const formulaImmutable = `(${storedEntryCreditDollars.toFixed(2)} - ${storedExitDebitDollars.toFixed(2)}) = ${finalPnl.toFixed(2)} [from actual fills - IMMUTABLE]`;
+
+            // Build side data map from inference
+            if (inference.success) {
+              inferredLegs = inference.legs;
+            }
+            const legSideData = new Map<string, { openSide: string; closeSide: string }>();
+            if (inferredLegs.length > 0) {
+              for (const leg of groupLegs) {
+                const inferred = getInferredSide(inferredLegs, leg.symbol);
+                if (inferred) {
+                  legSideData.set(leg.id!, { openSide: inferred.openSide, closeSide: inferred.closeSide });
+                }
+              }
+            }
+
+            // Update PRIMARY leg with immutable P&L
+            const primaryLegSides = legSideData.get(primaryLeg.id!);
+            const { error: primaryLegError } = await supabase.from('trades').update({
+              pnl: finalPnl,
+              pnl_percent: finalPnlPercent,
+              pnl_formula: formulaImmutable,
+              needs_reconcile: false,
+              pnl_status: 'computed',
+              pnl_computed_at: primaryLeg.pnl_computed_at || now,
+              ...(primaryLegSides ? {
+                open_side: primaryLegSides.openSide,
+                close_side: primaryLegSides.closeSide
+              } : {}),
+            }).eq('id', primaryLeg.id);
+
+            if (primaryLegError) {
+              errors.push(`Trade ${primaryLeg.id}: ${primaryLegError.message}`);
+            } else {
+              updated++;
+            }
+
+            // Set other legs to 0 P&L
+            for (let i = 1; i < groupLegs.length; i++) {
+              const leg = groupLegs[i];
+              const legSides = legSideData.get(leg.id!);
+              const { error: legError } = await supabase.from('trades').update({
+                pnl: 0,
+                pnl_percent: 0,
+                pnl_formula: 'Included in group total',
+                needs_reconcile: false,
+                pnl_status: 'computed',
+                pnl_computed_at: leg.pnl_computed_at || now,
+                ...(legSides ? {
+                  open_side: legSides.openSide,
+                  close_side: legSides.closeSide
+                } : {}),
+              }).eq('id', leg.id);
+
+              if (legError) {
+                errors.push(`Trade ${leg.id}: ${legError.message}`);
+              } else {
+                updated++;
+              }
+            }
+            continue; // Skip inference-based calculation
+          }
+
+          // Fallback to inference-based calculation
           if (inference.success) {
             inferredLegs = inference.legs;
-            
+
             // Check if stored entry_credit differs materially from inferred
             const storedEntryCredit = Number(primaryLeg.entry_credit) || 0;
             const diff = Math.abs(storedEntryCredit - inference.netEntryCredit);
-            
+
             if (diff > 0.005 || storedEntryCredit === 0) {
               console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit correction ${storedEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
               computedEntryCredit = inference.netEntryCredit;
               entryCreditSource = 'inferred';
             }
           }
-          
+
           // EXIT DEBIT RESOLVER - Priority-based selection for correct group exit debit
           // Priority 1: Check if any leg already has a non-zero exit_debit (use median of non-zero values)
           const existingExitDebits = groupLegs
             .map(l => Number(l.exit_debit) || 0)
             .filter(ed => ed > 0.001);
-          
+
           if (existingExitDebits.length > 0) {
             // Use median of existing non-zero exit_debit values
             existingExitDebits.sort((a, b) => a - b);
@@ -828,12 +952,12 @@ export const tradeJournal = {
             const exitPrices = groupLegs
               .map(l => Number(l.exit_price) || 0)
               .filter(ep => ep > 0.001);
-            
+
             if (exitPrices.length >= 2) {
               const minExit = Math.min(...exitPrices);
               const maxExit = Math.max(...exitPrices);
               const isComboNetPrice = (maxExit - minExit) < 0.005; // All within 0.5 cents = duplicated combo price
-              
+
               if (isComboNetPrice && groupLegs.length >= 4) {
                 // Duplicated combo net close price - use the common value
                 computedExitDebit = exitPrices[0];
@@ -859,16 +983,17 @@ export const tradeJournal = {
               exitDebitSource = 'fallbackPrimaryExitPrice';
             }
           }
-          
+
           // Validate we have entry/exit data
           if (computedEntryCredit === 0 && computedExitDebit === 0) {
             errors.push(`Group ${groupId.slice(0, 8)}: Missing entry_credit and exit_debit`);
             for (const leg of groupLegs) {
-              await supabase.from('trades').update({ 
+              await supabase.from('trades').update({
                 needs_reconcile: true,
                 pnl: null,
                 pnl_percent: null,
                 pnl_formula: null,
+                pnl_status: 'missing_fills',
               }).eq('id', leg.id);
             }
             skipped += groupLegs.length;
@@ -881,7 +1006,7 @@ export const tradeJournal = {
           const formulaWithTrace = `${groupCalc.formula} [entry:${entryCreditSource}, exit:${exitDebitSource}]`;
           // Build side data map from inference (preferred) - Phase 2
           const legSideData = new Map<string, { openSide: string; closeSide: string }>();
-          
+
           // First use inference for all legs if available
           if (inferredLegs.length > 0) {
             for (const leg of groupLegs) {
@@ -891,7 +1016,7 @@ export const tradeJournal = {
               }
             }
           }
-          
+
           // Only fall back to position_group_map for legs where inference failed
           for (const leg of groupLegs) {
             if (!legSideData.has(leg.id!)) {
@@ -902,7 +1027,7 @@ export const tradeJournal = {
                 .eq('trade_group_id', leg.trade_group_id)
                 .maybeSingle();
               if (mapping?.leg_side) {
-                const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
+                const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' :
                                  mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : 'buy_to_close';
                 legSideData.set(leg.id!, { openSide: mapping.leg_side, closeSide });
               }
@@ -916,13 +1041,15 @@ export const tradeJournal = {
             pnl_percent: groupCalc.pnlPercent,
             pnl_formula: formulaWithTrace,
             needs_reconcile: false,
+            pnl_status: pnlStatus,
+            pnl_computed_at: now,
             // Always persist entry_credit and exit_debit on primary leg
             entry_credit: computedEntryCredit,
             exit_debit: computedExitDebit,
             // Fix side labels from inference
-            ...(primaryLegSides ? { 
-              open_side: primaryLegSides.openSide, 
-              close_side: primaryLegSides.closeSide 
+            ...(primaryLegSides ? {
+              open_side: primaryLegSides.openSide,
+              close_side: primaryLegSides.closeSide
             } : {}),
           }).eq('id', primaryLeg.id);
 
@@ -941,12 +1068,14 @@ export const tradeJournal = {
               pnl_percent: 0,
               pnl_formula: 'Included in group total',
               needs_reconcile: false,
+              pnl_status: pnlStatus,
+              pnl_computed_at: now,
               // Persist corrected entry_credit on all legs for consistency
               entry_credit: computedEntryCredit,
               // Fix side labels from inference
-              ...(legSides ? { 
-                open_side: legSides.openSide, 
-                close_side: legSides.closeSide 
+              ...(legSides ? {
+                open_side: legSides.openSide,
+                close_side: legSides.closeSide
               } : {}),
             }).eq('id', leg.id);
 
@@ -964,14 +1093,22 @@ export const tradeJournal = {
 
       // Step 3: Process single-leg trades using per-leg calculation
       for (const trade of ungroupedTrades) {
+        // IMMUTABILITY CHECK: Skip if already computed (unless force mode)
+        if (!options?.force && isPnlFinalized(trade)) {
+          console.log(`[recalculatePnl] Skipping finalized trade ${trade.id?.slice(0, 8)} (pnl_status=${trade.pnl_status})`);
+          finalized++;
+          continue;
+        }
+
         // HARD RULE: If close_status is not 'filled', nullify P&L
         if (trade.close_status !== 'filled') {
           if (trade.pnl != null || trade.pnl_percent != null || !trade.needs_reconcile) {
-            await supabase.from('trades').update({ 
+            await supabase.from('trades').update({
               needs_reconcile: true,
               pnl: null,
               pnl_percent: null,
               pnl_formula: null,
+              pnl_status: 'pending',
             }).eq('id', trade.id);
             sanitized++;
           } else {
@@ -979,15 +1116,16 @@ export const tradeJournal = {
           }
           continue;
         }
-        
+
         // Check if we have verified direction
         if (!hasVerifiedDirection(trade)) {
           if (!trade.needs_reconcile || trade.pnl != null) {
-            await supabase.from('trades').update({ 
+            await supabase.from('trades').update({
               needs_reconcile: true,
               pnl: null,
               pnl_percent: null,
               pnl_formula: null,
+              pnl_status: 'missing_fills',
             }).eq('id', trade.id);
             skipped++;
           } else {
@@ -1007,11 +1145,12 @@ export const tradeJournal = {
 
         if (!calc) {
           errors.push(`Trade ${trade.id?.slice(0, 8)} (${trade.symbol}): P&L calculation failed`);
-          await supabase.from('trades').update({ 
+          await supabase.from('trades').update({
             needs_reconcile: true,
             pnl: null,
             pnl_percent: null,
             pnl_formula: null,
+            pnl_status: 'missing_fills',
           }).eq('id', trade.id);
           skipped++;
           continue;
@@ -1024,6 +1163,8 @@ export const tradeJournal = {
             pnl_percent: calc.pnlPercent,
             pnl_formula: calc.formula,
             needs_reconcile: false,
+            pnl_status: 'computed',
+            pnl_computed_at: now,
           })
           .eq('id', trade.id);
 
@@ -1034,15 +1175,16 @@ export const tradeJournal = {
         }
       }
 
-      return { success: true, updated, skipped, sanitized, errors };
+      return { success: true, updated, skipped, sanitized, finalized, errors };
     } catch (error) {
       console.error('Error recalculating P&L:', error);
-      return { 
-        success: false, 
-        updated: 0, 
+      return {
+        success: false,
+        updated: 0,
         skipped: 0,
         sanitized: 0,
-        errors: [error instanceof Error ? error.message : 'Unknown error'] 
+        finalized: 0,
+        errors: [error instanceof Error ? error.message : 'Unknown error']
       };
     }
   },
@@ -1253,7 +1395,7 @@ export const tradeJournal = {
       if (isMultiLeg && status === 'filled' && details?.avgFillPrice != null) {
         // === MULTI-LEG COMBO ORDER: Use GROUP-LEVEL NET P&L ===
         const typedTrades = trades.map(t => castToTradeRecord(t));
-        
+
         // PHASE 3: Deterministic primary leg selection - sort by symbol, then by id
         typedTrades.sort((a, b) => {
           const symCmp = a.symbol.localeCompare(b.symbol);
@@ -1261,11 +1403,54 @@ export const tradeJournal = {
           return (a.id || '').localeCompare(b.id || '');
         });
         const primaryLeg = typedTrades[0];
-        
+
         const strategyType = primaryLeg.strategy_type;
         const contracts = details.filledQty || Math.max(...typedTrades.map(t => Number(t.quantity) || 1));
         const fees = details.fees || 0;
-        
+
+        // === IMMUTABLE P&L: Compute exit_debit_dollars from actual per-leg fills ===
+        let exitDebitDollars = 0;
+        let hasAllLegFills = true;
+
+        if (details?.legFills) {
+          for (const trade of typedTrades) {
+            const legFill = details.legFills[trade.symbol];
+            if (legFill) {
+              const fillPrice = legFill.avgFillPrice;
+              const qty = legFill.filledQty || Math.abs(trade.quantity);
+              // For closing: short positions pay to close, long positions receive
+              if (trade.open_side === 'sell_to_open') {
+                exitDebitDollars += fillPrice * qty * 100; // Pay to close short
+              } else if (trade.open_side === 'buy_to_open') {
+                exitDebitDollars -= fillPrice * qty * 100; // Receive to close long
+              } else {
+                // Open side unknown - try to infer from position_group_map
+                const { data: mapping } = await supabase
+                  .from('position_group_map')
+                  .select('leg_side')
+                  .eq('symbol', trade.symbol)
+                  .eq('trade_group_id', trade.trade_group_id)
+                  .maybeSingle();
+                if (mapping?.leg_side === 'sell_to_open') {
+                  exitDebitDollars += fillPrice * qty * 100;
+                } else if (mapping?.leg_side === 'buy_to_open') {
+                  exitDebitDollars -= fillPrice * qty * 100;
+                } else {
+                  hasAllLegFills = false; // Can't determine direction
+                }
+              }
+            } else {
+              hasAllLegFills = false;
+            }
+          }
+        } else {
+          hasAllLegFills = false;
+        }
+
+        // Get entry_credit_dollars from stored value
+        const entryCredit = Number(primaryLeg.entry_credit) || 0;
+        const entryCreditDollars = entryCredit * contracts * 100;
+
         // Build leg infos with exit prices for inference
         // For combo orders, avgFillPrice is net debit - but we may also have per-leg fills
         const legInfos = typedTrades.map(t => ({
@@ -1273,23 +1458,23 @@ export const tradeJournal = {
           entryPrice: Number(t.entry_price) || 0,
           exitPrice: (details?.legFills?.[t.symbol]?.avgFillPrice ?? Number(t.exit_price)) || undefined,
         }));
-        
+
         // PHASE 3: Infer leg sides and compute entry_credit and exit_debit
         const inference = inferLegSides(legInfos, strategyType);
         let inferredLegs: InferredLeg[] = [];
         let netEntryCredit = Number(primaryLeg.entry_credit) || 0;
         let netExitDebit = Math.abs(details.avgFillPrice); // Combo net exit debit from Tradier
-        
+
         if (inference.success) {
           inferredLegs = inference.legs;
-          
+
           // Check if stored entry_credit needs correction
           const diff = Math.abs(netEntryCredit - inference.netEntryCredit);
           if (diff > 0.005 || netEntryCredit === 0) {
             console.log(`[updateCloseStatus] Entry credit correction: ${netEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
             netEntryCredit = inference.netEntryCredit;
           }
-          
+
           // If we have per-leg exit prices, compute exit_debit from inferred sides
           if (inference.netExitDebit != null) {
             const computedDiff = Math.abs(netExitDebit - inference.netExitDebit);
@@ -1300,19 +1485,36 @@ export const tradeJournal = {
             }
           }
         }
-        
+
         // Calculate group P&L using net credit/debit formula
         let groupCalc: { pnl: number; pnlPercent: number; formula: string } | null = null;
-        
-        if (netEntryCredit > 0 || netExitDebit > 0) {
+        let pnlStatus: PnlStatus = 'missing_fills';
+        const now = new Date().toISOString();
+
+        // Determine if we can compute P&L from actual fill data
+        if (hasAllLegFills && entryCreditDollars > 0 && exitDebitDollars !== 0) {
+          // IMMUTABLE: Use actual fill prices, not inference
+          const finalPnl = entryCreditDollars - exitDebitDollars;
+          const finalPnlPercent = entryCreditDollars > 0 ? ((entryCreditDollars - exitDebitDollars) / entryCreditDollars) * 100 : 0;
+          groupCalc = {
+            pnl: finalPnl,
+            pnlPercent: finalPnlPercent,
+            formula: `(${(entryCreditDollars).toFixed(2)} - ${exitDebitDollars.toFixed(2)}) = ${finalPnl.toFixed(2)} [from actual fills]`
+          };
+          groupPnl = finalPnl;
+          pnlStatus = 'computed';
+          console.log(`[updateCloseStatus] IMMUTABLE P&L from fills: Entry=$${entryCreditDollars.toFixed(2)}, Exit=$${exitDebitDollars.toFixed(2)}, P&L=$${finalPnl.toFixed(2)}`);
+        } else if (netEntryCredit > 0 || netExitDebit > 0) {
+          // Fallback to inference-based calculation
           groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, fees);
           groupPnl = groupCalc.pnl;
-          console.log(`[updateCloseStatus] Multi-leg combo P&L: Entry Credit=$${netEntryCredit.toFixed(4)}, Exit Debit=$${netExitDebit.toFixed(4)}, Contracts=${contracts}, P&L=$${groupCalc.pnl.toFixed(2)}`);
+          pnlStatus = 'computed'; // Mark as computed even from inference
+          console.log(`[updateCloseStatus] Multi-leg combo P&L (inferred): Entry Credit=$${netEntryCredit.toFixed(4)}, Exit Debit=$${netExitDebit.toFixed(4)}, Contracts=${contracts}, P&L=$${groupCalc.pnl.toFixed(2)}`);
         }
-        
+
         // Build side data map from inference (preferred)
         const legSideData = new Map<string, { openSide: string; closeSide: string }>();
-        
+
         if (inferredLegs.length > 0) {
           for (const trade of typedTrades) {
             const inferred = getInferredSide(inferredLegs, trade.symbol);
@@ -1321,7 +1523,7 @@ export const tradeJournal = {
             }
           }
         }
-        
+
         // Fall back to position_group_map only for legs where inference failed
         for (const trade of typedTrades) {
           if (!legSideData.has(trade.id!)) {
@@ -1331,9 +1533,9 @@ export const tradeJournal = {
               .eq('symbol', trade.symbol)
               .eq('trade_group_id', trade.trade_group_id)
               .maybeSingle();
-            
+
             if (mapping?.leg_side) {
-              const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' : 
+              const closeSide = mapping.leg_side === 'sell_to_open' ? 'buy_to_close' :
                                mapping.leg_side === 'buy_to_open' ? 'sell_to_close' : null;
               if (closeSide) {
                 legSideData.set(trade.id!, { openSide: mapping.leg_side, closeSide });
@@ -1341,33 +1543,38 @@ export const tradeJournal = {
             }
           }
         }
-        
+
         // Update all legs with group info
         for (let i = 0; i < typedTrades.length; i++) {
           const trade = typedTrades[i];
           const isPrimaryLeg = i === 0;
           const sides = legSideData.get(trade.id!);
-          
+
           const updates: Record<string, any> = {
             close_status: 'filled',
-            close_filled_at: new Date().toISOString(),
-            exit_time: new Date().toISOString(),
+            close_filled_at: now,
+            exit_time: now,
             needs_reconcile: false,
             // Persist consistent entry_credit on all legs
             entry_credit: netEntryCredit,
+            // IMMUTABLE P&L tracking
+            entry_credit_dollars: entryCreditDollars,
+            pnl_status: pnlStatus,
+            pnl_computed_at: groupCalc ? now : null,
           };
-          
-          // Store exit_debit only on primary leg
+
+          // Store exit values only on primary leg
           if (isPrimaryLeg) {
             updates.exit_debit = netExitDebit;
+            updates.exit_debit_dollars = exitDebitDollars || null;
           }
-          
+
           // Fix side labels from inference
           if (sides) {
             updates.open_side = sides.openSide;
             updates.close_side = sides.closeSide;
           }
-          
+
           // P&L: Store group total on primary leg, zero on others
           if (groupCalc) {
             if (isPrimaryLeg) {
@@ -1380,22 +1587,23 @@ export const tradeJournal = {
               updates.pnl_formula = 'Included in group total';
             }
           }
-          
+
           await supabase.from('trades').update(updates).eq('id', trade.id);
         }
-        
+
         return { success: true, groupPnl };
       }
 
       // === SINGLE-LEG ORDER or non-filled status ===
       for (const row of trades) {
         const trade = castToTradeRecord(row);
+        const now = new Date().toISOString();
         const updates: Record<string, any> = { close_status: status };
 
         if (status === 'filled') {
-          updates.close_filled_at = new Date().toISOString();
-          updates.exit_time = new Date().toISOString();
-          
+          updates.close_filled_at = now;
+          updates.exit_time = now;
+
           // Get leg data from mapping for correct quantity and side
           const { data: mapping } = await supabase
             .from('position_group_map')
@@ -1403,15 +1611,15 @@ export const tradeJournal = {
             .eq('symbol', trade.symbol)
             .eq('trade_group_id', trade.trade_group_id)
             .maybeSingle();
-          
+
           const legFill = details?.legFills?.[trade.symbol];
           const fillPrice = legFill?.avgFillPrice ?? details?.avgFillPrice;
           const fillQty = mapping?.leg_qty ?? legFill?.filledQty ?? details?.filledQty ?? trade.quantity;
           const openSide = mapping?.leg_side || details?.open_side || trade.open_side;
-          const closeSide = openSide === 'sell_to_open' ? 'buy_to_close' : 
-                           openSide === 'buy_to_open' ? 'sell_to_close' : 
+          const closeSide = openSide === 'sell_to_open' ? 'buy_to_close' :
+                           openSide === 'buy_to_open' ? 'sell_to_close' :
                            legFill?.side;
-          
+
           if (fillPrice != null) {
             updates.close_avg_fill_price = fillPrice;
             updates.exit_price = fillPrice;
@@ -1420,7 +1628,7 @@ export const tradeJournal = {
           updates.quantity = fillQty;
           updates.close_side = closeSide;
           updates.open_side = openSide;
-          
+
           if (details?.fees != null) {
             updates.fees = details.fees;
           }
@@ -1437,13 +1645,21 @@ export const tradeJournal = {
               updates.pnl_percent = pnlCalc.pnlPercent;
               updates.pnl_formula = pnlCalc.formula;
               updates.needs_reconcile = false;
+              // IMMUTABLE P&L tracking for single-leg
+              updates.pnl_status = 'computed';
+              updates.pnl_computed_at = now;
+            } else {
+              updates.pnl_status = 'missing_fills';
             }
+          } else {
+            updates.pnl_status = 'missing_fills';
           }
         } else if (status === 'rejected' || status === 'canceled' || status === 'expired') {
           updates.close_reject_reason = details?.rejectReason || status;
           // Do NOT set exit_time, exit_price, pnl - trade is still open
           updates.pnl = null;
           updates.needs_reconcile = true;
+          updates.pnl_status = 'pending';
         }
 
         const { error: updateError } = await supabase
