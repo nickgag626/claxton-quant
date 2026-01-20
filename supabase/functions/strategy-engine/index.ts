@@ -2081,7 +2081,13 @@ serve(async (req) => {
       
       for (const strategy of strategies as Strategy[]) {
         if (!strategy.enabled) continue;
-        
+
+        // SAFETY: Block undefined-risk strategies (straddle/strangle) from automated trading
+        if (strategy.type === 'straddle' || strategy.type === 'strangle') {
+          console.warn(`[SAFETY] BLOCKED: Strategy "${strategy.name}" is type "${strategy.type}" with UNLIMITED LOSS potential. Not allowed for automated trading.`);
+          continue;
+        }
+
         // Run full evaluation with trace
         const result = await evaluateStrategyWithTrace(
           strategy,

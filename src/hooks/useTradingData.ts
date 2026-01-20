@@ -476,6 +476,7 @@ const defaultStrategies: Strategy[] = [
       maxDte: 7,
       shortDeltaTarget: 0.16,
       longDeltaTarget: 0.08,
+      minPremium: 0.75, // REQUIRED: Prevents tiny credits that cause random exits
       marketHoursOnly: true,
     },
     exitConditions: {
@@ -497,6 +498,7 @@ const defaultStrategies: Strategy[] = [
       maxDte: 35,
       shortDeltaTarget: 0.30,
       longDeltaTarget: 0.15,
+      minPremium: 1.00, // REQUIRED: Prevents tiny credits that cause random exits
       minIvRank: 25,
       marketHoursOnly: true,
     },

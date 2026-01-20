@@ -39,6 +39,7 @@ interface StrategyLeg {
 }
 
 // Updated presets with new delta fields
+// SAFETY: Only defined-risk strategies included. Straddles/strangles removed (unlimited loss).
 const STRATEGY_PRESETS = {
   '0DTE Iron Condor (SPX)': {
     type: 'iron_condor' as StrategyType,
@@ -47,6 +48,7 @@ const STRATEGY_PRESETS = {
     shortDeltaTarget: 0.10,
     longDeltaTarget: 0.05,
     wingWidth: 10,
+    minPremium: 1.50, // REQUIRED: Prevents tiny credits that cause random exits
     profitTarget: 50,
     stopLoss: 100,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
@@ -64,6 +66,7 @@ const STRATEGY_PRESETS = {
     shortDeltaTarget: 0.16,
     longDeltaTarget: 0.08,
     wingWidth: 5,
+    minPremium: 0.75, // REQUIRED: Prevents tiny credits that cause random exits
     profitTarget: 50,
     stopLoss: 200,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
@@ -81,6 +84,7 @@ const STRATEGY_PRESETS = {
     shortDeltaTarget: 0.30,
     longDeltaTarget: 0.15,
     wingWidth: 5,
+    minPremium: 1.00, // REQUIRED: Prevents tiny credits that cause random exits
     profitTarget: 50,
     stopLoss: 200,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
@@ -89,36 +93,8 @@ const STRATEGY_PRESETS = {
       { optionType: 'put', side: 'buy', strikeOffset: -5, quantity: 1 },
     ],
   },
-  '0DTE Straddle (SPX)': {
-    type: 'straddle' as StrategyType,
-    underlying: 'SPX',
-    dte: 0,
-    shortDeltaTarget: 0.50,
-    longDeltaTarget: undefined,
-    wingWidth: 0,
-    profitTarget: 25,
-    stopLoss: 100,
-    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
-    legs: [
-      { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
-      { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 1 },
-    ],
-  },
-  'Weekly Strangle (SPY)': {
-    type: 'strangle' as StrategyType,
-    underlying: 'SPY',
-    dte: 7,
-    shortDeltaTarget: 0.16,
-    longDeltaTarget: undefined,
-    wingWidth: 0,
-    profitTarget: 50,
-    stopLoss: 200,
-    sizing: { mode: 'fixed' as const, fixedContracts: 1 },
-    legs: [
-      { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
-      { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 1 },
-    ],
-  },
+  // REMOVED: '0DTE Straddle (SPX)' - UNDEFINED RISK (unlimited loss potential)
+  // REMOVED: 'Weekly Strangle (SPY)' - UNDEFINED RISK (unlimited loss potential)
   'Butterfly (SPX)': {
     type: 'butterfly' as StrategyType,
     underlying: 'SPX',
@@ -126,6 +102,7 @@ const STRATEGY_PRESETS = {
     shortDeltaTarget: 0.30,
     longDeltaTarget: 0.15,
     wingWidth: 10,
+    minPremium: 0.50, // REQUIRED: Prevents tiny credits that cause random exits
     profitTarget: 75,
     stopLoss: 50,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
@@ -142,6 +119,7 @@ const STRATEGY_PRESETS = {
     shortDeltaTarget: 0.50,
     longDeltaTarget: 0.10,
     wingWidth: 20,
+    minPremium: 3.00, // REQUIRED: Iron flies have higher premiums
     profitTarget: 25,
     stopLoss: 100,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
@@ -154,14 +132,14 @@ const STRATEGY_PRESETS = {
   },
 };
 
-const STRATEGY_TYPES: { value: StrategyType; label: string; description: string }[] = [
-  { value: 'iron_condor', label: 'Iron Condor', description: 'Sell OTM Put + Buy further OTM Put + Sell OTM Call + Buy further OTM Call' },
-  { value: 'credit_put_spread', label: 'Credit Put Spread', description: 'Sell Put + Buy lower strike Put (bullish)' },
-  { value: 'credit_call_spread', label: 'Credit Call Spread', description: 'Sell Call + Buy higher strike Call (bearish)' },
-  { value: 'strangle', label: 'Strangle', description: 'Sell OTM Put + Sell OTM Call (neutral, undefined risk)' },
-  { value: 'straddle', label: 'Straddle', description: 'Sell ATM Put + Sell ATM Call (neutral, undefined risk)' },
-  { value: 'butterfly', label: 'Butterfly', description: 'Buy 1 lower + Sell 2 middle + Buy 1 upper (neutral, defined risk)' },
-  { value: 'iron_fly', label: 'Iron Fly', description: 'Sell ATM Put + Sell ATM Call + Buy OTM wings (neutral, defined risk)' },
+const STRATEGY_TYPES: { value: StrategyType; label: string; description: string; risk?: 'defined' | 'undefined' }[] = [
+  { value: 'iron_condor', label: 'Iron Condor', description: 'Sell OTM Put + Buy further OTM Put + Sell OTM Call + Buy further OTM Call', risk: 'defined' },
+  { value: 'credit_put_spread', label: 'Credit Put Spread', description: 'Sell Put + Buy lower strike Put (bullish)', risk: 'defined' },
+  { value: 'credit_call_spread', label: 'Credit Call Spread', description: 'Sell Call + Buy higher strike Call (bearish)', risk: 'defined' },
+  { value: 'strangle', label: 'Strangle (DISABLED)', description: 'UNLIMITED LOSS - Not available for automated trading', risk: 'undefined' },
+  { value: 'straddle', label: 'Straddle (DISABLED)', description: 'UNLIMITED LOSS - Not available for automated trading', risk: 'undefined' },
+  { value: 'butterfly', label: 'Butterfly', description: 'Buy 1 lower + Sell 2 middle + Buy 1 upper (neutral, defined risk)', risk: 'defined' },
+  { value: 'iron_fly', label: 'Iron Fly', description: 'Sell ATM Put + Sell ATM Call + Buy OTM wings (neutral, defined risk)', risk: 'defined' },
   { value: 'custom', label: 'Custom', description: 'Define your own leg structure' },
 ];
 
@@ -587,7 +565,12 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
                   </SelectTrigger>
                   <SelectContent>
                     {STRATEGY_TYPES.map((type) => (
-                      <SelectItem key={type.value} value={type.value}>
+                      <SelectItem
+                        key={type.value}
+                        value={type.value}
+                        disabled={type.risk === 'undefined'}
+                        className={type.risk === 'undefined' ? 'text-destructive opacity-50' : ''}
+                      >
                         {type.label}
                       </SelectItem>
                     ))}
