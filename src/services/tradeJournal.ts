@@ -214,35 +214,40 @@ export function calculatePnl(
 
 /**
  * GROUP-LEVEL NET P&L CALCULATION (for multi-leg orders like iron condors)
- * 
- * Formula: P&L = (Net Entry Credit - Net Exit Debit) × multiplier × contracts
- * 
- * This is the CORRECT way to calculate P&L for combo orders:
- * - Entry credit: The net premium received when opening the position
- * - Exit debit: The net premium paid when closing the position
- * - Contracts: Number of contracts (NOT number of legs)
- * 
+ *
+ * **IMPORTANT: Values must be in DOLLARS (already multiplied by contracts × 100)**
+ *
+ * The strategy-engine stores entry_credit and exit_debit as total dollars:
+ *   entry_credit = avgFill × qty × 100 (e.g., $920 for 4 contracts at $2.30 net)
+ *
+ * Formula: P&L = Entry Credit (dollars) - Exit Debit (dollars) - fees
+ *
  * Example:
- * - Entry credit: $1.18 (sold for net $1.18 credit)
- * - Exit debit: $1.19 (bought back for net $1.19 debit)
- * - Contracts: 4
- * - P&L = ($1.18 - $1.19) × 100 × 4 = -$4.00
+ * - Entry credit: $920 (received $2.30 × 4 contracts × 100)
+ * - Exit debit: $924 (paid $2.31 × 4 contracts × 100)
+ * - P&L = $920 - $924 - $0 = -$4.00
+ *
+ * @param netEntryCreditDollars Total net credit in dollars (already multiplied)
+ * @param netExitDebitDollars Total net debit in dollars (already multiplied)
+ * @param contracts Number of contracts (for formula display only, NOT used in calculation)
+ * @param multiplier Kept for API compatibility (NOT used in calculation)
+ * @param fees Trading fees in dollars
  */
 export function calculateGroupPnl(
-  netEntryCredit: number,  // Total net credit received at entry (from entry_credit)
-  netExitDebit: number,    // Total net debit paid at exit (combo order fill price)
-  contracts: number,       // Number of contracts (NOT number of legs)
-  multiplier: number = 100,
+  netEntryCreditDollars: number,  // Total dollars received at entry
+  netExitDebitDollars: number,    // Total dollars paid at exit
+  contracts: number,              // For display only
+  multiplier: number = 100,       // Unused - kept for API compatibility
   fees: number = 0
 ): { pnl: number; pnlPercent: number; formula: string } {
-  // P&L = (Credit Received - Debit Paid) × multiplier × contracts - fees
-  const pnl = (netEntryCredit - netExitDebit) * multiplier * contracts - fees;
-  const pnlPercent = netEntryCredit > 0 
-    ? ((netEntryCredit - netExitDebit) / netEntryCredit) * 100 
+  // P&L = Entry Credit - Exit Debit - fees (all in dollars, NO multiplication)
+  const pnl = netEntryCreditDollars - netExitDebitDollars - fees;
+  const pnlPercent = netEntryCreditDollars > 0
+    ? ((netEntryCreditDollars - netExitDebitDollars) / netEntryCreditDollars) * 100
     : 0;
-  
-  const formula = `(${netEntryCredit.toFixed(4)} - ${netExitDebit.toFixed(4)}) × ${multiplier} × ${contracts} - ${fees.toFixed(2)} = ${pnl.toFixed(2)}`;
-  
+
+  const formula = `$${netEntryCreditDollars.toFixed(2)} - $${netExitDebitDollars.toFixed(2)} - $${fees.toFixed(2)} = $${pnl.toFixed(2)} [${contracts} contracts]`;
+
   return { pnl, pnlPercent, formula };
 }
 
@@ -766,6 +771,25 @@ export const tradeJournal = {
       const errors: string[] = [];
       const now = new Date().toISOString();
 
+      // === DIAGNOSTIC: Capture before-state for delta tracking ===
+      const beforePnlByGroup = new Map<string, number>();
+      let totalBeforePnl = 0;
+      for (const row of trades || []) {
+        const trade = castToTradeRecord(row);
+        const pnl = Number(trade.pnl) || 0;
+        if (trade.trade_group_id) {
+          // For groups, only count primary leg (first alphabetically)
+          const existing = beforePnlByGroup.get(trade.trade_group_id) || 0;
+          beforePnlByGroup.set(trade.trade_group_id, existing + pnl);
+        } else {
+          totalBeforePnl += pnl;
+        }
+      }
+      for (const groupPnl of beforePnlByGroup.values()) {
+        totalBeforePnl += groupPnl;
+      }
+      console.log(`[recompute] === STARTING RECOMPUTE === Total P&L before: $${totalBeforePnl.toFixed(2)}, force=${options?.force || false}`);
+
       // Step 1: Group trades by trade_group_id
       const groupedTrades = new Map<string, TradeRecord[]>();
       const ungroupedTrades: TradeRecord[] = [];
@@ -921,34 +945,41 @@ export const tradeJournal = {
           if (inference.success) {
             inferredLegs = inference.legs;
 
-            // Check if stored entry_credit differs materially from inferred
+            // IMPORTANT: inference.netEntryCredit is PER-SHARE, entry_credit is DOLLARS
+            // Convert inferred per-share to dollars for comparison
+            const inferredEntryCreditDollars = inference.netEntryCredit * contracts * 100;
             const storedEntryCredit = Number(primaryLeg.entry_credit) || 0;
-            const diff = Math.abs(storedEntryCredit - inference.netEntryCredit);
 
-            if (diff > 0.005 || storedEntryCredit === 0) {
-              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit correction ${storedEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
-              computedEntryCredit = inference.netEntryCredit;
-              entryCreditSource = 'inferred';
+            // Only use inference if stored value is missing/zero
+            // Don't override dollars with per-share values!
+            if (storedEntryCredit === 0 && inferredEntryCreditDollars > 0) {
+              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit from inference: $${inferredEntryCreditDollars.toFixed(2)} (${inference.netEntryCredit.toFixed(4)} × ${contracts} × 100)`);
+              computedEntryCredit = inferredEntryCreditDollars;
+              entryCreditSource = 'inferred_dollars';
             }
           }
 
           // EXIT DEBIT RESOLVER - Priority-based selection for correct group exit debit
-          // Priority 1: Check if any leg already has a non-zero exit_debit (use median of non-zero values)
+          // IMPORTANT: exit_debit column = DOLLARS, exit_price column = PER-SHARE
+          // All outputs must be in DOLLARS for calculateGroupPnl
+
+          // Priority 1: Check if any leg already has a non-zero exit_debit (already in dollars)
           const existingExitDebits = groupLegs
             .map(l => Number(l.exit_debit) || 0)
             .filter(ed => ed > 0.001);
 
           if (existingExitDebits.length > 0) {
-            // Use median of existing non-zero exit_debit values
+            // Use median of existing non-zero exit_debit values (already in dollars)
             existingExitDebits.sort((a, b) => a - b);
             const midIdx = Math.floor(existingExitDebits.length / 2);
             computedExitDebit = existingExitDebits.length % 2 === 0
               ? (existingExitDebits[midIdx - 1] + existingExitDebits[midIdx]) / 2
               : existingExitDebits[midIdx];
-            exitDebitSource = 'existingExitDebit';
-            console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using existing exit_debit median=${computedExitDebit.toFixed(4)}`);
+            exitDebitSource = 'existingExitDebit_dollars';
+            console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using existing exit_debit=$${computedExitDebit.toFixed(2)}`);
           } else {
             // Priority 2: Check if exit_price is duplicated combo net price (all legs have same exit_price)
+            // NOTE: exit_price is PER-SHARE, need to convert to dollars
             const exitPrices = groupLegs
               .map(l => Number(l.exit_price) || 0)
               .filter(ep => ep > 0.001);
@@ -959,28 +990,33 @@ export const tradeJournal = {
               const isComboNetPrice = (maxExit - minExit) < 0.005; // All within 0.5 cents = duplicated combo price
 
               if (isComboNetPrice && groupLegs.length >= 4) {
-                // Duplicated combo net close price - use the common value
-                computedExitDebit = exitPrices[0];
-                exitDebitSource = 'comboExitPriceRepeated';
-                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: detected duplicated combo exit_price=${computedExitDebit.toFixed(4)}`);
+                // Duplicated combo net close price - convert per-share to dollars
+                const comboNetPerShare = exitPrices[0];
+                computedExitDebit = comboNetPerShare * contracts * 100;
+                exitDebitSource = 'comboExitPrice_dollars';
+                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: combo exit_price=${comboNetPerShare.toFixed(4)} → $${computedExitDebit.toFixed(2)}`);
               } else if (inference.success && inference.netExitDebit != null && Math.abs(inference.netExitDebit) > 0.001) {
-                // Priority 3: Per-leg netting from inference (only if result is non-zero)
-                computedExitDebit = inference.netExitDebit;
-                exitDebitSource = 'perLegNet';
-                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using per-leg net exit_debit=${computedExitDebit.toFixed(4)}`);
+                // Priority 3: Per-leg netting from inference - convert per-share to dollars
+                const inferredExitPerShare = inference.netExitDebit;
+                computedExitDebit = inferredExitPerShare * contracts * 100;
+                exitDebitSource = 'perLegNet_dollars';
+                console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: inferred exit_debit=${inferredExitPerShare.toFixed(4)} → $${computedExitDebit.toFixed(2)}`);
               } else if (!isComboNetPrice) {
-                // Exit prices differ but inference gave 0 - likely per-leg netting is correct
-                computedExitDebit = inference.netExitDebit ?? 0;
-                exitDebitSource = 'perLegNet';
+                // Exit prices differ but inference gave 0 - per-leg netting might give 0 (e.g., expired worthless)
+                const inferredExitPerShare = inference.netExitDebit ?? 0;
+                computedExitDebit = inferredExitPerShare * contracts * 100;
+                exitDebitSource = 'perLegNet_dollars';
               } else {
-                // 2-3 leg spread with identical exit prices - use as combo price
-                computedExitDebit = exitPrices[0];
-                exitDebitSource = 'comboExitPrice';
+                // 2-3 leg spread with identical exit prices - convert per-share to dollars
+                const comboNetPerShare = exitPrices[0];
+                computedExitDebit = comboNetPerShare * contracts * 100;
+                exitDebitSource = 'comboExitPrice_dollars';
               }
             } else {
-              // Priority 4: Fallback to primary leg's exit_price
-              computedExitDebit = Number(primaryLeg.exit_price) || 0;
-              exitDebitSource = 'fallbackPrimaryExitPrice';
+              // Priority 4: Fallback to primary leg's exit_price - convert per-share to dollars
+              const exitPricePerShare = Number(primaryLeg.exit_price) || 0;
+              computedExitDebit = exitPricePerShare * contracts * 100;
+              exitDebitSource = 'fallbackPrimaryExitPrice_dollars';
             }
           }
 
@@ -1173,6 +1209,29 @@ export const tradeJournal = {
         } else {
           updated++;
         }
+      }
+
+      // === DIAGNOSTIC: Capture after-state and log summary ===
+      const { data: afterTrades } = await supabase.from('trades').select('pnl, trade_group_id');
+      let totalAfterPnl = 0;
+      const afterPnlByGroup = new Map<string, number>();
+      for (const row of afterTrades || []) {
+        const pnl = Number(row.pnl) || 0;
+        if (row.trade_group_id) {
+          const existing = afterPnlByGroup.get(row.trade_group_id) || 0;
+          afterPnlByGroup.set(row.trade_group_id, existing + pnl);
+        } else {
+          totalAfterPnl += pnl;
+        }
+      }
+      for (const groupPnl of afterPnlByGroup.values()) {
+        totalAfterPnl += groupPnl;
+      }
+      const delta = totalAfterPnl - totalBeforePnl;
+      console.log(`[recompute] === RECOMPUTE COMPLETE === Total P&L after: $${totalAfterPnl.toFixed(2)}, delta: $${delta.toFixed(2)}`);
+      console.log(`[recompute] Stats: updated=${updated}, skipped=${skipped}, sanitized=${sanitized}, finalized=${finalized}, errors=${errors.length}`);
+      if (Math.abs(delta) > 100) {
+        console.warn(`[recompute] WARNING: Large P&L delta detected ($${delta.toFixed(2)}). Review may be needed.`);
       }
 
       return { success: true, updated, skipped, sanitized, finalized, errors };
@@ -1447,9 +1506,9 @@ export const tradeJournal = {
           hasAllLegFills = false;
         }
 
-        // Get entry_credit_dollars from stored value
-        const entryCredit = Number(primaryLeg.entry_credit) || 0;
-        const entryCreditDollars = entryCredit * contracts * 100;
+        // IMPORTANT: entry_credit is stored in DOLLARS by strategy-engine (avgFill × qty × 100)
+        // DO NOT multiply again - it's already in dollars!
+        const entryCreditDollars = Number(primaryLeg.entry_credit) || 0;
 
         // Build leg infos with exit prices for inference
         // For combo orders, avgFillPrice is net debit - but we may also have per-leg fills
@@ -1462,27 +1521,27 @@ export const tradeJournal = {
         // PHASE 3: Infer leg sides and compute entry_credit and exit_debit
         const inference = inferLegSides(legInfos, strategyType);
         let inferredLegs: InferredLeg[] = [];
-        let netEntryCredit = Number(primaryLeg.entry_credit) || 0;
-        let netExitDebit = Math.abs(details.avgFillPrice); // Combo net exit debit from Tradier
+
+        // IMPORTANT: details.avgFillPrice from Tradier is PER-SHARE, need to convert to dollars
+        const tradierExitPricePerShare = Math.abs(details.avgFillPrice);
+        let netExitDebitDollars = tradierExitPricePerShare * contracts * 100;
+        let netEntryCreditDollars = entryCreditDollars; // Already in dollars
 
         if (inference.success) {
           inferredLegs = inference.legs;
 
-          // Check if stored entry_credit needs correction
-          const diff = Math.abs(netEntryCredit - inference.netEntryCredit);
-          if (diff > 0.005 || netEntryCredit === 0) {
-            console.log(`[updateCloseStatus] Entry credit correction: ${netEntryCredit.toFixed(4)} → ${inference.netEntryCredit.toFixed(4)}`);
-            netEntryCredit = inference.netEntryCredit;
+          // Only use inference for entry credit if stored value is missing
+          if (netEntryCreditDollars === 0) {
+            const inferredEntryCreditDollars = inference.netEntryCredit * contracts * 100;
+            console.log(`[updateCloseStatus] Entry credit from inference: $${inferredEntryCreditDollars.toFixed(2)}`);
+            netEntryCreditDollars = inferredEntryCreditDollars;
           }
 
-          // If we have per-leg exit prices, compute exit_debit from inferred sides
-          if (inference.netExitDebit != null) {
-            const computedDiff = Math.abs(netExitDebit - inference.netExitDebit);
-            // Use computed if significantly different or if Tradier price is 0
-            if (computedDiff > 0.01 && netExitDebit === 0) {
-              console.log(`[updateCloseStatus] Exit debit from inference: ${inference.netExitDebit.toFixed(4)}`);
-              netExitDebit = inference.netExitDebit;
-            }
+          // Only use inference for exit debit if Tradier price is missing
+          if (tradierExitPricePerShare === 0 && inference.netExitDebit != null) {
+            const inferredExitDebitDollars = inference.netExitDebit * contracts * 100;
+            console.log(`[updateCloseStatus] Exit debit from inference: $${inferredExitDebitDollars.toFixed(2)}`);
+            netExitDebitDollars = inferredExitDebitDollars;
           }
         }
 
@@ -1493,23 +1552,23 @@ export const tradeJournal = {
 
         // Determine if we can compute P&L from actual fill data
         if (hasAllLegFills && entryCreditDollars > 0 && exitDebitDollars !== 0) {
-          // IMMUTABLE: Use actual fill prices, not inference
+          // IMMUTABLE: Use actual per-leg fill prices
           const finalPnl = entryCreditDollars - exitDebitDollars;
           const finalPnlPercent = entryCreditDollars > 0 ? ((entryCreditDollars - exitDebitDollars) / entryCreditDollars) * 100 : 0;
           groupCalc = {
             pnl: finalPnl,
             pnlPercent: finalPnlPercent,
-            formula: `(${(entryCreditDollars).toFixed(2)} - ${exitDebitDollars.toFixed(2)}) = ${finalPnl.toFixed(2)} [from actual fills]`
+            formula: `$${entryCreditDollars.toFixed(2)} - $${exitDebitDollars.toFixed(2)} = $${finalPnl.toFixed(2)} [from actual fills]`
           };
           groupPnl = finalPnl;
           pnlStatus = 'computed';
           console.log(`[updateCloseStatus] IMMUTABLE P&L from fills: Entry=$${entryCreditDollars.toFixed(2)}, Exit=$${exitDebitDollars.toFixed(2)}, P&L=$${finalPnl.toFixed(2)}`);
-        } else if (netEntryCredit > 0 || netExitDebit > 0) {
-          // Fallback to inference-based calculation
-          groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, fees);
+        } else if (netEntryCreditDollars > 0 || netExitDebitDollars > 0) {
+          // Fallback: use combo order fill price (already converted to dollars)
+          groupCalc = calculateGroupPnl(netEntryCreditDollars, netExitDebitDollars, contracts, 100, fees);
           groupPnl = groupCalc.pnl;
-          pnlStatus = 'computed'; // Mark as computed even from inference
-          console.log(`[updateCloseStatus] Multi-leg combo P&L (inferred): Entry Credit=$${netEntryCredit.toFixed(4)}, Exit Debit=$${netExitDebit.toFixed(4)}, Contracts=${contracts}, P&L=$${groupCalc.pnl.toFixed(2)}`);
+          pnlStatus = 'computed';
+          console.log(`[updateCloseStatus] Combo P&L: Entry=$${netEntryCreditDollars.toFixed(2)}, Exit=$${netExitDebitDollars.toFixed(2)}, P&L=$${groupCalc.pnl.toFixed(2)}`);
         }
 
         // Build side data map from inference (preferred)
@@ -1555,8 +1614,8 @@ export const tradeJournal = {
             close_filled_at: now,
             exit_time: now,
             needs_reconcile: false,
-            // Persist consistent entry_credit on all legs
-            entry_credit: netEntryCredit,
+            // Persist entry_credit in dollars on all legs
+            entry_credit: netEntryCreditDollars,
             // IMMUTABLE P&L tracking
             entry_credit_dollars: entryCreditDollars,
             pnl_status: pnlStatus,
@@ -1565,7 +1624,7 @@ export const tradeJournal = {
 
           // Store exit values only on primary leg
           if (isPrimaryLeg) {
-            updates.exit_debit = netExitDebit;
+            updates.exit_debit = netExitDebitDollars;
             updates.exit_debit_dollars = exitDebitDollars || null;
           }
 
