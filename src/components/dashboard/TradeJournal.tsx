@@ -562,6 +562,8 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
               </div>
               {group.trades.map((leg, idx) => {
                 const legPnl = leg.pnl != null && !leg.needs_reconcile ? leg.pnl : null;
+                // Check if this leg's P&L is included in group total (non-primary legs)
+                const isIncludedInGroupTotal = leg.pnl_formula === 'Included in group total';
                 // Use stable key: prefer id, fallback to unique composite key
                 const legKey = leg.id || `${leg.symbol}-${leg.exit_time}-${leg.quantity}-${idx}`;
                 return (
@@ -575,7 +577,7 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                       <span className="text-muted-foreground">×{leg.quantity}</span>
                       <span className={cn(
                         "text-[9px] px-1 rounded",
-                        leg.open_side?.includes('sell') ? "bg-trading-green/20 text-trading-green" : 
+                        leg.open_side?.includes('sell') ? "bg-trading-green/20 text-trading-green" :
                         leg.open_side ? "bg-bloomberg-amber/20 text-bloomberg-amber" : "bg-muted/20 text-muted-foreground"
                       )}>
                         {leg.open_side || '?'}
@@ -586,9 +588,11 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                     </div>
                     <div className="flex items-center gap-4">
                       <span className="text-muted-foreground">
-                        ${Number(leg.entry_price).toFixed(4)} → {leg.exit_price != null ? `$${Number(leg.exit_price).toFixed(4)}` : '$?'}
+                        ${Number(leg.entry_price).toFixed(4)} → {leg.exit_price != null ? `$${Number(leg.exit_price).toFixed(4)}` : '(combo)'}
                       </span>
-                      {legPnl != null ? (
+                      {isIncludedInGroupTotal ? (
+                        <span className="font-mono text-muted-foreground text-[10px]">in total</span>
+                      ) : legPnl != null ? (
                         <span className={cn(
                           "font-mono",
                           legPnl >= 0 ? "text-trading-green" : "text-panic-red"

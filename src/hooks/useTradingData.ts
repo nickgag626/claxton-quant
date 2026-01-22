@@ -2191,6 +2191,7 @@ export const useTradingData = () => {
                 open_side: tradesInOrder[0]?.open_side,
                 fees: 0,
                 isComboOrder, // Signal to use group P&L calculation
+                legFills: orderStatus.legFills, // Per-leg fill prices for multi-leg orders
               }
             );
             
