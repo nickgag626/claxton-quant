@@ -989,19 +989,39 @@ export const tradeJournal = {
           // All outputs must be in DOLLARS for calculateGroupPnl
 
           // Priority 1: Check if any leg already has a non-zero exit_debit (already in dollars)
-          const existingExitDebits = groupLegs
-            .map(l => Number(l.exit_debit) || 0)
-            .filter(ed => ed > 0.001);
+          // HEURISTIC: Detect if exit_debit is per-share (≈ exit_price) vs dollars
+          const existingExitDebitsWithPrices = groupLegs
+            .map(l => ({ 
+              exitDebit: Number(l.exit_debit) || 0, 
+              exitPrice: Number(l.exit_price) || 0 
+            }))
+            .filter(ed => ed.exitDebit > 0.001);
 
-          if (existingExitDebits.length > 0) {
-            // Use median of existing non-zero exit_debit values (already in dollars)
-            existingExitDebits.sort((a, b) => a - b);
-            const midIdx = Math.floor(existingExitDebits.length / 2);
-            computedExitDebit = existingExitDebits.length % 2 === 0
-              ? (existingExitDebits[midIdx - 1] + existingExitDebits[midIdx]) / 2
-              : existingExitDebits[midIdx];
-            exitDebitSource = 'existingExitDebit_dollars';
-            console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using existing exit_debit=$${computedExitDebit.toFixed(2)}`);
+          if (existingExitDebitsWithPrices.length > 0) {
+            const first = existingExitDebitsWithPrices[0];
+            
+            // CRITICAL FIX: Detect per-share values stored in exit_debit column
+            // If exit_debit is very close to exit_price, it's likely per-share not dollars
+            // Dollar values would be ~100x larger than per-share values
+            const isLikelyPerShare = first.exitPrice > 0.01 && 
+              first.exitDebit < 50 && // Dollar values for condors typically > $50
+              Math.abs(first.exitDebit - first.exitPrice) / Math.max(first.exitPrice, 0.01) < 0.5;
+            
+            if (isLikelyPerShare) {
+              // Convert per-share net combo price to dollars
+              computedExitDebit = first.exitDebit * contracts * 100;
+              exitDebitSource = 'existingExitDebit_convertedToDollars';
+              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: CONVERTED per-share exit_debit=${first.exitDebit.toFixed(4)} → $${computedExitDebit.toFixed(2)}`);
+            } else {
+              // Already in dollars - use median of existing non-zero exit_debit values
+              const debits = existingExitDebitsWithPrices.map(e => e.exitDebit).sort((a, b) => a - b);
+              const midIdx = Math.floor(debits.length / 2);
+              computedExitDebit = debits.length % 2 === 0
+                ? (debits[midIdx - 1] + debits[midIdx]) / 2
+                : debits[midIdx];
+              exitDebitSource = 'existingExitDebit_dollars';
+              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: using existing exit_debit=$${computedExitDebit.toFixed(2)}`);
+            }
           } else {
             // Priority 2: Check if exit_price is duplicated combo net price (all legs have same exit_price)
             // NOTE: exit_price is PER-SHARE, need to convert to dollars
