@@ -238,11 +238,9 @@ export type Database = {
           close_submitted_at: string | null
           created_at: string
           entry_credit: number | null
-          entry_credit_dollars: number | null
           entry_price: number
           entry_time: string
           exit_debit: number | null
-          exit_debit_dollars: number | null
           exit_price: number | null
           exit_reason: string | null
           exit_time: string
@@ -254,10 +252,8 @@ export type Database = {
           open_order_id: string | null
           open_side: string | null
           pnl: number | null
-          pnl_computed_at: string | null
           pnl_formula: string | null
           pnl_percent: number | null
-          pnl_status: string | null
           quantity: number
           strategy_name: string | null
           strategy_type: string | null
@@ -276,11 +272,9 @@ export type Database = {
           close_submitted_at?: string | null
           created_at?: string
           entry_credit?: number | null
-          entry_credit_dollars?: number | null
           entry_price: number
           entry_time: string
           exit_debit?: number | null
-          exit_debit_dollars?: number | null
           exit_price?: number | null
           exit_reason?: string | null
           exit_time?: string
@@ -292,10 +286,8 @@ export type Database = {
           open_order_id?: string | null
           open_side?: string | null
           pnl?: number | null
-          pnl_computed_at?: string | null
           pnl_formula?: string | null
           pnl_percent?: number | null
-          pnl_status?: string | null
           quantity: number
           strategy_name?: string | null
           strategy_type?: string | null
@@ -314,11 +306,9 @@ export type Database = {
           close_submitted_at?: string | null
           created_at?: string
           entry_credit?: number | null
-          entry_credit_dollars?: number | null
           entry_price?: number
           entry_time?: string
           exit_debit?: number | null
-          exit_debit_dollars?: number | null
           exit_price?: number | null
           exit_reason?: string | null
           exit_time?: string
@@ -330,10 +320,8 @@ export type Database = {
           open_order_id?: string | null
           open_side?: string | null
           pnl?: number | null
-          pnl_computed_at?: string | null
           pnl_formula?: string | null
           pnl_percent?: number | null
-          pnl_status?: string | null
           quantity?: number
           strategy_name?: string | null
           strategy_type?: string | null

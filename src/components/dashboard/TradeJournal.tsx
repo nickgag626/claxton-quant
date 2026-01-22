@@ -532,7 +532,7 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
           ) : pnlDisplay != null ? (
             <span className="flex items-center justify-end gap-1">
               {pnlDisplay >= 0 ? '+' : ''}${Number(pnlDisplay).toFixed(2)}
-              {isPnlFinal && <CheckCircle className="h-3 w-3 text-trading-green/60" title="Computed from fills" />}
+              {isPnlFinal && <CheckCircle className="h-3 w-3 text-trading-green/60" />}
             </span>
           ) : '--'}
         </TableCell>
