@@ -1013,7 +1013,11 @@ export const tradeJournal = {
               computedEntryCredit > 10 &&
               first.exitDebit < (computedEntryCredit * 0.1); // exit_debit is < 10% of entry_credit
 
-            const isLikelyPerShare = isLikelyPerShareByPrice || isLikelyPerShareByRatio;
+            // CRITICAL FIX #1c: For small premium trades, detect per-share by absolute threshold
+            // Any exit_debit between $0.01 and $1 is almost certainly per-share (real dollar costs are > $1)
+            const isLikelyPerShareByAbsolute = first.exitDebit > 0.01 && first.exitDebit < 1;
+
+            const isLikelyPerShare = isLikelyPerShareByPrice || isLikelyPerShareByRatio || isLikelyPerShareByAbsolute;
             
             // CRITICAL FIX #2: Detect if exit_debit = exit_price × 100 × leg_count (incorrectly summed per-leg)
             // This happens when broker returns per-leg prices and they get summed instead of netted

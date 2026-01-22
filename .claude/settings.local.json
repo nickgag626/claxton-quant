@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run build:*)",
+      "Bash(npx vite build)",
+      "Bash(./node_modules/.bin/tsc:*)",
+      "Bash(winget install:*)",
+      "Bash(git push:*)",
+      "Bash(grep:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(xargs:*)",
+      "Bash(git pull:*)",
+      "Bash(npm install)",
+      "Bash(npm test:*)",
+      "Bash(npm run:*)",
+      "Bash(npx vitest:*)",
+      "Bash(npx supabase db execute --db-url \"$SUPABASE_DB_URL\" --sql \"\nINSERT INTO public.strategies \\(\n  name,\n  type,\n  underlying,\n  enabled,\n  max_positions,\n  position_size,\n  entry_conditions,\n  exit_conditions\n\\) VALUES \\(\n  ''Higher-Conviction 0DTE IC \\(SPX\\)'',\n  ''iron_condor'',\n  ''SPX'',\n  true,\n  3,\n  1,\n  ''{\n    \"\"minDte\"\": 0,\n    \"\"maxDte\"\": 0,\n    \"\"shortDeltaTarget\"\": 0.08,\n    \"\"longDeltaTarget\"\": 0.04,\n    \"\"minPremium\"\": 0.50,\n    \"\"marketHoursOnly\"\": true,\n    \"\"startTime\"\": \"\"09:45\"\",\n    \"\"endTime\"\": \"\"15:00\"\",\n    \"\"minWingWidthPoints\"\": 5,\n    \"\"maxBidAskSpreadPerLegPercent\"\": 15,\n    \"\"minEntryCreditDollars\"\": 50,\n    \"\"sizing\"\": {\n      \"\"mode\"\": \"\"risk\"\",\n      \"\"riskPerTrade\"\": 500,\n      \"\"maxContracts\"\": 5,\n      \"\"minContractsOnRisk\"\": 1\n    }\n  }''::jsonb,\n  ''{\n    \"\"profitTargetPercent\"\": 50,\n    \"\"stopLossPercent\"\": 100,\n    \"\"exitTriggerMode\"\": \"\"either\"\"\n  }''::jsonb\n\\)\nRETURNING id, name, enabled;\n\")",
+      "Bash(curl:*)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(npx supabase functions lint:*)",
+      "Bash(npx deno check:*)",
+      "Bash(npx supabase login)",
+      "Bash(git stash:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh auth login:*)",
+      "Bash(npx supabase:*)",
+      "Bash(node -e \"\n\\(async \\(\\) => {\n  const res = await fetch\\(''https://tlilzsovehqryoyywean.supabase.co/rest/v1/decision_trace?select=*&order=timestamp.desc&limit=10'', {\n    headers: {\n      ''apikey'': ''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsaWx6c292ZWhxcnlveXl3ZWFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3MjEwOTQsImV4cCI6MjA4MzI5NzA5NH0.H9ke0r2KVKr0EVkk7xADf-tqkQPqpq1EJX5WP5ndEwo'',\n      ''Authorization'': ''Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRsaWx6c292ZWhxcnlveXl3ZWFuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3MjEwOTQsImV4cCI6MjA4MzI5NzA5NH0.H9ke0r2KVKr0EVkk7xADf-tqkQPqpq1EJX5WP5ndEwo''\n    }\n  }\\);\n  const text = await res.text\\(\\);\n  console.log\\(''Response:'', text.slice\\(0, 2000\\)\\);\n}\\)\\(\\);\n\")",
+      "Bash(node:*)"
+    ]
+  }
+}
