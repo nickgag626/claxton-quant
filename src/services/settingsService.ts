@@ -38,6 +38,13 @@ export const settingsService = {
 
   // Save a new strategy
   async addStrategy(strategy: Omit<Strategy, 'id'>): Promise<Strategy | null> {
+    // Include sizing and trackedLegs in entry_conditions for the engine to read
+    const entryConditionsWithExtras = {
+      ...strategy.entryConditions,
+      sizing: strategy.sizing,
+      trackedLegs: strategy.trackedLegs,
+    };
+
     const { data, error } = await supabase
       .from('strategies')
       .insert({
@@ -47,7 +54,7 @@ export const settingsService = {
         enabled: strategy.enabled,
         max_positions: strategy.maxPositions,
         position_size: strategy.positionSize,
-        entry_conditions: strategy.entryConditions as unknown as Json,
+        entry_conditions: entryConditionsWithExtras as unknown as Json,
         exit_conditions: strategy.exitConditions as unknown as Json,
       })
       .select()
@@ -89,6 +96,13 @@ export const settingsService = {
 
   // Update a strategy
   async updateStrategy(strategyId: string, strategy: Omit<Strategy, 'id'>): Promise<Strategy | null> {
+    // Include sizing and trackedLegs in entry_conditions for the engine to read
+    const entryConditionsWithExtras = {
+      ...strategy.entryConditions,
+      sizing: strategy.sizing,
+      trackedLegs: strategy.trackedLegs,
+    };
+
     const { data, error } = await supabase
       .from('strategies')
       .update({
@@ -98,7 +112,7 @@ export const settingsService = {
         enabled: strategy.enabled,
         max_positions: strategy.maxPositions,
         position_size: strategy.positionSize,
-        entry_conditions: strategy.entryConditions as unknown as Json,
+        entry_conditions: entryConditionsWithExtras as unknown as Json,
         exit_conditions: strategy.exitConditions as unknown as Json,
         updated_at: new Date().toISOString(),
       })
