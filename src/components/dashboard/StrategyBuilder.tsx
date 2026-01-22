@@ -12,17 +12,18 @@ import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
-import type { 
-  Strategy, 
-  StrategyType, 
-  EntryConditions, 
-  ExitConditions, 
-  TrackedLeg, 
+import type {
+  Strategy,
+  StrategyType,
+  EntryConditions,
+  ExitConditions,
+  TrackedLeg,
   TrackedLegRole,
   StrategySizing,
   MAFilter,
   MAFilterRule,
-  TrailingStopConfig 
+  TrailingStopConfig,
+  ExitTriggerMode
 } from '@/types/trading';
 
 interface StrategyBuilderProps {
@@ -52,6 +53,28 @@ const STRATEGY_PRESETS = {
     profitTarget: 50,
     stopLoss: 100,
     sizing: { mode: 'fixed' as const, fixedContracts: 1 },
+    legs: [
+      { optionType: 'put', side: 'buy', strikeOffset: -10, quantity: 1 },
+      { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
+      { optionType: 'call', side: 'sell', strikeOffset: 0, quantity: 1 },
+      { optionType: 'call', side: 'buy', strikeOffset: 10, quantity: 1 },
+    ],
+  },
+  'Higher-Conviction 0DTE IC (SPX)': {
+    type: 'iron_condor' as StrategyType,
+    underlying: 'SPX',
+    dte: 0,
+    shortDeltaTarget: 0.08, // Tighter delta for quality
+    longDeltaTarget: 0.04,
+    wingWidth: 10,
+    minPremium: 0.50, // Per-contract backup filter
+    profitTarget: 50,
+    stopLoss: 100, // 1x credit
+    sizing: { mode: 'risk' as const, riskPerTrade: 500, maxContracts: 5 },
+    // Higher-conviction filters (set via advanced entry controls):
+    // minWingWidthPoints: 5
+    // maxBidAskSpreadPerLegPercent: 15
+    // minEntryCreditDollars: 50
     legs: [
       { optionType: 'put', side: 'buy', strikeOffset: -10, quantity: 1 },
       { optionType: 'put', side: 'sell', strikeOffset: 0, quantity: 1 },
@@ -267,6 +290,16 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
   const [sizingMode, setSizingMode] = useState<'fixed' | 'risk'>('fixed');
   const [riskPerTrade, setRiskPerTrade] = useState(100);
   const [maxContracts, setMaxContracts] = useState(10);
+
+  // Advanced entry filters
+  const [minWingWidthPoints, setMinWingWidthPoints] = useState<number>(5);
+  const [maxBidAskSpreadPerLegPercent, setMaxBidAskSpreadPerLegPercent] = useState<number>(15);
+  const [minEntryCreditDollars, setMinEntryCreditDollars] = useState<number>(0);
+
+  // Advanced exit controls
+  const [profitTargetDollars, setProfitTargetDollars] = useState<number | undefined>(undefined);
+  const [stopLossDollars, setStopLossDollars] = useState<number | undefined>(undefined);
+  const [exitTriggerMode, setExitTriggerMode] = useState<'percent_only' | 'dollars_only' | 'both_required' | 'either'>('either');
   
   // Custom legs
   const [customLegs, setCustomLegs] = useState<StrategyLeg[]>([]);
@@ -324,7 +357,17 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
       setTrailingStopActivation(exit.trailingStop.activationProfit);
       setTrailingStopBasis(exit.trailingStop.basis ?? 'group');
     }
-    
+
+    // Advanced entry filters
+    setMinWingWidthPoints(entry.minWingWidthPoints ?? 5);
+    setMaxBidAskSpreadPerLegPercent(entry.maxBidAskSpreadPerLegPercent ?? 15);
+    setMinEntryCreditDollars(entry.minEntryCreditDollars ?? 0);
+
+    // Advanced exit controls
+    setProfitTargetDollars(exit.profitTargetDollars);
+    setStopLossDollars(exit.stopLossDollars);
+    setExitTriggerMode(exit.exitTriggerMode ?? 'either');
+
     // Sizing
     if (sizing) {
       setSizingMode(sizing.mode);
@@ -479,6 +522,10 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
       startTime: marketHoursOnly ? startTime : undefined,
       endTime: marketHoursOnly ? endTime : undefined,
       maFilter: useMaFilter ? maFilter : undefined,
+      // Advanced entry filters
+      minWingWidthPoints: minWingWidthPoints > 0 ? minWingWidthPoints : undefined,
+      maxBidAskSpreadPerLegPercent: maxBidAskSpreadPerLegPercent > 0 ? maxBidAskSpreadPerLegPercent : undefined,
+      minEntryCreditDollars: minEntryCreditDollars > 0 ? minEntryCreditDollars : undefined,
     };
 
     const trailingStopConfig: TrailingStopConfig | undefined = useTrailingStop ? {
@@ -495,6 +542,10 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
       timeStopDte,
       timeStopTime: is0dte ? timeStopTime : undefined,
       trailingStop: trailingStopConfig,
+      // Advanced exit controls
+      profitTargetDollars,
+      stopLossDollars,
+      exitTriggerMode: exitTriggerMode !== 'either' ? exitTriggerMode : undefined,
     };
 
     const sizing: StrategySizing = sizingMode === 'fixed' 
@@ -911,6 +962,61 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
               )}
             </div>
 
+            {/* Advanced Entry Controls */}
+            <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
+              <Label className="text-xs text-bloomberg-amber font-medium flex items-center gap-1">
+                Advanced Entry Filters
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <Info className="w-3 h-3 text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="text-xs">Higher-conviction entry requirements for quality trades</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </Label>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Min Wing Width (pts)</Label>
+                  <Input
+                    type="number"
+                    value={minWingWidthPoints}
+                    onChange={(e) => setMinWingWidthPoints(parseInt(e.target.value) || 0)}
+                    min={0}
+                    max={100}
+                    className="bg-secondary/50 border-border text-xs h-8"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Max Leg Spread (%)</Label>
+                  <Input
+                    type="number"
+                    value={maxBidAskSpreadPerLegPercent}
+                    onChange={(e) => setMaxBidAskSpreadPerLegPercent(parseInt(e.target.value) || 0)}
+                    min={0}
+                    max={50}
+                    className="bg-secondary/50 border-border text-xs h-8"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Min Entry Credit ($)</Label>
+                  <Input
+                    type="number"
+                    value={minEntryCreditDollars}
+                    onChange={(e) => setMinEntryCreditDollars(parseInt(e.target.value) || 0)}
+                    min={0}
+                    step={10}
+                    className="bg-secondary/50 border-border text-xs h-8"
+                  />
+                </div>
+              </div>
+              <div className="text-[10px] text-muted-foreground italic">
+                Set to 0 to disable filter. Wing width prevents degenerate 1-wide structures.
+              </div>
+            </div>
+
             {/* Tracked Legs */}
             {trackedLegs.length > 0 && (
               <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
@@ -1072,6 +1178,66 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
                     </div>
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Advanced Exit Controls */}
+            <div className="space-y-3 p-3 bg-secondary/20 rounded-md">
+              <Label className="text-xs text-bloomberg-amber font-medium flex items-center gap-1">
+                Dollar-Based Exits
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <Info className="w-3 h-3 text-muted-foreground" />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="text-xs">Set fixed dollar profit/loss targets in addition to percentages</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              </Label>
+              <div className="grid grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Exit Trigger Mode</Label>
+                  <Select value={exitTriggerMode} onValueChange={(v) => setExitTriggerMode(v as ExitTriggerMode)}>
+                    <SelectTrigger className="bg-secondary/50 border-border text-xs h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="either">Either (default)</SelectItem>
+                      <SelectItem value="percent_only">Percent Only</SelectItem>
+                      <SelectItem value="dollars_only">Dollars Only</SelectItem>
+                      <SelectItem value="both_required">Both Required</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Profit Target ($)</Label>
+                  <Input
+                    type="number"
+                    value={profitTargetDollars ?? ''}
+                    onChange={(e) => setProfitTargetDollars(e.target.value ? parseInt(e.target.value) : undefined)}
+                    placeholder="n/a"
+                    min={0}
+                    step={10}
+                    className="bg-secondary/50 border-border text-xs h-8"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] text-muted-foreground">Stop Loss ($)</Label>
+                  <Input
+                    type="number"
+                    value={stopLossDollars ?? ''}
+                    onChange={(e) => setStopLossDollars(e.target.value ? parseInt(e.target.value) : undefined)}
+                    placeholder="n/a"
+                    min={0}
+                    step={10}
+                    className="bg-secondary/50 border-border text-xs h-8"
+                  />
+                </div>
+              </div>
+              <div className="text-[10px] text-muted-foreground italic">
+                "Either" triggers exit when any threshold is met. "Both Required" requires both % and $ thresholds.
               </div>
             </div>
           </div>

@@ -95,6 +95,8 @@ export interface StrategySizing {
   fixedContracts?: number;
   riskPerTrade?: number;
   maxContracts?: number;
+  maxTotalRiskDollars?: number;  // Portfolio risk cap
+  minContractsOnRisk?: number;   // Floor (default: 1)
 }
 
 export interface MAFilterRule {
@@ -127,6 +129,10 @@ export interface EntryConditions {
   endTime?: string;
   // Moving average filter
   maFilter?: MAFilter;
+  // Higher-conviction entry filters
+  minWingWidthPoints?: number;           // Min spread width (default: 5)
+  maxBidAskSpreadPerLegPercent?: number; // Per-leg liquidity (default: 15%)
+  minEntryCreditDollars?: number;        // Dollar minimum (e.g., $50)
 }
 
 export interface TrailingStopConfig {
@@ -137,6 +143,8 @@ export interface TrailingStopConfig {
   basis: 'group' | 'tracked_legs' | 'short_legs';
 }
 
+export type ExitTriggerMode = 'percent_only' | 'dollars_only' | 'both_required' | 'either';
+
 export interface ExitConditions {
   profitTargetPercent: number;
   stopLossPercent: number;
@@ -145,6 +153,10 @@ export interface ExitConditions {
   /** @deprecated Use trailingStop object instead */
   trailingStopPercent?: number;
   trailingStop?: TrailingStopConfig;
+  // Dollar-based exits
+  profitTargetDollars?: number;
+  stopLossDollars?: number;
+  exitTriggerMode?: ExitTriggerMode;
 }
 
 export interface RiskStatus {
@@ -163,6 +175,8 @@ export interface TradeSafeguards {
   zeroDteCloseBufferMinutes: number;  // 15-60, default 30
   fillPriceBufferPercent: number;  // 0-10%, default 2%
   maxCondorsPerExpiry: number;  // Max stacked condors per underlying+expiry, default 3
+  maxDailyLossDollars?: number;       // Configurable (was hardcoded $1000)
+  maxConsecutiveRejections?: number;  // Default: 5
 }
 
 export interface Trade {
