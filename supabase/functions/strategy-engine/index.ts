@@ -2099,6 +2099,190 @@ async function saveEvaluation(
   }
 }
 
+/**
+ * Reconcile stale close orders that have close_status='submitted' but no fill data.
+ * This handles cases where the browser tab was closed after submitting a close order
+ * before the fill could be recorded.
+ *
+ * For each stale order:
+ * - If filled: update close_status, exit_price, exit_debit, compute P&L
+ * - If still pending after timeout: mark as 'timeout_unknown'
+ */
+async function reconcileStaleCloseOrders(supabaseClient: any): Promise<{ reconciled: number; timedOut: number; errors: string[] }> {
+  const STALE_THRESHOLD_MS = 30 * 1000; // 30 seconds
+  const TIMEOUT_THRESHOLD_MS = 120 * 1000; // 2 minutes
+
+  const result = { reconciled: 0, timedOut: 0, errors: [] as string[] };
+
+  try {
+    // Get trades with close_status='submitted' and a close_order_id
+    const { data: staleTrades, error } = await supabaseClient
+      .from('trades')
+      .select('*')
+      .eq('close_status', 'submitted')
+      .not('close_order_id', 'is', null);
+
+    if (error) {
+      console.error('[RECONCILE] Error fetching stale trades:', error);
+      result.errors.push(`DB error: ${error.message}`);
+      return result;
+    }
+
+    if (!staleTrades?.length) {
+      return result;
+    }
+
+    console.log(`[RECONCILE] Found ${staleTrades.length} trades with close_status='submitted'`);
+
+    // Group trades by close_order_id (multi-leg orders share the same order ID)
+    const orderGroups = new Map<string, any[]>();
+    for (const trade of staleTrades) {
+      const orderId = trade.close_order_id;
+      if (!orderId) continue;
+
+      const submittedAt = trade.close_submitted_at
+        ? new Date(trade.close_submitted_at).getTime()
+        : Date.now() - TIMEOUT_THRESHOLD_MS; // Treat missing timestamp as very old
+      const elapsed = Date.now() - submittedAt;
+
+      if (elapsed < STALE_THRESHOLD_MS) {
+        continue; // Not stale yet
+      }
+
+      const existing = orderGroups.get(orderId) || [];
+      existing.push({ ...trade, elapsed });
+      orderGroups.set(orderId, existing);
+    }
+
+    if (orderGroups.size === 0) {
+      return result;
+    }
+
+    console.log(`[RECONCILE] Processing ${orderGroups.size} stale order group(s)`);
+
+    // Query Tradier for each stale order
+    for (const [orderId, trades] of orderGroups) {
+      const elapsed = trades[0].elapsed;
+      const tradeGroupId = trades[0].trade_group_id;
+
+      try {
+        // Call tradier-api to get order status
+        const supabaseUrl = Deno.env.get('SUPABASE_URL');
+        const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+        const resp = await fetch(`${supabaseUrl}/functions/v1/tradier-api`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${serviceKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ action: 'order_status', orderId }),
+        });
+
+        if (!resp.ok) {
+          console.error(`[RECONCILE] Failed to fetch order status for ${orderId}: ${resp.status}`);
+          result.errors.push(`Order ${orderId}: HTTP ${resp.status}`);
+          continue;
+        }
+
+        const orderStatus = await resp.json();
+        console.log(`[RECONCILE] Order ${orderId} status:`, orderStatus.closeStatus, `elapsed: ${Math.round(elapsed/1000)}s`);
+
+        if (orderStatus.closeStatus === 'filled') {
+          // Order is filled - update all legs with fill data
+          const legFills = orderStatus.legFills || {};
+
+          for (const trade of trades) {
+            // Get per-leg fill price if available, otherwise use order-level average
+            const legFill = legFills[trade.symbol];
+            const exitPrice = legFill?.avgFillPrice ?? orderStatus.avgFillPrice ?? null;
+
+            // Calculate exit_debit: for credit spreads, this is cost to close
+            // exit_debit = exit_price * quantity * 100 (per contract multiplier)
+            const quantity = Math.abs(trade.quantity || 1);
+            const exitDebit = exitPrice != null ? exitPrice * quantity * 100 : null;
+
+            // Calculate P&L: entry_credit - exit_debit
+            // For credit strategies: positive credit at entry, positive debit at exit
+            // P&L = credit received - debit paid to close
+            const entryCredit = trade.entry_credit ?? 0;
+            const pnl = exitDebit != null ? entryCredit - exitDebit : null;
+
+            // Update the trade record
+            const { error: updateError } = await supabaseClient
+              .from('trades')
+              .update({
+                close_status: 'filled',
+                exit_price: exitPrice,
+                exit_debit: exitDebit,
+                pnl: pnl,
+                realized_pnl: pnl,
+                exit_time: orderStatus.rawOrder?.transaction_date || new Date().toISOString(),
+              })
+              .eq('id', trade.id);
+
+            if (updateError) {
+              console.error(`[RECONCILE] Error updating trade ${trade.id}:`, updateError);
+              result.errors.push(`Trade ${trade.id}: ${updateError.message}`);
+            } else {
+              console.log(`[RECONCILE] Updated trade ${trade.id} (${trade.symbol}): exit_price=${exitPrice}, pnl=${pnl?.toFixed(2)}`);
+              result.reconciled++;
+            }
+          }
+        } else if (orderStatus.closeStatus === 'rejected' || orderStatus.closeStatus === 'canceled' || orderStatus.closeStatus === 'expired') {
+          // Order failed - update status accordingly
+          for (const trade of trades) {
+            const { error: updateError } = await supabaseClient
+              .from('trades')
+              .update({
+                close_status: orderStatus.closeStatus,
+                exit_reason: orderStatus.rejectReason || `Order ${orderStatus.closeStatus}`,
+              })
+              .eq('id', trade.id);
+
+            if (updateError) {
+              console.error(`[RECONCILE] Error updating failed trade ${trade.id}:`, updateError);
+              result.errors.push(`Trade ${trade.id}: ${updateError.message}`);
+            } else {
+              console.log(`[RECONCILE] Marked trade ${trade.id} as ${orderStatus.closeStatus}: ${orderStatus.rejectReason || ''}`);
+            }
+          }
+        } else if (elapsed > TIMEOUT_THRESHOLD_MS) {
+          // Still pending after timeout - mark as unknown
+          console.warn(`[RECONCILE] Order ${orderId} timed out after ${Math.round(elapsed/1000)}s, marking as timeout_unknown`);
+
+          const { error: updateError } = await supabaseClient
+            .from('trades')
+            .update({ close_status: 'timeout_unknown' })
+            .eq('close_order_id', orderId);
+
+          if (updateError) {
+            console.error(`[RECONCILE] Error marking timeout for order ${orderId}:`, updateError);
+            result.errors.push(`Order ${orderId} timeout: ${updateError.message}`);
+          } else {
+            result.timedOut += trades.length;
+          }
+        }
+        // else: still pending but not timed out yet - leave as is
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[RECONCILE] Exception processing order ${orderId}:`, errMsg);
+        result.errors.push(`Order ${orderId}: ${errMsg}`);
+      }
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : 'Unknown error';
+    console.error('[RECONCILE] Exception:', errMsg);
+    result.errors.push(errMsg);
+  }
+
+  if (result.reconciled > 0 || result.timedOut > 0) {
+    console.log(`[RECONCILE] Complete: ${result.reconciled} reconciled, ${result.timedOut} timed out`);
+  }
+
+  return result;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -3056,6 +3240,14 @@ serve(async (req) => {
     }
 
     if (action === 'check_exits') {
+      // === RECONCILE STALE CLOSE ORDERS FIRST ===
+      // This handles cases where browser tab was closed after submitting close orders
+      // before fill data could be recorded. Must run before processing exits.
+      const reconcileResult = await reconcileStaleCloseOrders(supabase);
+      if (reconcileResult.reconciled > 0 || reconcileResult.timedOut > 0) {
+        console.log(`[CHECK_EXITS] Reconciled ${reconcileResult.reconciled} stale orders, ${reconcileResult.timedOut} timed out`);
+      }
+
       // Check if any positions should be closed
       // CRITICAL: Return group-level exit signals, not per-leg
       const exitSignals: any[] = [];
