@@ -1094,6 +1094,19 @@ export const tradeJournal = {
             continue;
           }
 
+          // Validate we have real exit data (not just zero from missing fills)
+          if (computedExitDebit < 0.01 && exitDebitSource === 'unknown') {
+            console.warn(`[recalculatePnl] Group ${groupId.slice(0, 8)}: Missing exit_debit data (source=unknown), marking for reconcile`);
+            for (const leg of groupLegs) {
+              await supabase.from('trades').update({
+                needs_reconcile: true,
+                pnl_status: 'missing_fills',
+              }).eq('id', leg.id);
+            }
+            skipped += groupLegs.length;
+            continue;
+          }
+
           // Calculate group P&L with corrected values
           const groupCalc = calculateGroupPnl(computedEntryCredit, computedExitDebit, contracts, 100, totalFees);
           // Add source tracing to formula for debugging
@@ -1532,7 +1545,7 @@ export const tradeJournal = {
         if (details?.legFills) {
           for (const trade of typedTrades) {
             const legFill = details.legFills[trade.symbol];
-            if (legFill) {
+            if (legFill && legFill.avgFillPrice > 0) {
               const fillPrice = legFill.avgFillPrice;
               const qty = legFill.filledQty || Math.abs(trade.quantity);
               // For closing: short positions pay to close, long positions receive
@@ -1558,6 +1571,7 @@ export const tradeJournal = {
               }
             } else {
               hasAllLegFills = false;
+              console.warn(`[updateCloseStatus] Missing or zero fill for ${trade.symbol}: legFill=${JSON.stringify(legFill)}`);
             }
           }
         } else {
@@ -1637,8 +1651,12 @@ export const tradeJournal = {
         let pnlStatus: PnlStatus = 'missing_fills';
         const now = new Date().toISOString();
 
-        // Determine if we can compute P&L from actual fill data
-        if (hasAllLegFills && entryCreditDollars > 0 && exitDebitDollars !== 0) {
+        // VALIDATION: Don't compute P&L if exit debit is suspiciously low with missing fills
+        if (netExitDebitDollars < 0.01 && !hasAllLegFills) {
+          console.error(`[updateCloseStatus] Cannot compute P&L: exit_debit is $${netExitDebitDollars.toFixed(2)} with missing leg fills`);
+          pnlStatus = 'missing_fills';
+          // Skip P&L calculation entirely - leave groupCalc as null
+        } else if (hasAllLegFills && entryCreditDollars > 0 && exitDebitDollars !== 0) {
           // IMMUTABLE: Use actual per-leg fill prices
           const finalPnl = entryCreditDollars - exitDebitDollars;
           const finalPnlPercent = entryCreditDollars > 0 ? ((entryCreditDollars - exitDebitDollars) / entryCreditDollars) * 100 : 0;
@@ -1986,6 +2004,96 @@ export const tradeJournal = {
         error: error instanceof Error ? error.message : 'Unknown error' 
       };
     }
+  },
+
+  /**
+   * Recover missing fill data for trades marked as needs_reconcile
+   * Fetches actual fill prices from Tradier order history and updates P&L
+   */
+  async reconcileMissingFills(): Promise<{
+    success: boolean;
+    recovered: number;
+    stillMissing: number;
+    errors: string[];
+  }> {
+    const errors: string[] = [];
+    let recovered = 0;
+    let stillMissing = 0;
+
+    // Get trades with missing fills
+    const { data: trades, error } = await supabase
+      .from('trades')
+      .select('*')
+      .eq('needs_reconcile', true)
+      .eq('pnl_status', 'missing_fills')
+      .not('close_order_id', 'is', null);
+
+    if (error) {
+      return { success: false, recovered: 0, stillMissing: 0, errors: [error.message] };
+    }
+
+    if (!trades || trades.length === 0) {
+      console.log('[reconcileMissingFills] No trades with missing fills found');
+      return { success: true, recovered: 0, stillMissing: 0, errors: [] };
+    }
+
+    // Group by close_order_id
+    const orderIds = [...new Set(trades.map(t => t.close_order_id).filter(Boolean))];
+    console.log(`[reconcileMissingFills] Found ${orderIds.length} orders to reconcile`);
+
+    for (const orderId of orderIds) {
+      try {
+        // Fetch order details from Tradier
+        const { data: orderData, error: fetchError } = await supabase.functions.invoke('tradier-api', {
+          body: { action: 'order_status', orderId },
+        });
+
+        if (fetchError || !orderData?.closeStatus) {
+          errors.push(`Order ${orderId}: Failed to fetch - ${fetchError?.message || 'Unknown error'}`);
+          stillMissing++;
+          continue;
+        }
+
+        if (orderData.closeStatus !== 'filled') {
+          errors.push(`Order ${orderId}: Status is ${orderData.closeStatus}, not filled`);
+          stillMissing++;
+          continue;
+        }
+
+        // Check if we have valid fill data now
+        const hasValidComboPrice = orderData.avgFillPrice && orderData.avgFillPrice > 0.01;
+        const hasLegFills = orderData.legFills && Object.keys(orderData.legFills).length > 0;
+
+        if (!hasValidComboPrice && !hasLegFills) {
+          console.log(`[reconcileMissingFills] Order ${orderId} still missing fill data`);
+          stillMissing++;
+          continue;
+        }
+
+        // Update trades with recovered fill data
+        const result = await this.updateCloseStatus(orderId, 'filled', {
+          avgFillPrice: orderData.avgFillPrice,
+          filledQty: orderData.filledQty,
+          legFills: orderData.legFills,
+          isComboOrder: true,
+        });
+
+        if (result.success) {
+          console.log(`[reconcileMissingFills] Recovered order ${orderId}`);
+          recovered++;
+        } else {
+          errors.push(`Order ${orderId}: Update failed - ${result.error}`);
+          stillMissing++;
+        }
+
+      } catch (err) {
+        errors.push(`Order ${orderId}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        stillMissing++;
+      }
+    }
+
+    console.log(`[reconcileMissingFills] Complete: recovered=${recovered}, stillMissing=${stillMissing}, errors=${errors.length}`);
+    return { success: true, recovered, stillMissing, errors };
   },
 
   /**

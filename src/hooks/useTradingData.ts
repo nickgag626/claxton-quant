@@ -1277,16 +1277,29 @@ export const useTradingData = () => {
 
       console.log('[journalClosedTrade] Saved as submitted:', position.symbol, closeResult.orderId, 'row:', saveResult.id);
 
-      // STEP 2: Immediately check order status with Tradier
-      // Small delay to allow order to process
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // STEP 2: Check order status with Tradier
+      // Increased delay to allow order to process
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
-      const orderStatus = await tradierApi.getOrderStatus(closeResult.orderId);
+      let orderStatus = await tradierApi.getOrderStatus(closeResult.orderId);
       console.log('[journalClosedTrade] Order status:', closeResult.orderId, orderStatus);
 
       if (!orderStatus.success) {
         console.warn('[journalClosedTrade] Could not fetch order status, will retry later:', orderStatus.error);
         return saveResult.id;
+      }
+
+      // Retry if filled but fill data is incomplete
+      if (orderStatus.closeStatus === 'filled') {
+        const hasValidFillPrice = orderStatus.avgFillPrice && orderStatus.avgFillPrice > 0.01;
+        const hasLegFills = orderStatus.legFills && Object.keys(orderStatus.legFills).length > 0;
+
+        if (!hasValidFillPrice && !hasLegFills) {
+          console.warn('[journalClosedTrade] Fill price missing, retrying in 2s...');
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          orderStatus = await tradierApi.getOrderStatus(closeResult.orderId);
+          console.log('[journalClosedTrade] Retry order status:', closeResult.orderId, orderStatus);
+        }
       }
 
       // STEP 3: Update trade based on order status

@@ -466,12 +466,26 @@ serve(async (req) => {
             legFills = {};
             for (const leg of legs) {
               if (leg.option_symbol) {
-                legFills[leg.option_symbol] = {
-                  avgFillPrice: normalizeNumber(leg.avg_fill_price) || 0,
-                  filledQty: normalizeNumber(leg.exec_quantity) || normalizeNumber(leg.quantity) || 0,
-                  side: leg.side || '',
-                };
+                const fillPrice = normalizeNumber(leg.avg_fill_price);
+                // Only store if we have an actual fill price (not null/0)
+                if (fillPrice > 0) {
+                  legFills[leg.option_symbol] = {
+                    avgFillPrice: fillPrice,
+                    filledQty: normalizeNumber(leg.exec_quantity) || normalizeNumber(leg.quantity) || 0,
+                    side: leg.side || '',
+                  };
+                } else {
+                  console.warn('ORDER_STATUS_MISSING_LEG_FILL', {
+                    orderId,
+                    symbol: leg.option_symbol,
+                    rawPrice: leg.avg_fill_price
+                  });
+                }
               }
+            }
+            // If no legs had valid fills, clear legFills so downstream knows data is missing
+            if (Object.keys(legFills).length === 0) {
+              legFills = undefined;
             }
           }
         }
