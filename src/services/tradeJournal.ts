@@ -865,9 +865,37 @@ export const tradeJournal = {
           // PHASE 2: Prefer strike-based inference over position_group_map
           const inference = inferLegSides(legInfos, strategyType);
           let inferredLegs: InferredLeg[] = [];
-          let computedEntryCredit = Number(primaryLeg.entry_credit) || 0;
+
+          // === FIX: Get entry_credit from position_group_map (SOURCE OF TRUTH in DOLLARS) ===
+          // trades.entry_credit may contain per-share values from UI path
+          let computedEntryCredit = 0;
+          let entryCreditSource = 'unknown';
+
+          // First try position_group_map (always in DOLLARS)
+          const { data: groupMapping } = await supabase
+            .from('position_group_map')
+            .select('entry_credit')
+            .eq('trade_group_id', groupId)
+            .limit(1)
+            .maybeSingle();
+
+          if (groupMapping?.entry_credit != null && Number(groupMapping.entry_credit) > 0) {
+            computedEntryCredit = Number(groupMapping.entry_credit);
+            entryCreditSource = 'position_group_map';
+            console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit from position_group_map: $${computedEntryCredit.toFixed(2)}`);
+          } else {
+            // Fallback: only use trades.entry_credit if it looks like dollars (> $50)
+            const storedValue = Number(primaryLeg.entry_credit) || 0;
+            if (storedValue > 50) {
+              computedEntryCredit = storedValue;
+              entryCreditSource = 'stored_dollars';
+              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit from trades (appears to be dollars): $${computedEntryCredit.toFixed(2)}`);
+            } else if (storedValue > 0) {
+              console.warn(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit ${storedValue} appears to be per-share, will use inference`);
+            }
+          }
+
           let computedExitDebit = 0;
-          let entryCreditSource = 'stored';
           let exitDebitSource = 'unknown';
           let pnlStatus: PnlStatus = 'computed';
 
@@ -941,18 +969,15 @@ export const tradeJournal = {
             continue; // Skip inference-based calculation
           }
 
-          // Fallback to inference-based calculation
+          // Fallback to inference-based calculation for entry credit
           if (inference.success) {
             inferredLegs = inference.legs;
 
-            // IMPORTANT: inference.netEntryCredit is PER-SHARE, entry_credit is DOLLARS
-            // Convert inferred per-share to dollars for comparison
+            // IMPORTANT: inference.netEntryCredit is PER-SHARE, need to convert to dollars
             const inferredEntryCreditDollars = inference.netEntryCredit * contracts * 100;
-            const storedEntryCredit = Number(primaryLeg.entry_credit) || 0;
 
-            // Only use inference if stored value is missing/zero
-            // Don't override dollars with per-share values!
-            if (storedEntryCredit === 0 && inferredEntryCreditDollars > 0) {
+            // Use inference if we don't have entry credit yet
+            if (computedEntryCredit === 0 && inferredEntryCreditDollars > 0) {
               console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: entry_credit from inference: $${inferredEntryCreditDollars.toFixed(2)} (${inference.netEntryCredit.toFixed(4)} × ${contracts} × 100)`);
               computedEntryCredit = inferredEntryCreditDollars;
               entryCreditSource = 'inferred_dollars';
@@ -1506,9 +1531,38 @@ export const tradeJournal = {
           hasAllLegFills = false;
         }
 
-        // IMPORTANT: entry_credit is stored in DOLLARS by strategy-engine (avgFill × qty × 100)
-        // DO NOT multiply again - it's already in dollars!
-        const entryCreditDollars = Number(primaryLeg.entry_credit) || 0;
+        // === FIX: Fetch entry_credit from position_group_map (SOURCE OF TRUTH in DOLLARS) ===
+        // The trades.entry_credit may contain per-share values from UI path, which is WRONG.
+        // position_group_map.entry_credit is always in DOLLARS (set by strategy-engine from actual fills).
+        let entryCreditDollars = 0;
+
+        if (primaryLeg.trade_group_id) {
+          const { data: groupMapping } = await supabase
+            .from('position_group_map')
+            .select('entry_credit')
+            .eq('trade_group_id', primaryLeg.trade_group_id)
+            .limit(1)
+            .maybeSingle();
+
+          if (groupMapping?.entry_credit != null) {
+            entryCreditDollars = Number(groupMapping.entry_credit);
+            console.log(`[updateCloseStatus] Entry credit from position_group_map: $${entryCreditDollars.toFixed(2)}`);
+          }
+        }
+
+        // Fallback to trades.entry_credit only if position_group_map lookup failed
+        // AND the value looks like dollars (> $50 suggests it's not per-share)
+        if (entryCreditDollars === 0) {
+          const storedValue = Number(primaryLeg.entry_credit) || 0;
+          // Sanity check: per-share values are typically < $20, dollars are typically > $50
+          // If value is small, it's likely per-share and we should use inference instead
+          if (storedValue > 50) {
+            entryCreditDollars = storedValue;
+            console.log(`[updateCloseStatus] Entry credit from trades table (appears to be dollars): $${entryCreditDollars.toFixed(2)}`);
+          } else if (storedValue > 0) {
+            console.warn(`[updateCloseStatus] Entry credit ${storedValue} appears to be per-share, will use inference`);
+          }
+        }
 
         // Build leg infos with exit prices for inference
         // For combo orders, avgFillPrice is net debit - but we may also have per-leg fills
