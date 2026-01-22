@@ -49,6 +49,7 @@ export const ControlsPanel = ({
   const [editCloseBuffer, setEditCloseBuffer] = useState(safeguards.zeroDteCloseBufferMinutes);
   const [editFillBuffer, setEditFillBuffer] = useState(safeguards.fillPriceBufferPercent);
   const [editMaxCondors, setEditMaxCondors] = useState(safeguards.maxCondorsPerExpiry);
+  const [editMaxConsecutiveRejections, setEditMaxConsecutiveRejections] = useState(safeguards.maxConsecutiveRejections ?? 5);
   const [pingResult, setPingResult] = useState<{ ok: boolean; timestamp?: string; error?: string; details?: any } | null>(null);
   const [isPinging, setIsPinging] = useState(false);
   
@@ -240,6 +241,7 @@ export const ControlsPanel = ({
                 setEditCloseBuffer(safeguards.zeroDteCloseBufferMinutes);
                 setEditFillBuffer(safeguards.fillPriceBufferPercent);
                 setEditMaxCondors(safeguards.maxCondorsPerExpiry);
+                setEditMaxConsecutiveRejections(safeguards.maxConsecutiveRejections ?? 5);
                 setIsEditingSafeguards(true);
               }}
               disabled={isBotRunning}
@@ -349,7 +351,28 @@ export const ControlsPanel = ({
               Multi-condor stacking limit per underlying+expiry
             </div>
           </div>
-          
+
+          {/* Max Consecutive Rejections */}
+          <div>
+            <div className="flex justify-between items-center mb-1">
+              <span>Max Consecutive Rejections:</span>
+              <span className="font-mono text-foreground">{isEditingSafeguards ? editMaxConsecutiveRejections : (safeguards.maxConsecutiveRejections ?? 5)}</span>
+            </div>
+            {isEditingSafeguards && (
+              <Slider
+                value={[editMaxConsecutiveRejections]}
+                onValueChange={(v) => setEditMaxConsecutiveRejections(v[0])}
+                min={1}
+                max={20}
+                step={1}
+                className="w-full"
+              />
+            )}
+            <div className="text-[9px] text-muted-foreground/70">
+              Pause entries after N consecutive rejections
+            </div>
+          </div>
+
           {isEditingSafeguards && (
             <div className="pt-2 flex gap-2">
               <Button
@@ -370,6 +393,7 @@ export const ControlsPanel = ({
                     zeroDteCloseBufferMinutes: editCloseBuffer,
                     fillPriceBufferPercent: editFillBuffer,
                     maxCondorsPerExpiry: editMaxCondors,
+                    maxConsecutiveRejections: editMaxConsecutiveRejections,
                   });
                   setIsEditingSafeguards(false);
                 }}

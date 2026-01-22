@@ -483,6 +483,8 @@ function checkEntryConflicts(
 }
 
 // Types
+type ExitTriggerMode = 'percent_only' | 'dollars_only' | 'both_required' | 'either';
+
 interface Strategy {
   id: string;
   name: string;
@@ -510,6 +512,10 @@ interface Strategy {
       sma200?: boolean;
       rules?: Array<{ left: string; op: string; right: string }>;
     };
+    // Higher-conviction entry filters
+    minWingWidthPoints?: number;
+    maxBidAskSpreadPerLegPercent?: number;
+    minEntryCreditDollars?: number;
   };
   exitConditions: {
     profitTargetPercent: number;
@@ -523,12 +529,18 @@ interface Strategy {
       activationProfit?: number;
       basis?: string;
     };
+    // Dollar-based exits
+    profitTargetDollars?: number;
+    stopLossDollars?: number;
+    exitTriggerMode?: ExitTriggerMode;
   };
   sizing?: {
     mode: 'fixed' | 'risk';
     fixedContracts?: number;
     riskPerTrade?: number;
     maxContracts?: number;
+    maxTotalRiskDollars?: number;
+    minContractsOnRisk?: number;
   };
   trackedLegs?: Array<{
     role: string;
@@ -543,6 +555,8 @@ interface Safeguards {
   zeroDteCloseBufferMinutes: number;
   fillPriceBufferPercent: number;
   maxCondorsPerExpiry: number;
+  maxDailyLossDollars?: number;
+  maxConsecutiveRejections?: number;
 }
 
 interface OptionContract {
@@ -1202,7 +1216,116 @@ async function evaluateStrategyWithTrace(
     hardStop = true;
     hardStopReason = 'premium_filter';
   }
-  
+
+  // GATE 7b: Entry Credit Dollar Minimum (optional)
+  const minEntryCreditDollars = strategy.entryConditions.minEntryCreditDollars;
+  const entryCreditDollarsEnabled = minEntryCreditDollars !== undefined && minEntryCreditDollars > 0;
+  let entryCreditDollarsPass = true;
+  let entryCreditDollarsReason: string | undefined;
+
+  if (!entryCreditDollarsEnabled) {
+    entryCreditDollarsPass = true;
+    entryCreditDollarsReason = 'disabled';
+  } else if (hardStop) {
+    entryCreditDollarsPass = false;
+    entryCreditDollarsReason = `skipped_due_to_${hardStopReason}`;
+  } else {
+    // estimatedCredit is per-contract, multiply by 100 for dollars
+    const estimatedCreditDollars = (estimatedCredit || 0) * 100;
+    if (estimatedCreditDollars < minEntryCreditDollars) {
+      entryCreditDollarsPass = false;
+      entryCreditDollarsReason = `Entry credit $${estimatedCreditDollars.toFixed(0)} below minimum $${minEntryCreditDollars}`;
+    }
+  }
+
+  const entryCreditDollarsGate: Gate = {
+    name: 'Entry Credit Dollar Minimum',
+    expected: entryCreditDollarsEnabled
+      ? `credit ≥ $${minEntryCreditDollars}`
+      : 'disabled',
+    actual: {
+      enabled: entryCreditDollarsEnabled,
+      minEntryCreditDollars: minEntryCreditDollars ?? null,
+      estimatedCreditDollars: (estimatedCredit || 0) * 100,
+    },
+    pass: entryCreditDollarsPass,
+    reason: entryCreditDollarsReason,
+  };
+  gates.push(entryCreditDollarsGate);
+
+  if (!entryCreditDollarsPass && !hardStop && entryCreditDollarsEnabled) {
+    hardStop = true;
+    hardStopReason = 'entry_credit_dollar_minimum';
+  }
+
+  // GATE 7c: Minimum Wing Width (optional)
+  const minWingWidthRequired = strategy.entryConditions.minWingWidthPoints;
+  const wingWidthEnabled = minWingWidthRequired !== undefined && minWingWidthRequired > 0;
+  let wingWidthPass = true;
+  let wingWidthReason: string | undefined;
+  let actualWingWidth = 0;
+  let putWidth = 0;
+  let callWidth = 0;
+
+  if (!wingWidthEnabled) {
+    wingWidthPass = true;
+    wingWidthReason = 'disabled';
+  } else if (hardStop) {
+    wingWidthPass = false;
+    wingWidthReason = `skipped_due_to_${hardStopReason}`;
+  } else if (proposedOrder?.legs) {
+    // Calculate wing widths from proposed order legs
+    const putLegs = proposedOrder.legs.filter((l: any) => l.role?.includes('put'));
+    const callLegs = proposedOrder.legs.filter((l: any) => l.role?.includes('call'));
+
+    if (putLegs.length >= 2) {
+      const putStrikes = putLegs.map((l: any) => l.strike).sort((a: number, b: number) => a - b);
+      putWidth = putStrikes[putStrikes.length - 1] - putStrikes[0];
+    }
+    if (callLegs.length >= 2) {
+      const callStrikes = callLegs.map((l: any) => l.strike).sort((a: number, b: number) => a - b);
+      callWidth = callStrikes[callStrikes.length - 1] - callStrikes[0];
+    }
+
+    // For iron condors, use the minimum wing width
+    // For spreads, use the only available width
+    actualWingWidth = Math.min(
+      putWidth > 0 ? putWidth : Infinity,
+      callWidth > 0 ? callWidth : Infinity
+    );
+    if (actualWingWidth === Infinity) actualWingWidth = 0;
+
+    if (actualWingWidth < minWingWidthRequired) {
+      wingWidthPass = false;
+      wingWidthReason = `Wing width ${actualWingWidth} pts below minimum ${minWingWidthRequired} pts`;
+    }
+  } else {
+    wingWidthPass = false;
+    wingWidthReason = 'No legs available to calculate wing width';
+  }
+
+  const wingWidthGate: Gate = {
+    name: 'Minimum Wing Width',
+    expected: wingWidthEnabled
+      ? `width ≥ ${minWingWidthRequired} pts`
+      : 'disabled',
+    actual: {
+      enabled: wingWidthEnabled,
+      minWingWidthPoints: minWingWidthRequired ?? null,
+      putWidth,
+      callWidth,
+      actualWingWidth,
+    },
+    pass: wingWidthPass,
+    reason: wingWidthReason,
+  };
+  gates.push(wingWidthGate);
+
+  if (!wingWidthPass && !hardStop && wingWidthEnabled) {
+    hardStop = true;
+    hardStopReason = 'min_wing_width';
+  }
+
   // GATE 8: IV Rank Filter (optional)
   const ivEnabled = strategy.entryConditions.minIvRank !== undefined || strategy.entryConditions.maxIvRank !== undefined;
   let ivPass = true;
@@ -1240,7 +1363,8 @@ async function evaluateStrategyWithTrace(
   let sizingPass = true;
   let sizingReason: string | undefined;
   let computedContracts = strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1;
-  
+  const minContractsOnRisk = strategy.sizing?.minContractsOnRisk ?? 1;
+
   if (strategy.sizing?.mode === 'risk' && strategy.sizing.riskPerTrade) {
     const maxLoss = proposedOrder?.estimated_max_loss || 0;
     if (hardStop) {
@@ -1254,26 +1378,39 @@ async function evaluateStrategyWithTrace(
     } else {
       computedContracts = Math.floor(strategy.sizing.riskPerTrade / maxLoss);
       computedContracts = Math.min(computedContracts, strategy.sizing.maxContracts || 10);
-      if (computedContracts < 1) {
+      computedContracts = Math.max(computedContracts, minContractsOnRisk);
+
+      // Check if exceeds maxTotalRiskDollars (portfolio risk cap)
+      if (strategy.sizing.maxTotalRiskDollars) {
+        const totalRisk = computedContracts * maxLoss;
+        if (totalRisk > strategy.sizing.maxTotalRiskDollars) {
+          const cappedContracts = Math.floor(strategy.sizing.maxTotalRiskDollars / maxLoss);
+          computedContracts = Math.max(cappedContracts, minContractsOnRisk);
+        }
+      }
+
+      if (computedContracts < minContractsOnRisk) {
         sizingPass = false;
-        sizingReason = 'Risk sizing resulted in 0 contracts';
+        sizingReason = `Risk sizing resulted in ${computedContracts} contracts (min: ${minContractsOnRisk})`;
       }
     }
   } else if (hardStop) {
     sizingPass = false;
     sizingReason = `skipped_due_to_${hardStopReason}`;
   }
-  
+
   const sizingGate: Gate = {
     name: 'Risk Sizing',
-    expected: strategy.sizing?.mode === 'risk' 
-      ? `risk/trade = $${strategy.sizing.riskPerTrade}, max = ${strategy.sizing.maxContracts || 10}`
+    expected: strategy.sizing?.mode === 'risk'
+      ? `risk/trade = $${strategy.sizing.riskPerTrade}, max = ${strategy.sizing.maxContracts || 10}, min = ${minContractsOnRisk}`
       : `fixed = ${strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1}`,
     actual: {
       mode: strategy.sizing?.mode || 'fixed',
       computed_contracts: computedContracts,
       riskPerTrade: strategy.sizing?.riskPerTrade || null,
       maxContracts: strategy.sizing?.maxContracts || null,
+      minContractsOnRisk,
+      maxTotalRiskDollars: strategy.sizing?.maxTotalRiskDollars || null,
       fixedContracts: strategy.sizing?.fixedContracts ?? strategy.positionSize ?? 1,
       estimated_max_loss: proposedOrder?.estimated_max_loss || null,
     },
@@ -3149,16 +3286,52 @@ serve(async (req) => {
         
         let exitReason: string | null = null;
 
-        // === profit_target: Only trigger on POSITIVE P&L ===
-        if (pnlPercent >= strategy.exitConditions.profitTargetPercent && pnlPercent > 0) {
-          exitReason = 'profit_target';
+        // === Enhanced Exit Logic with Dollar-Based Triggers ===
+        const exitMode = strategy.exitConditions.exitTriggerMode ?? 'either';
+        const profitTargetPercent = strategy.exitConditions.profitTargetPercent;
+        const stopLossPercent = strategy.exitConditions.stopLossPercent;
+        const profitTargetDollars = strategy.exitConditions.profitTargetDollars;
+        const stopLossDollars = strategy.exitConditions.stopLossDollars;
+
+        // Calculate which thresholds are met
+        const profitPercentMet = pnlPercent >= profitTargetPercent && pnlPercent > 0;
+        const profitDollarsMet = profitTargetDollars !== undefined && pnl >= profitTargetDollars;
+        const stopPercentMet = pnlPercent <= -stopLossPercent;
+        const stopDollarsMet = stopLossDollars !== undefined && pnl <= -stopLossDollars;
+
+        // Determine exit reason based on mode
+        if (exitMode === 'both_required') {
+          // Profit: BOTH percent AND dollars must be satisfied
+          if (profitPercentMet && profitDollarsMet) {
+            exitReason = 'profit_target_combined';
+          } else if (stopPercentMet && stopDollarsMet) {
+            exitReason = 'stop_loss_combined';
+          }
+        } else if (exitMode === 'percent_only') {
+          // Only percent thresholds considered
+          if (profitPercentMet) {
+            exitReason = 'profit_target';
+          } else if (stopPercentMet) {
+            exitReason = 'stop_loss';
+          }
+        } else if (exitMode === 'dollars_only') {
+          // Only dollar thresholds considered
+          if (profitDollarsMet) {
+            exitReason = 'profit_target_dollars';
+          } else if (stopDollarsMet) {
+            exitReason = 'stop_loss_dollars';
+          }
+        } else {
+          // 'either' mode (default): trigger if ANY threshold is met
+          if (profitPercentMet || profitDollarsMet) {
+            exitReason = profitPercentMet ? 'profit_target' : 'profit_target_dollars';
+          } else if (stopPercentMet || stopDollarsMet) {
+            exitReason = stopPercentMet ? 'stop_loss' : 'stop_loss_dollars';
+          }
         }
-        // Check stop loss (unchanged)
-        else if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
-          exitReason = 'stop_loss';
-        }
-        // Check time stop (use earliest expiration in group)
-        else if (strategy.exitConditions.timeStopDte) {
+
+        // Check time stop (use earliest expiration in group) - always checked
+        if (!exitReason && strategy.exitConditions.timeStopDte) {
           let earliestDte = Infinity;
           for (const leg of groupLegs) {
             if (leg.expirationDate) {
@@ -3176,6 +3349,28 @@ serve(async (req) => {
           // Get current timestamp for trigger snapshot
           const { isoET } = getETTime();
           
+          // Build expected description based on exit reason
+          const getExpectedDescription = (reason: string) => {
+            switch (reason) {
+              case 'profit_target':
+                return `P&L >= ${profitTargetPercent}%`;
+              case 'profit_target_dollars':
+                return `P&L >= $${profitTargetDollars}`;
+              case 'profit_target_combined':
+                return `P&L >= ${profitTargetPercent}% AND >= $${profitTargetDollars}`;
+              case 'stop_loss':
+                return `P&L <= -${stopLossPercent}%`;
+              case 'stop_loss_dollars':
+                return `P&L <= -$${stopLossDollars}`;
+              case 'stop_loss_combined':
+                return `P&L <= -${stopLossPercent}% AND <= -$${stopLossDollars}`;
+              case 'time_stop':
+                return `DTE <= ${strategy.exitConditions.timeStopDte}`;
+              default:
+                return `Unknown trigger: ${reason}`;
+            }
+          };
+
           // Save exit_attempt evaluation with trigger snapshot in inputs.market
           if (strategy.id) {
             await saveEvaluation(
@@ -3185,34 +3380,38 @@ serve(async (req) => {
               'exit_attempt',
               {
                 decision: 'CLOSE',
-                reason: `Group exit triggered: ${exitReason} (P&L: ${pnlPercent.toFixed(2)}%)`,
+                reason: `Group exit triggered: ${exitReason} (P&L: ${pnlPercent.toFixed(2)}%, $${pnl.toFixed(2)})`,
                 gates: [{
                   name: exitReason,
-                  expected: exitReason === 'profit_target' 
-                    ? `P&L >= ${strategy.exitConditions.profitTargetPercent}%`
-                    : exitReason === 'stop_loss'
-                    ? `P&L <= -${strategy.exitConditions.stopLossPercent}%`
-                    : `DTE <= ${strategy.exitConditions.timeStopDte}`,
-                  actual: { 
-                    pnl_percent: pnlPercent, 
+                  expected: getExpectedDescription(exitReason),
+                  actual: {
+                    pnl_percent: pnlPercent,
+                    pnl_dollars: pnl,
                     legs: observedLegs,
-                    pnl_basis: 'mark', // NEW: Indicate this is mark-to-market
+                    pnl_basis: 'mark',
+                    exit_mode: exitMode,
                   },
                   pass: true,
                 }],
-                inputs: { 
-                  market: { 
+                inputs: {
+                  market: {
                     pnl_percent: pnlPercent,
-                    pnl_basis: 'mark',  // NEW: Indicate this is mark-to-market
+                    pnl_dollars: pnl,
+                    pnl_basis: 'mark',
+                    exit_mode: exitMode,
                     entry_credit_dollars: entryCreditDollars,
                     cost_to_close_debit: costToCloseDebit,
                     unrealized_pnl_dollars: unrealizedPnlDollars,
+                    profit_target_percent: profitTargetPercent,
+                    profit_target_dollars: profitTargetDollars,
+                    stop_loss_percent: stopLossPercent,
+                    stop_loss_dollars: stopLossDollars,
                     leg_count: observedLegs,
                     leg_sides: Object.fromEntries(legSideMap),
                     distinct_entry_credits: distinctEntryCredits.length,
-                    trigger_timestamp: isoET, // NEW: Trigger snapshot timestamp
-                  }, 
-                  account: {} 
+                    trigger_timestamp: isoET,
+                  },
+                  account: {}
                 },
               },
               { groupLegs, exitReason },
@@ -3250,9 +3449,10 @@ serve(async (req) => {
           });
         } else {
           // Log WHY no exit triggered for debugging
-          console.log(`[EXIT] Group ${tradeGroupId}: NO TRIGGER - pnl%=${pnlPercent.toFixed(2)}%, ` +
-            `profitTarget=${strategy.exitConditions.profitTargetPercent}%, ` +
-            `stopLoss=${strategy.exitConditions.stopLossPercent}%`);
+          console.log(`[EXIT] Group ${tradeGroupId}: NO TRIGGER - mode=${exitMode}, ` +
+            `pnl%=${pnlPercent.toFixed(2)}%, pnl$=$${pnl.toFixed(2)}, ` +
+            `profitTarget%=${profitTargetPercent}%, profitTarget$=${profitTargetDollars ?? 'n/a'}, ` +
+            `stopLoss%=${stopLossPercent}%, stopLoss$=${stopLossDollars ?? 'n/a'}`);
 
           // Record exit status (not triggered)
           exitStatus.push({
@@ -3281,26 +3481,51 @@ serve(async (req) => {
 
         const pnl = isShort ? Math.abs(costBasis) - currentValue : currentValue - costBasis;
         const pnlPercent = Math.abs(costBasis) > 0 ? (pnl / Math.abs(costBasis)) * 100 : 0;
-        
+
+        // Enhanced exit logic with dollar-based triggers
+        const exitMode = strategy.exitConditions.exitTriggerMode ?? 'either';
+        const profitTargetPercent = strategy.exitConditions.profitTargetPercent;
+        const stopLossPercent = strategy.exitConditions.stopLossPercent;
+        const profitTargetDollars = strategy.exitConditions.profitTargetDollars;
+        const stopLossDollars = strategy.exitConditions.stopLossDollars;
+
+        const profitPercentMet = pnlPercent >= profitTargetPercent && pnlPercent > 0;
+        const profitDollarsMet = profitTargetDollars !== undefined && pnl >= profitTargetDollars;
+        const stopPercentMet = pnlPercent <= -stopLossPercent;
+        const stopDollarsMet = stopLossDollars !== undefined && pnl <= -stopLossDollars;
+
         let exitReason: string | null = null;
-        
-        // Check profit target
-        if (pnlPercent >= strategy.exitConditions.profitTargetPercent) {
-          exitReason = 'profit_target';
+
+        if (exitMode === 'both_required') {
+          if (profitPercentMet && profitDollarsMet) {
+            exitReason = 'profit_target_combined';
+          } else if (stopPercentMet && stopDollarsMet) {
+            exitReason = 'stop_loss_combined';
+          }
+        } else if (exitMode === 'percent_only') {
+          if (profitPercentMet) exitReason = 'profit_target';
+          else if (stopPercentMet) exitReason = 'stop_loss';
+        } else if (exitMode === 'dollars_only') {
+          if (profitDollarsMet) exitReason = 'profit_target_dollars';
+          else if (stopDollarsMet) exitReason = 'stop_loss_dollars';
+        } else {
+          // 'either' mode
+          if (profitPercentMet || profitDollarsMet) {
+            exitReason = profitPercentMet ? 'profit_target' : 'profit_target_dollars';
+          } else if (stopPercentMet || stopDollarsMet) {
+            exitReason = stopPercentMet ? 'stop_loss' : 'stop_loss_dollars';
+          }
         }
-        // Check stop loss
-        else if (pnlPercent <= -strategy.exitConditions.stopLossPercent) {
-          exitReason = 'stop_loss';
-        }
+
         // Check time stop
-        else if (strategy.exitConditions.timeStopDte && position.expirationDate) {
+        if (!exitReason && strategy.exitConditions.timeStopDte && position.expirationDate) {
           const expDate = new Date(position.expirationDate);
           const dte = Math.ceil((expDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
           if (dte <= strategy.exitConditions.timeStopDte) {
             exitReason = 'time_stop';
           }
         }
-        
+
         if (exitReason) {
           exitSignals.push({
             positionId: position.id,
