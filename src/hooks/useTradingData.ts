@@ -1241,7 +1241,10 @@ export const useTradingData = () => {
         exit_time: now, // Set to submission time, updated when filled
         entry_price: entryPrice,
         exit_price: undefined, // Set when filled from Tradier avg_fill_price
-        entry_credit: stratInfo?.entryCredit,
+        // NOTE: Do NOT set entry_credit here - it would be per-share from UI.
+        // The source of truth is position_group_map.entry_credit (in DOLLARS),
+        // which is fetched by updateCloseStatus when the exit fills.
+        entry_credit: undefined,
         pnl: null, // NEVER guess - wait for fill confirmation
         pnl_percent: null,
         pnl_formula: undefined,
