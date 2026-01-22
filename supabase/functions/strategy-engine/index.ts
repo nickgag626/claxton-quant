@@ -3330,16 +3330,18 @@ serve(async (req) => {
           }
         }
 
-        // Check time stop (use earliest expiration in group) - always checked
-        if (!exitReason && strategy.exitConditions.timeStopDte) {
-          let earliestDte = Infinity;
-          for (const leg of groupLegs) {
-            if (leg.expirationDate) {
-              const expDate = new Date(leg.expirationDate);
-              const dte = Math.ceil((expDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
-              earliestDte = Math.min(earliestDte, dte);
-            }
+        // Calculate earliest DTE for the group (used for time stop and status reporting)
+        let earliestDte = Infinity;
+        for (const leg of groupLegs) {
+          if (leg.expirationDate) {
+            const expDate = new Date(leg.expirationDate);
+            const dte = Math.ceil((expDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24));
+            earliestDte = Math.min(earliestDte, dte);
           }
+        }
+
+        // Check time stop - always checked
+        if (!exitReason && strategy.exitConditions.timeStopDte) {
           if (earliestDte <= strategy.exitConditions.timeStopDte) {
             exitReason = 'time_stop';
           }
@@ -3442,7 +3444,7 @@ serve(async (req) => {
             pnlPercent,
             profitTargetPercent: strategy.exitConditions.profitTargetPercent,
             stopLossPercent: strategy.exitConditions.stopLossPercent,
-            dte: expirationDate ? Math.ceil((expirationDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : undefined,
+            dte: earliestDte !== Infinity ? earliestDte : undefined,
             timeStopDte: strategy.exitConditions.timeStopDte,
             triggered: true,
             reason: exitReason,
@@ -3462,7 +3464,7 @@ serve(async (req) => {
             pnlPercent,
             profitTargetPercent: strategy.exitConditions.profitTargetPercent,
             stopLossPercent: strategy.exitConditions.stopLossPercent,
-            dte: expirationDate ? Math.ceil((expirationDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24)) : undefined,
+            dte: earliestDte !== Infinity ? earliestDte : undefined,
             timeStopDte: strategy.exitConditions.timeStopDte,
             triggered: false,
             reason: null,

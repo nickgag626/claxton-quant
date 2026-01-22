@@ -422,7 +422,7 @@ export const StrategyBuilder = ({ onSaveStrategy, onClose, editingStrategy }: St
     setCustomLegs(preset.legs as StrategyLeg[]);
     setIs0dte(preset.dte === 0);
     setSizingMode(preset.sizing.mode);
-    setPositionSize(preset.sizing.fixedContracts || 1);
+    setPositionSize('fixedContracts' in preset.sizing ? preset.sizing.fixedContracts : 1);
     setTrackedLegs(getDefaultTrackedLegs(preset.type));
   };
 
