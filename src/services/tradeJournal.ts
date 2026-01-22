@@ -1658,6 +1658,7 @@ export const tradeJournal = {
         }
 
         // Update all legs with group info
+        const updateErrors: string[] = [];
         for (let i = 0; i < typedTrades.length; i++) {
           const trade = typedTrades[i];
           const isPrimaryLeg = i === 0;
@@ -1701,7 +1702,18 @@ export const tradeJournal = {
             }
           }
 
-          await supabase.from('trades').update(updates).eq('id', trade.id);
+          // CRITICAL: Capture and log errors - previously these failed silently
+          const { error: updateError } = await supabase.from('trades').update(updates).eq('id', trade.id);
+          if (updateError) {
+            console.error(`[updateCloseStatus] Failed to update trade ${trade.id} (${trade.symbol}):`, updateError.message);
+            updateErrors.push(`${trade.symbol}: ${updateError.message}`);
+          }
+        }
+
+        // Return failure if any updates failed
+        if (updateErrors.length > 0) {
+          console.error(`[updateCloseStatus] ${updateErrors.length} leg updates failed for closeOrderId=${closeOrderId}`);
+          return { success: false, error: `Failed to update ${updateErrors.length} legs: ${updateErrors.join('; ')}` };
         }
 
         return { success: true, groupPnl };
