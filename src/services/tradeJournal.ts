@@ -1003,9 +1003,17 @@ export const tradeJournal = {
             
             // CRITICAL FIX #1: Detect per-share values stored in exit_debit column
             // If exit_debit is very close to exit_price, it's likely per-share not dollars
-            const isLikelyPerShare = first.exitPrice > 0.01 && 
+            const isLikelyPerShareByPrice = first.exitPrice > 0.01 &&
               first.exitDebit < 50 && // Dollar values for condors typically > $50
               Math.abs(first.exitDebit - first.exitPrice) / Math.max(first.exitPrice, 0.01) < 0.5;
+
+            // CRITICAL FIX #1b: Also detect per-share when exit_debit is tiny compared to entry_credit
+            // For spreads, exit_debit should be comparable to entry_credit (not 100x smaller)
+            const isLikelyPerShareByRatio = first.exitDebit < 5 &&
+              computedEntryCredit > 10 &&
+              first.exitDebit < (computedEntryCredit * 0.1); // exit_debit is < 10% of entry_credit
+
+            const isLikelyPerShare = isLikelyPerShareByPrice || isLikelyPerShareByRatio;
             
             // CRITICAL FIX #2: Detect if exit_debit = exit_price × 100 × leg_count (incorrectly summed per-leg)
             // This happens when broker returns per-leg prices and they get summed instead of netted
