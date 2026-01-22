@@ -999,19 +999,32 @@ export const tradeJournal = {
 
           if (existingExitDebitsWithPrices.length > 0) {
             const first = existingExitDebitsWithPrices[0];
+            const legCount = groupLegs.length;
             
-            // CRITICAL FIX: Detect per-share values stored in exit_debit column
+            // CRITICAL FIX #1: Detect per-share values stored in exit_debit column
             // If exit_debit is very close to exit_price, it's likely per-share not dollars
-            // Dollar values would be ~100x larger than per-share values
             const isLikelyPerShare = first.exitPrice > 0.01 && 
               first.exitDebit < 50 && // Dollar values for condors typically > $50
               Math.abs(first.exitDebit - first.exitPrice) / Math.max(first.exitPrice, 0.01) < 0.5;
+            
+            // CRITICAL FIX #2: Detect if exit_debit = exit_price × 100 × leg_count (incorrectly summed per-leg)
+            // This happens when broker returns per-leg prices and they get summed instead of netted
+            const expectedPerLegDollars = first.exitPrice * 100;
+            const expectedSummedValue = expectedPerLegDollars * legCount;
+            const isSummedPerLegDollars = legCount >= 4 && 
+              first.exitDebit > 100 && // Must be a substantial dollar value
+              Math.abs(first.exitDebit - expectedSummedValue) < (expectedSummedValue * 0.1); // Within 10% of summed value
             
             if (isLikelyPerShare) {
               // Convert per-share net combo price to dollars
               computedExitDebit = first.exitDebit * contracts * 100;
               exitDebitSource = 'existingExitDebit_convertedToDollars';
               console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: CONVERTED per-share exit_debit=${first.exitDebit.toFixed(4)} → $${computedExitDebit.toFixed(2)}`);
+            } else if (isSummedPerLegDollars) {
+              // exit_debit was incorrectly calculated as sum of per-leg values - divide by leg count
+              computedExitDebit = first.exitDebit / legCount;
+              exitDebitSource = 'existingExitDebit_correctedFromSummedLegs';
+              console.log(`[recalculatePnl] Group ${groupId.slice(0, 8)}: CORRECTED summed exit_debit=${first.exitDebit.toFixed(2)} ÷ ${legCount} legs → $${computedExitDebit.toFixed(2)}`);
             } else {
               // Already in dollars - use median of existing non-zero exit_debit values
               const debits = existingExitDebitsWithPrices.map(e => e.exitDebit).sort((a, b) => a - b);
