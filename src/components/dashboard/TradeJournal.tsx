@@ -586,7 +586,7 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
                     </div>
                     <div className="flex items-center gap-4">
                       <span className="text-muted-foreground">
-                        ${Number(leg.entry_price).toFixed(4)} → ${leg.exit_price != null ? `$${Number(leg.exit_price).toFixed(4)}` : '?'}
+                        ${Number(leg.entry_price).toFixed(4)} → {leg.exit_price != null ? `$${Number(leg.exit_price).toFixed(4)}` : '$?'}
                       </span>
                       {legPnl != null ? (
                         <span className={cn(

@@ -1696,6 +1696,7 @@ export const tradeJournal = {
           const trade = typedTrades[i];
           const isPrimaryLeg = i === 0;
           const sides = legSideData.get(trade.id!);
+          const legFill = details?.legFills?.[trade.symbol];
 
           const updates: Record<string, any> = {
             close_status: 'filled',
@@ -1708,6 +1709,11 @@ export const tradeJournal = {
             entry_credit_dollars: entryCreditDollars,
             pnl_status: pnlStatus,
             pnl_computed_at: groupCalc ? now : null,
+            // Set exit_price from per-leg fills
+            ...(legFill?.avgFillPrice != null && {
+              exit_price: legFill.avgFillPrice,
+              close_avg_fill_price: legFill.avgFillPrice,
+            }),
           };
 
           // Store exit values only on primary leg
