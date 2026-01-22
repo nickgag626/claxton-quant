@@ -563,7 +563,13 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
               {group.trades.map((leg, idx) => {
                 const legPnl = leg.pnl != null && !leg.needs_reconcile ? leg.pnl : null;
                 // Check if this leg's P&L is included in group total (non-primary legs)
-                const isIncludedInGroupTotal = leg.pnl_formula === 'Included in group total';
+                // More robust: also detect legacy legs where pnl=0 indicates non-primary
+                const isIncludedInGroupTotal =
+                  leg.pnl_formula === 'Included in group total' ||
+                  (group.trades.length > 1 &&
+                   leg.pnl === 0 &&
+                   leg.pnl_percent === 0 &&
+                   !leg.needs_reconcile);
                 // Use stable key: prefer id, fallback to unique composite key
                 const legKey = leg.id || `${leg.symbol}-${leg.exit_time}-${leg.quantity}-${idx}`;
                 return (
