@@ -1,6 +1,65 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
 // ============================================================================
+// RETRY CONFIGURATION for transient errors (504, 502, 503, network failures)
+// ============================================================================
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 500;
+const RETRYABLE_STATUS_CODES = [502, 503, 504];
+
+/**
+ * Fetch with automatic retry for transient errors.
+ * Uses exponential backoff: 500ms, 1000ms, 2000ms
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  retries = MAX_RETRIES,
+  action = "unknown"
+): Promise<Response> {
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      
+      // Check if response is retryable (5xx gateway errors)
+      if (RETRYABLE_STATUS_CODES.includes(response.status) && attempt < retries) {
+        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+        console.warn(`RETRY_${action.toUpperCase()}`, { 
+          status: response.status, 
+          attempt: attempt + 1, 
+          maxRetries: retries,
+          delayMs: delay 
+        });
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      return response;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      
+      // Network errors are retryable
+      if (attempt < retries) {
+        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt);
+        console.warn(`RETRY_${action.toUpperCase()}_NETWORK_ERROR`, { 
+          error: lastError.message, 
+          attempt: attempt + 1, 
+          maxRetries: retries,
+          delayMs: delay 
+        });
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+    }
+  }
+  
+  // All retries exhausted
+  throw lastError || new Error(`Fetch failed after ${retries} retries`);
+}
+
+// ============================================================================
 // CORS Configuration
 // - Set ALLOWED_ORIGINS env var to comma-separated list for production
 // - Set DEV_ALLOW_ALL_ORIGINS=true for local development with wildcard CORS
@@ -313,7 +372,7 @@ serve(async (req) => {
         }
         const url = `${baseUrl}/markets/quotes?symbols=${symbols.join(",")}`;
         console.log("QUOTE_REQUEST", { symbols_count: symbols.length });
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "quote");
         data = await safeParseTradierResponse(response);
         console.log("QUOTE_RESPONSE", { status: response.status });
         break;
@@ -322,7 +381,7 @@ serve(async (req) => {
       case "positions": {
         const url = `${baseUrl}/accounts/${accountId}/positions`;
         console.log("POSITIONS_REQUEST");
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "positions");
         data = await safeParseTradierResponse(response);
         const posCount = Array.isArray(data?.positions?.position)
           ? data.positions.position.length
@@ -334,7 +393,7 @@ serve(async (req) => {
       case "balances": {
         const url = `${baseUrl}/accounts/${accountId}/balances`;
         console.log("BALANCES_REQUEST");
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "balances");
         data = await safeParseTradierResponse(response);
         console.log("BALANCES_RESPONSE", { status: response.status });
         break;
@@ -349,7 +408,7 @@ serve(async (req) => {
         }
         const url = `${baseUrl}/markets/options/expirations?symbol=${symbol}`;
         console.log("EXPIRATIONS_REQUEST", { symbol });
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "expirations");
         data = await safeParseTradierResponse(response);
         console.log("EXPIRATIONS_RESPONSE", { status: response.status, symbol });
         break;
@@ -367,7 +426,7 @@ serve(async (req) => {
         }
         const url = `${baseUrl}/markets/options/chains?symbol=${symbol}&expiration=${expiration}&greeks=true`;
         console.log("CHAIN_REQUEST", { symbol, expiration });
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "chain");
         data = await safeParseTradierResponse(response);
         console.log("CHAIN_RESPONSE", { status: response.status, symbol, expiration });
         break;
@@ -376,7 +435,7 @@ serve(async (req) => {
       case "clock": {
         const url = `${baseUrl}/markets/clock`;
         console.log("CLOCK_REQUEST");
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "clock");
         data = await safeParseTradierResponse(response);
         console.log("CLOCK_RESPONSE", { status: response.status, state: data?.clock?.state });
         break;
@@ -386,7 +445,7 @@ serve(async (req) => {
         // Fetch order history for reconciliation
         const url = `${baseUrl}/accounts/${accountId}/orders?includeTags=true`;
         console.log("ORDERS_REQUEST");
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "orders");
         data = await safeParseTradierResponse(response);
         const orderCount = Array.isArray(data?.orders?.order) ? data.orders.order.length : (data?.orders?.order ? 1 : 0);
         console.log("ORDERS_RESPONSE", { status: response.status, count: orderCount });
@@ -403,7 +462,7 @@ serve(async (req) => {
         }
         const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
         console.log("ORDER_DETAIL_REQUEST", { orderId });
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "order_detail");
         data = await safeParseTradierResponse(response);
         console.log("ORDER_DETAIL_RESPONSE", { status: response.status, orderId });
         break;
@@ -419,7 +478,7 @@ serve(async (req) => {
         }
         const url = `${baseUrl}/accounts/${accountId}/orders/${orderId}`;
         console.log("ORDER_STATUS_REQUEST", { orderId });
-        response = await fetch(url, { headers });
+        response = await fetchWithRetry(url, { headers }, MAX_RETRIES, "order_status");
         const orderData = await safeParseTradierResponse(response);
         console.log("ORDER_STATUS_RESPONSE", { status: response.status, orderId });
 
@@ -546,7 +605,7 @@ serve(async (req) => {
         try {
           // Fetch positions once
           const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
-          const posResp = await fetch(posUrl, { headers });
+          const posResp = await fetchWithRetry(posUrl, { headers }, MAX_RETRIES, "close_group_positions");
           const posData = await safeParseTradierResponse(posResp);
           const positionsRaw = posData?.positions?.position;
           const posArray: TradierPosition[] = Array.isArray(positionsRaw)
@@ -613,7 +672,7 @@ serve(async (req) => {
           const forceClose = !!body.forceClose;
           if (!forceClose) {
             const quoteUrl = `${baseUrl}/markets/quotes?symbols=${symbolsSorted.join(",")}`;
-            const quoteResp = await fetch(quoteUrl, { headers });
+            const quoteResp = await fetchWithRetry(quoteUrl, { headers }, MAX_RETRIES, "close_group_quotes");
             const quoteData = await safeParseTradierResponse(quoteResp);
             const quotesRaw = quoteData?.quotes?.quote;
             const quotesArray = Array.isArray(quotesRaw) ? quotesRaw : quotesRaw ? [quotesRaw] : [];
@@ -779,7 +838,7 @@ serve(async (req) => {
         try {
           // Fetch exact position snapshot
           const posUrl = `${baseUrl}/accounts/${accountId}/positions`;
-          const posResp = await fetch(posUrl, { headers });
+          const posResp = await fetchWithRetry(posUrl, { headers }, MAX_RETRIES, "close_pos_positions");
           const posData = await safeParseTradierResponse(posResp);
           const positionsRaw = posData?.positions?.position;
           const posArray: TradierPosition[] = Array.isArray(positionsRaw)
@@ -803,7 +862,7 @@ serve(async (req) => {
           let quoteAsk: number = 0;
           try {
             const qUrl = `${baseUrl}/markets/quotes?symbols=${encodeURIComponent(positionSymbol)}`;
-            const qResp = await fetch(qUrl, { headers });
+            const qResp = await fetchWithRetry(qUrl, { headers }, MAX_RETRIES, "close_pos_quote");
             const qData = await safeParseTradierResponse(qResp);
             const q = qData?.quotes?.quote;
             const quote = Array.isArray(q) ? q[0] : q;
