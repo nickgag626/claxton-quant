@@ -488,27 +488,18 @@ export const tradeJournal = {
             const allFilled = groupTrades.every(t => t.close_status === 'filled');
             const hasUnfinalized = !allFilled || groupTrades.some(t => t.needs_reconcile);
             
-            // === GROUP-LEVEL NET P&L CALCULATION ===
-            // Use entry_credit and exit_debit for net calculation (not per-leg sums)
+            // === GROUP-LEVEL P&L: Use stored pnl values (computed by recalculatePnl) ===
+            // The stored pnl values are the source of truth - they were computed correctly
+            // with direction-aware exit debit calculation. The exit_debit field may have
+            // incorrect values due to a bug in the close order flow, so we DON'T recalculate
+            // from entry_credit/exit_debit here.
             let totalPnl = 0;
-            
+
             if (allFilled) {
-              // Get net entry credit (should be same for all legs in a group)
-              const netEntryCredit = groupTrades[0]?.entry_credit || 0;
-              // Get net exit debit (stored on first leg, or use exit_debit if available)
-              const netExitDebit = groupTrades[0]?.exit_debit || 0;
-              // Get contracts count (from first leg's quantity - NOT number of legs)
-              const contracts = groupTrades[0]?.quantity || 1;
-              
-              // If we have proper entry_credit and exit_debit, use group formula
-              if (netEntryCredit > 0 && netExitDebit > 0) {
-                const groupCalc = calculateGroupPnl(netEntryCredit, netExitDebit, contracts, 100, 0);
-                totalPnl = groupCalc.pnl;
-              } else {
-                // Fallback: Sum individual leg P&Ls (legacy data)
-                const finalizedLegs = groupTrades.filter(t => isFullyFinalized(t));
-                totalPnl = finalizedLegs.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
-              }
+              // Sum the stored pnl values from all legs
+              // Primary leg has the group P&L, other legs have 0 (included in group total)
+              const finalizedLegs = groupTrades.filter(t => isFullyFinalized(t));
+              totalPnl = finalizedLegs.reduce((sum, t) => sum + Number(t.pnl || 0), 0);
             }
             
             const group: TradeGroup = {
@@ -1747,8 +1738,13 @@ export const tradeJournal = {
           };
 
           // Store exit values only on primary leg
+          // IMPORTANT: Use the same exit debit value that was used for P&L calculation
+          // exitDebitDollars = direction-aware per-leg calculation (preferred)
+          // netExitDebitDollars = combo fill price calculation (fallback)
           if (isPrimaryLeg) {
-            updates.exit_debit = netExitDebitDollars;
+            // Prefer per-leg calculation if available, otherwise use combo price
+            const exitDebitToStore = (exitDebitDollars !== 0) ? exitDebitDollars : netExitDebitDollars;
+            updates.exit_debit = exitDebitToStore;
             updates.exit_debit_dollars = exitDebitDollars || null;
           }
 
