@@ -236,6 +236,7 @@ export type Database = {
           close_side: string | null
           close_status: string | null
           close_submitted_at: string | null
+          contracts: number | null
           created_at: string
           entry_credit: number | null
           entry_credit_dollars: number | null
@@ -244,10 +245,13 @@ export type Database = {
           exit_debit: number | null
           exit_debit_dollars: number | null
           exit_price: number | null
+          exit_price_source: string | null
           exit_reason: string | null
           exit_time: string
+          exit_trigger_reason: string | null
           fees: number | null
           id: string
+          leg_count: number | null
           multiplier: number | null
           needs_reconcile: boolean | null
           notes: string | null
@@ -274,6 +278,7 @@ export type Database = {
           close_side?: string | null
           close_status?: string | null
           close_submitted_at?: string | null
+          contracts?: number | null
           created_at?: string
           entry_credit?: number | null
           entry_credit_dollars?: number | null
@@ -282,10 +287,13 @@ export type Database = {
           exit_debit?: number | null
           exit_debit_dollars?: number | null
           exit_price?: number | null
+          exit_price_source?: string | null
           exit_reason?: string | null
           exit_time?: string
+          exit_trigger_reason?: string | null
           fees?: number | null
           id?: string
+          leg_count?: number | null
           multiplier?: number | null
           needs_reconcile?: boolean | null
           notes?: string | null
@@ -312,6 +320,7 @@ export type Database = {
           close_side?: string | null
           close_status?: string | null
           close_submitted_at?: string | null
+          contracts?: number | null
           created_at?: string
           entry_credit?: number | null
           entry_credit_dollars?: number | null
@@ -320,10 +329,13 @@ export type Database = {
           exit_debit?: number | null
           exit_debit_dollars?: number | null
           exit_price?: number | null
+          exit_price_source?: string | null
           exit_reason?: string | null
           exit_time?: string
+          exit_trigger_reason?: string | null
           fees?: number | null
           id?: string
+          leg_count?: number | null
           multiplier?: number | null
           needs_reconcile?: boolean | null
           notes?: string | null
