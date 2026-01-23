@@ -376,16 +376,16 @@ describe('Quantity/Contracts Invariants', () => {
   });
 
   it('does not flag correct quantity for 4-leg spreads', () => {
-    const legCount = 4;
-    const storedQuantity = 1; // Correct: 1 contract
+    const legCount: number = 4;
+    const storedQuantity: number = 1; // Correct: 1 contract
 
     const hasQuantityBug = legCount >= 4 && storedQuantity === legCount;
     expect(hasQuantityBug).toBe(false);
   });
 
   it('allows quantity > legCount for multiple contracts', () => {
-    const legCount = 4;
-    const storedQuantity = 2; // 2 contracts is valid
+    const legCount: number = 4;
+    const storedQuantity: number = 2; // 2 contracts is valid
 
     const hasQuantityBug = legCount >= 4 && storedQuantity === legCount;
     expect(hasQuantityBug).toBe(false);
