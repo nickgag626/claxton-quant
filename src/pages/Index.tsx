@@ -13,7 +13,9 @@ import { TradeJournal } from '@/components/dashboard/TradeJournal';
 import { OptionsChain } from '@/components/dashboard/OptionsChain';
 import { RecoveryPanel } from '@/components/dashboard/RecoveryPanel';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { BookOpen, Grid3X3, Activity, AlertTriangle } from 'lucide-react';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { BookOpen, Grid3X3, Activity, AlertTriangle, RefreshCw, WifiOff, Loader2 } from 'lucide-react';
 
 const Index = () => {
   const {
@@ -31,6 +33,8 @@ const Index = () => {
     lastCheckExitsTime,
     deltaHistory,
     pnlHistory,
+    isLoading,
+    error,
     toggleBot,
     toggleKillSwitch,
     updateRiskSettings,
@@ -71,10 +75,47 @@ const Index = () => {
   const enabledStrategiesCount = strategies.filter(s => s.enabled).length;
   const nearestDte = positions.length > 0 ? 11 : null; // Mock value
 
+  // Show loading state during initial load
+  if (isLoading && !isApiConnected && positions.length === 0) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center p-4">
+        <div className="text-center space-y-4">
+          <Loader2 className="h-12 w-12 animate-spin text-muted-foreground mx-auto" />
+          <p className="text-muted-foreground">Connecting to trading API...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show error banner (not blocking) when API has issues but we have some data
+  const showErrorBanner = error && !isApiConnected;
+
   return (
     <div className="min-h-screen bg-background p-4 md:p-6">
       <div className="max-w-7xl mx-auto space-y-4">
         <Header />
+        
+        {/* API Error Banner - shown but doesn't block UI */}
+        {showErrorBanner && (
+          <Alert variant="destructive" className="border-destructive/50 bg-destructive/10">
+            <WifiOff className="h-4 w-4" />
+            <AlertTitle className="flex items-center gap-2">
+              API Connection Issue
+            </AlertTitle>
+            <AlertDescription className="flex items-center justify-between">
+              <span className="text-sm">{error || 'Unable to connect to trading API. Retrying automatically...'}</span>
+              <Button 
+                variant="outline" 
+                size="sm" 
+                onClick={refetch}
+                className="ml-4 shrink-0"
+              >
+                <RefreshCw className="h-3 w-3 mr-1" />
+                Retry Now
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
         
         <DataLagWarning />
         
