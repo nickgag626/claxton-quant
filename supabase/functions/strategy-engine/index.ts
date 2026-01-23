@@ -2191,24 +2191,86 @@ async function reconcileStaleCloseOrders(supabaseClient: any): Promise<{ reconci
         if (orderStatus.closeStatus === 'filled') {
           // Order is filled - update all legs with fill data
           const legFills = orderStatus.legFills || {};
+          const exitTime = orderStatus.rawOrder?.transaction_date || new Date().toISOString();
 
-          for (const trade of trades) {
-            // Get per-leg fill price if available, otherwise use order-level average
+          if (trades.length > 1) {
+            // COMBO ORDER - process as group
+            // Sort by symbol to determine primary leg (first alphabetically)
+            const sortedTrades = [...trades].sort((a, b) => a.symbol.localeCompare(b.symbol));
+            const primaryLeg = sortedTrades[0];
+            const legCount = trades.length;
+
+            // Get entry_credit from position_group_map (source of truth)
+            let entryCreditDollars = 0;
+            if (primaryLeg.trade_group_id) {
+              const { data: mapping } = await supabaseClient
+                .from('position_group_map')
+                .select('entry_credit')
+                .eq('trade_group_id', primaryLeg.trade_group_id)
+                .maybeSingle();
+
+              entryCreditDollars = mapping?.entry_credit ?? 0;
+            }
+
+            // Fallback to trade entry_credit if mapping not found
+            if (entryCreditDollars === 0) {
+              entryCreditDollars = primaryLeg.entry_credit ?? 0;
+            }
+
+            // Normalize contracts: for 4-leg orders, if quantity == legCount, assume 1 contract
+            let contracts = Math.abs(primaryLeg.quantity || 1);
+            if (legCount >= 4 && contracts === legCount) {
+              console.log(`[RECONCILE] Normalizing contracts: quantity=${contracts} equals legCount=${legCount}, using contracts=1`);
+              contracts = 1;
+            }
+
+            // Use combo net price for exit debit (NOT per-leg sum)
+            const comboExitPrice = orderStatus.avgFillPrice ?? 0;
+            const exitDebitDollars = comboExitPrice * contracts * 100;
+            const pnl = entryCreditDollars - exitDebitDollars;
+
+            console.log(`[RECONCILE] COMBO ORDER: legs=${legCount}, contracts=${contracts}, entry=$${entryCreditDollars.toFixed(2)}, exitPrice=${comboExitPrice}, exitDebit=$${exitDebitDollars.toFixed(2)}, pnl=$${pnl.toFixed(2)}`);
+
+            // Update all legs - store financial values only on primary
+            for (const trade of sortedTrades) {
+              const isPrimary = trade.id === primaryLeg.id;
+              const legFill = legFills[trade.symbol];
+              const exitPrice = legFill?.avgFillPrice ?? comboExitPrice;
+
+              const { error: updateError } = await supabaseClient
+                .from('trades')
+                .update({
+                  close_status: 'filled',
+                  exit_price: exitPrice,
+                  exit_debit: isPrimary ? exitDebitDollars : null,
+                  pnl: isPrimary ? pnl : 0,
+                  realized_pnl: isPrimary ? pnl : 0,
+                  exit_time: exitTime,
+                  entry_credit: entryCreditDollars, // Persist source of truth
+                  exit_price_source: 'COMBO_NET',
+                })
+                .eq('id', trade.id);
+
+              if (updateError) {
+                console.error(`[RECONCILE] Error updating trade ${trade.id}:`, updateError);
+                result.errors.push(`Trade ${trade.id}: ${updateError.message}`);
+              } else {
+                console.log(`[RECONCILE] Updated trade ${trade.id} (${trade.symbol}): isPrimary=${isPrimary}, exit_price=${exitPrice}, pnl=${isPrimary ? pnl.toFixed(2) : '0'}`);
+                result.reconciled++;
+              }
+            }
+          } else {
+            // SINGLE-LEG ORDER - process individually
+            const trade = trades[0];
             const legFill = legFills[trade.symbol];
             const exitPrice = legFill?.avgFillPrice ?? orderStatus.avgFillPrice ?? null;
 
-            // Calculate exit_debit: for credit spreads, this is cost to close
-            // exit_debit = exit_price * quantity * 100 (per contract multiplier)
+            // For single leg, quantity is straightforward
             const quantity = Math.abs(trade.quantity || 1);
             const exitDebit = exitPrice != null ? exitPrice * quantity * 100 : null;
-
-            // Calculate P&L: entry_credit - exit_debit
-            // For credit strategies: positive credit at entry, positive debit at exit
-            // P&L = credit received - debit paid to close
             const entryCredit = trade.entry_credit ?? 0;
             const pnl = exitDebit != null ? entryCredit - exitDebit : null;
 
-            // Update the trade record
             const { error: updateError } = await supabaseClient
               .from('trades')
               .update({
@@ -2217,7 +2279,8 @@ async function reconcileStaleCloseOrders(supabaseClient: any): Promise<{ reconci
                 exit_debit: exitDebit,
                 pnl: pnl,
                 realized_pnl: pnl,
-                exit_time: orderStatus.rawOrder?.transaction_date || new Date().toISOString(),
+                exit_time: exitTime,
+                exit_price_source: 'PER_LEG',
               })
               .eq('id', trade.id);
 

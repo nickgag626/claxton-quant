@@ -8,6 +8,12 @@ export const ORDER_TIMEOUT_MS = 60 * 1000;
 
 export type PnlStatus = 'pending' | 'computed' | 'final' | 'missing_fills';
 
+// Exit price source - how exit_debit was calculated
+// PER_LEG: Direction-aware sum of individual leg fill prices
+// COMBO_NET: Combo order's net fill price from Tradier
+// PARTIAL: Some legs missing fill data, needs reconciliation
+export type ExitPriceSource = 'PER_LEG' | 'COMBO_NET' | 'PARTIAL';
+
 export interface TradeRecord {
   id?: string;
   symbol: string;
@@ -47,14 +53,19 @@ export interface TradeRecord {
   entry_credit_dollars?: number;
   exit_debit_dollars?: number;
   pnl_computed_at?: string;
+  // Exit price source tracking
+  exit_price_source?: ExitPriceSource;
+  // Exit trigger vs realized outcome separation
+  exit_trigger_reason?: string; // Why exit was initiated (mark-based decision)
 }
 
-// Helper to cast DB row to TradeRecord (handles string → CloseStatus and PnlStatus)
+// Helper to cast DB row to TradeRecord (handles string → CloseStatus, PnlStatus, ExitPriceSource)
 function castToTradeRecord(row: any): TradeRecord {
   return {
     ...row,
     close_status: row.close_status as CloseStatus | undefined,
     pnl_status: row.pnl_status as PnlStatus | undefined,
+    exit_price_source: row.exit_price_source as ExitPriceSource | undefined,
   };
 }
 
@@ -301,6 +312,10 @@ export const tradeJournal = {
         }
       }
 
+      // For single trade inserts, leg_count defaults to 1
+      const legCount = 1;
+      const contracts = Math.abs(trade.quantity || 1);
+
       const { data, error } = await supabase
         .from('trades')
         .insert({
@@ -337,6 +352,9 @@ export const tradeJournal = {
           close_filled_at: trade.close_filled_at || null,
           close_avg_fill_price: trade.close_avg_fill_price || null,
           close_filled_qty: trade.close_filled_qty || null,
+          // P&L tracking columns
+          contracts,
+          leg_count: legCount,
         })
         .select('id')
         .single();
@@ -393,6 +411,11 @@ export const tradeJournal = {
           }
         }
         
+        // Normalize contracts: if qty == legCount for 4+ legs, assume 1 contract
+        const legCount = trades.length;
+        const storedQty = Math.abs(trade.quantity || 1);
+        const contracts = (legCount >= 4 && storedQty === legCount) ? 1 : storedQty;
+
         return {
           symbol: trade.symbol,
           underlying: trade.underlying,
@@ -418,6 +441,9 @@ export const tradeJournal = {
           multiplier: trade.multiplier || 100,
           pnl_formula: pnlFormula,
           needs_reconcile: needsReconcile,
+          // P&L tracking columns
+          contracts,
+          leg_count: legCount,
         };
       });
 
@@ -1426,6 +1452,7 @@ export const tradeJournal = {
     strategy_type?: string;
     exit_reason?: string;
     trade_group_id?: string;
+    leg_count?: number; // Number of legs in the spread
   }): Promise<{ success: boolean; error?: string; id?: string }> {
     try {
       // Check if already exists
@@ -1440,6 +1467,11 @@ export const tradeJournal = {
         console.log('Pending close already exists:', tradeData.symbol, tradeData.close_order_id);
         return { success: true, id: existing.id };
       }
+
+      // Normalize contracts: if qty == legCount for 4+ legs, assume 1 contract
+      const legCount = tradeData.leg_count || 1;
+      const storedQty = Math.abs(tradeData.quantity || 1);
+      const contracts = (legCount >= 4 && storedQty === legCount) ? 1 : storedQty;
 
       const { data, error } = await supabase
         .from('trades')
@@ -1466,6 +1498,9 @@ export const tradeJournal = {
           close_submitted_at: new Date().toISOString(),
           multiplier: 100,
           fees: 0,
+          // P&L tracking columns
+          contracts,
+          leg_count: legCount,
         })
         .select('id')
         .single();
@@ -1538,7 +1573,15 @@ export const tradeJournal = {
         const primaryLeg = typedTrades[0];
 
         const strategyType = primaryLeg.strategy_type;
-        const contracts = details.filledQty || Math.max(...typedTrades.map(t => Number(t.quantity) || 1));
+
+        // DEFENSIVE: The quantity field is sometimes incorrectly set to leg count instead of contracts
+        // For multi-leg trades (4+ legs like iron condors), if quantity == legCount, assume 1 contract
+        let contracts = details.filledQty || Math.max(...typedTrades.map(t => Number(t.quantity) || 1));
+        if (typedTrades.length >= 4 && contracts === typedTrades.length) {
+          contracts = 1; // Quantity was set to leg count, actual contracts is 1
+          console.warn(`[updateCloseStatus] Detected quantity=${typedTrades.length} == legCount, correcting to 1 contract`);
+        }
+
         const fees = details.fees || 0;
 
         // === IMMUTABLE P&L: Compute exit_debit_dollars from actual per-leg fills ===
@@ -1748,6 +1791,10 @@ export const tradeJournal = {
             updates.exit_debit_dollars = exitDebitDollars || null;
           }
 
+          // Detect exit_price_source: PER_LEG if we have all leg fills, COMBO_NET if using combo price
+          const exitPriceSource = (hasAllLegFills && exitDebitDollars !== 0) ? 'PER_LEG' : 'COMBO_NET';
+          updates.exit_price_source = exitPriceSource;
+
           // Fix side labels from inference
           if (sides) {
             updates.open_side = sides.openSide;
@@ -1813,6 +1860,7 @@ export const tradeJournal = {
           if (fillPrice != null) {
             updates.close_avg_fill_price = fillPrice;
             updates.exit_price = fillPrice;
+            updates.exit_price_source = 'PER_LEG'; // Single-leg always has per-leg fill
           }
           updates.close_filled_qty = fillQty;
           updates.quantity = fillQty;
