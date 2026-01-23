@@ -52,7 +52,7 @@ interface PositionsPanelProps {
   positions: Position[];
   isApiConnected: boolean;
   onClosePosition?: (positionId: string) => Promise<boolean>;
-  onCloseGroup?: (tradeGroupId: string, exitReason?: string, forceBrokenStructure?: boolean) => Promise<boolean>;
+  onCloseGroup?: (tradeGroupId: string, exitReason?: string, forceBrokenStructure?: boolean, forceClose?: boolean) => Promise<boolean>;
   legOutModeEnabled?: boolean;
   onLegOutModeChange?: (enabled: boolean) => void;
   isGroupedPosition?: (position: Position) => boolean;
@@ -70,6 +70,15 @@ interface PositionsPanelProps {
   onClearEntryBlock?: () => void;
   // Mapping maintenance
   onPurgeStaleMappings?: () => Promise<{ deletedCount: number }>;
+  // Wide spread block confirmation
+  wideSpreadBlock?: {
+    tradeGroupId: string;
+    symbol?: string;
+    spreadIssues: Array<{ symbol: string; bid: number; ask: number; spreadPercent: number }>;
+    maxAllowed: number;
+  } | null;
+  onForceCloseGroup?: () => Promise<boolean>;
+  onClearWideSpreadBlock?: () => void;
 }
 
 interface GroupedPositionInfo {
@@ -131,6 +140,9 @@ export const PositionsPanel = ({
   entryBlockedReason,
   onClearEntryBlock,
   onPurgeStaleMappings,
+  wideSpreadBlock,
+  onForceCloseGroup,
+  onClearWideSpreadBlock,
 }: PositionsPanelProps) => {
   const [closingPositions, setClosingPositions] = useState<Set<string>>(new Set());
   const [closingGroups, setClosingGroups] = useState<Set<string>>(new Set());
@@ -954,6 +966,54 @@ export const PositionsPanel = ({
               }}
             >
               Close Available Legs
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Wide Spread Block Confirmation Dialog */}
+      <AlertDialog open={!!wideSpreadBlock} onOpenChange={(open) => !open && onClearWideSpreadBlock?.()}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-bloomberg-amber">
+              <AlertTriangle className="h-5 w-5" />
+              Wide Bid/Ask Spread Detected
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {wideSpreadBlock && (
+                <>
+                  <p className="mb-3">
+                    The close was blocked because one or more options have bid/ask spreads 
+                    exceeding the {wideSpreadBlock.maxAllowed}% safety limit:
+                  </p>
+                  <div className="bg-muted/50 rounded-md p-3 mb-3 font-mono text-xs space-y-1">
+                    {wideSpreadBlock.spreadIssues.map((issue, i) => (
+                      <div key={i} className="flex justify-between">
+                        <span className="text-muted-foreground">{issue.symbol}</span>
+                        <span className="text-bloomberg-amber">
+                          {issue.spreadPercent.toFixed(1)}% (bid: ${issue.bid.toFixed(2)}, ask: ${issue.ask.toFixed(2)})
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-muted-foreground text-xs">
+                    Wide spreads can result in poor fill prices. Do you want to proceed anyway?
+                  </p>
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => onClearWideSpreadBlock?.()}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-bloomberg-amber text-black hover:bg-bloomberg-amber/80"
+              onClick={async () => {
+                if (onForceCloseGroup) {
+                  await onForceCloseGroup();
+                }
+              }}
+            >
+              Force Close Anyway
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
