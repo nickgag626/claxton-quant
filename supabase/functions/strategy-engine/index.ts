@@ -3538,7 +3538,15 @@ serve(async (req) => {
             exitReason = 'time_stop';
           }
         }
-        
+
+        // Check time stop by clock time (timeStopTime)
+        if (!exitReason && strategy.exitConditions.timeStopTime) {
+          const { timeStr } = getETTime();
+          if (timeStr >= strategy.exitConditions.timeStopTime) {
+            exitReason = 'time_stop_clock';
+          }
+        }
+
         if (exitReason) {
           // Get current timestamp for trigger snapshot
           const { isoET } = getETTime();
@@ -3560,6 +3568,8 @@ serve(async (req) => {
                 return `P&L <= -${stopLossPercent}% AND <= -$${stopLossDollars}`;
               case 'time_stop':
                 return `DTE <= ${strategy.exitConditions.timeStopDte}`;
+              case 'time_stop_clock':
+                return `Time >= ${strategy.exitConditions.timeStopTime} ET`;
               default:
                 return `Unknown trigger: ${reason}`;
             }
