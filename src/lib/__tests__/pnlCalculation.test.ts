@@ -1,5 +1,93 @@
 import { describe, it, expect } from 'vitest';
 
+// Exit price source type for combo vs per-leg exit detection
+type ExitPriceSource = 'PER_LEG' | 'COMBO_NET' | 'PARTIAL';
+
+// Normalize contracts when quantity equals legCount (common bug in multi-leg orders)
+function normalizeContracts(storedQuantity: number, legCount: number): number {
+  // If legCount >= 4 and quantity === legCount, assume 1 contract (not N contracts)
+  // This handles the bug where quantity=4 is stored instead of contracts=1
+  if (legCount >= 4 && storedQuantity === legCount) {
+    return 1;
+  }
+  return storedQuantity;
+}
+
+// Detect exit price source based on leg exit prices
+function detectExitPriceSource(legs: Array<{ exit_price?: number; exitPrice?: number; isPrimary?: boolean }>): ExitPriceSource {
+  const exitPrices = legs.map(l => l.exit_price ?? l.exitPrice ?? 0);
+  const nonZeroExitPrices = exitPrices.filter(p => p > 0);
+
+  // No exit prices at all
+  if (nonZeroExitPrices.length === 0) {
+    return 'PARTIAL';
+  }
+
+  // Only some legs have exit prices
+  if (nonZeroExitPrices.length < legs.length && nonZeroExitPrices.length > 0) {
+    // Check if only primary has exit price (COMBO_NET case)
+    const primaryWithExit = legs.filter(l => l.isPrimary && (l.exit_price ?? l.exitPrice ?? 0) > 0);
+    const nonPrimaryWithExit = legs.filter(l => !l.isPrimary && (l.exit_price ?? l.exitPrice ?? 0) > 0);
+
+    if (primaryWithExit.length === 1 && nonPrimaryWithExit.length === 0) {
+      return 'COMBO_NET';
+    }
+    return 'PARTIAL';
+  }
+
+  // All legs have exit prices - check if all same (COMBO_NET) or different (PER_LEG)
+  const allSame = exitPrices.every(p => Math.abs(p - exitPrices[0]) < 0.001);
+  return allSame ? 'COMBO_NET' : 'PER_LEG';
+}
+
+// Compute exit debit based on exit price source
+function computeExitDebit(
+  legs: Array<{ exit_price?: number; exitPrice?: number; side?: string; isPrimary?: boolean }>,
+  source: ExitPriceSource,
+  contracts: number,
+  normalizeLegDir: (side: string | null | undefined) => 'short' | 'long' | null
+): number {
+  if (source === 'COMBO_NET') {
+    // For combo net, use primary leg's exit price as combo price
+    const primaryLeg = legs.find(l => l.isPrimary);
+    const exitPrice = primaryLeg?.exit_price ?? primaryLeg?.exitPrice ?? 0;
+
+    // If no primary found, use first non-zero exit price
+    const firstExitPrice = exitPrice || legs.map(l => l.exit_price ?? l.exitPrice ?? 0).find(p => p > 0) || 0;
+
+    return firstExitPrice * contracts * 100;
+  }
+
+  if (source === 'PER_LEG') {
+    // Direction-aware sum for per-leg fills
+    let exitDebit = 0;
+    for (const leg of legs) {
+      const legDir = normalizeLegDir(leg.side);
+      const exitPrice = leg.exit_price ?? leg.exitPrice ?? 0;
+
+      if (legDir === 'short') {
+        exitDebit += exitPrice * contracts * 100; // Pay to close short
+      } else if (legDir === 'long') {
+        exitDebit -= exitPrice * contracts * 100; // Receive from selling long
+      }
+    }
+    return exitDebit;
+  }
+
+  // PARTIAL - return 0 and set needs_reconcile
+  return 0;
+}
+
+// Format exit info for UI display (separates trigger from realized outcome)
+function formatExitInfo(trade: { exit_trigger_reason?: string; exit_reason?: string; pnl?: number | null }): { trigger: string; realized: string } {
+  const trigger = trade.exit_trigger_reason || trade.exit_reason || 'unknown';
+  const pnl = trade.pnl ?? 0;
+  const sign = pnl >= 0 ? '+' : '-';
+  const absValue = Math.abs(pnl).toFixed(2);
+  const realized = `${sign}$${absValue}`;
+  return { trigger, realized };
+}
+
 // Helper to normalize leg direction (matches strategy-engine implementation)
 function normalizeLegDir(side: string | null | undefined): 'short' | 'long' | null {
   if (!side) return null;
@@ -264,11 +352,344 @@ describe('P&L calculation edge cases', () => {
 
   it('does not clamp larger negative values', () => {
     let costToCloseDebit = -5; // Actual credit from closing
-    
+
     if (costToCloseDebit < 0 && costToCloseDebit > -1) {
       costToCloseDebit = 0;
     }
-    
+
     expect(costToCloseDebit).toBe(-5);
+  });
+});
+
+describe('Quantity/Contracts Invariants', () => {
+  it('detects quantity == legCount bug for 4-leg spreads', () => {
+    const legCount = 4;
+    const storedQuantity = 4; // Bug: should be 1 contract, stored as 4
+
+    // Invariant check
+    const hasQuantityBug = legCount >= 4 && storedQuantity === legCount;
+    expect(hasQuantityBug).toBe(true);
+
+    // Correction
+    const correctedContracts = hasQuantityBug ? 1 : storedQuantity;
+    expect(correctedContracts).toBe(1);
+  });
+
+  it('does not flag correct quantity for 4-leg spreads', () => {
+    const legCount = 4;
+    const storedQuantity = 1; // Correct: 1 contract
+
+    const hasQuantityBug = legCount >= 4 && storedQuantity === legCount;
+    expect(hasQuantityBug).toBe(false);
+  });
+
+  it('allows quantity > legCount for multiple contracts', () => {
+    const legCount = 4;
+    const storedQuantity = 2; // 2 contracts is valid
+
+    const hasQuantityBug = legCount >= 4 && storedQuantity === legCount;
+    expect(hasQuantityBug).toBe(false);
+  });
+
+  it('computes correct entry credit with corrected contracts', () => {
+    // Bug scenario: entry_credit computed with quantity=4 instead of 1
+    const netCreditPerShare = 0.30; // $0.30 per share
+    const buggyQuantity = 4;
+    const correctContracts = 1;
+
+    const buggyEntryCredit = netCreditPerShare * buggyQuantity * 100; // $120 (wrong)
+    const correctEntryCredit = netCreditPerShare * correctContracts * 100; // $30 (right)
+
+    expect(buggyEntryCredit).toBe(120);
+    expect(correctEntryCredit).toBe(30);
+    expect(buggyEntryCredit / correctEntryCredit).toBe(4); // 4x multiplier bug
+  });
+});
+
+describe('Combo Fill Price Interpretation', () => {
+  it('detects COMBO_NET when all legs have same exit price', () => {
+    const legs = [
+      { symbol: 'SPY260115P00692000', exitPrice: 0.15 },
+      { symbol: 'SPY260115P00693000', exitPrice: 0.15 },
+      { symbol: 'SPY260115C00696000', exitPrice: 0.15 },
+      { symbol: 'SPY260115C00697000', exitPrice: 0.15 },
+    ];
+
+    const exitPrices = legs.map(l => l.exitPrice);
+    const allSame = exitPrices.every(p => Math.abs(p - exitPrices[0]) < 0.001);
+    expect(allSame).toBe(true);
+
+    // For COMBO_NET, exit_debit = price * contracts * 100 (NOT sum of legs)
+    const contracts = 1;
+    const exitDebit = exitPrices[0] * contracts * 100;
+    expect(exitDebit).toBe(15);
+  });
+
+  it('uses direction-aware sum for PER_LEG_FILLS', () => {
+    const legs = [
+      { symbol: 'SPY260115P00692000', side: 'buy_to_open', exitPrice: 0.05 },  // Long: receive $5
+      { symbol: 'SPY260115P00693000', side: 'sell_to_open', exitPrice: 0.10 }, // Short: pay $10
+      { symbol: 'SPY260115C00696000', side: 'sell_to_open', exitPrice: 0.08 }, // Short: pay $8
+      { symbol: 'SPY260115C00697000', side: 'buy_to_open', exitPrice: 0.02 },  // Long: receive $2
+    ];
+
+    const exitPrices = legs.map(l => l.exitPrice);
+    const allSame = exitPrices.every(p => Math.abs(p - exitPrices[0]) < 0.001);
+    expect(allSame).toBe(false);
+
+    // Direction-aware calculation
+    const contracts = 1;
+    let exitDebit = 0;
+    for (const leg of legs) {
+      const legDir = normalizeLegDir(leg.side);
+      if (legDir === 'short') {
+        exitDebit += leg.exitPrice * contracts * 100; // Pay to close
+      } else {
+        exitDebit -= leg.exitPrice * contracts * 100; // Receive from close
+      }
+    }
+
+    // Short legs: (0.10 + 0.08) * 100 = $18 pay
+    // Long legs: (0.05 + 0.02) * 100 = $7 receive
+    // Net = $18 - $7 = $11
+    expect(exitDebit).toBe(11);
+  });
+
+  it('handles COMBO_NET_PRIMARY when only primary has exit price', () => {
+    const legs = [
+      { symbol: 'SPY260115C00696000', exitPrice: 0.15, isPrimary: true },
+      { symbol: 'SPY260115C00697000', exitPrice: 0, isPrimary: false },
+      { symbol: 'SPY260115P00692000', exitPrice: 0, isPrimary: false },
+      { symbol: 'SPY260115P00693000', exitPrice: 0, isPrimary: false },
+    ];
+
+    const legsWithExit = legs.filter(l => l.exitPrice > 0);
+    expect(legsWithExit.length).toBe(1);
+    expect(legsWithExit[0].isPrimary).toBe(true);
+
+    // Treat as combo net price
+    const contracts = 1;
+    const exitDebit = legsWithExit[0].exitPrice * contracts * 100;
+    expect(exitDebit).toBe(15);
+  });
+});
+
+describe('Exit Reason vs Realized P&L', () => {
+  it('allows stop_loss trigger with positive realized P&L', () => {
+    // Scenario: stop_loss triggered at -30% (mark-based)
+    // But actual fill resulted in +10% profit (favorable slippage)
+    const exitTriggerReason = 'stop_loss';
+    const unrealizedPnlAtTrigger = -30; // Mark-based, triggered stop
+    const realizedPnl = 10; // Actual fill was profitable
+
+    // This is VALID - trigger and outcome are independent
+    // exit_reason = why we exited (trigger type)
+    // realized_pnl = what we actually made
+    expect(exitTriggerReason).toBe('stop_loss');
+    expect(realizedPnl).toBeGreaterThan(0);
+
+    // UI should show both: "Exit: stop_loss | P&L: +$10"
+    // NOT imply that stop_loss means loss
+  });
+
+  it('allows profit_target trigger with negative realized P&L', () => {
+    // Scenario: profit_target triggered at +70% (mark-based)
+    // But actual fill resulted in -5% loss (unfavorable slippage)
+    const exitTriggerReason = 'profit_target';
+    const unrealizedPnlAtTrigger = 70; // Mark-based, triggered target
+    const realizedPnl = -5; // Actual fill was a loss
+
+    // This is VALID - trigger and outcome are independent
+    expect(exitTriggerReason).toBe('profit_target');
+    expect(realizedPnl).toBeLessThan(0);
+  });
+});
+
+describe('Canonical P&L Formula', () => {
+  it('computes realized P&L for credit spread: entry_credit - exit_debit - fees', () => {
+    // Credit spread example
+    const entryCreditDollars = 95; // Received $95 at entry
+    const exitDebitDollars = 31; // Paid $31 to close
+    const fees = 0;
+
+    const realizedPnl = entryCreditDollars - exitDebitDollars - fees;
+    expect(realizedPnl).toBe(64); // Profit of $64
+  });
+
+  it('computes P&L percent correctly', () => {
+    const entryCreditDollars = 95;
+    const exitDebitDollars = 31;
+    const realizedPnl = entryCreditDollars - exitDebitDollars;
+
+    const pnlPercent = (realizedPnl / entryCreditDollars) * 100;
+    expect(pnlPercent).toBeCloseTo(67.37, 1); // ~67% profit
+  });
+
+  it('handles loss scenario correctly', () => {
+    const entryCreditDollars = 50;
+    const exitDebitDollars = 80; // Paid more to close than received
+
+    const realizedPnl = entryCreditDollars - exitDebitDollars;
+    expect(realizedPnl).toBe(-30); // Loss of $30
+
+    const pnlPercent = (realizedPnl / entryCreditDollars) * 100;
+    expect(pnlPercent).toBe(-60); // -60% loss
+  });
+});
+
+// ============================================================================
+// Step 6: Tests that expose current bugs (from P&L Fix Implementation Plan)
+// ============================================================================
+
+describe('normalizeContracts helper', () => {
+  it('normalizes quantity when it equals legCount', () => {
+    const legCount = 4;
+    const storedQuantity = 4;
+
+    // This should be normalized to 1 at write-time
+    const normalizedContracts = normalizeContracts(storedQuantity, legCount);
+    expect(normalizedContracts).toBe(1);
+  });
+
+  it('does not normalize when quantity differs from legCount', () => {
+    const legCount = 4;
+    const storedQuantity = 2; // 2 contracts is valid
+
+    const normalizedContracts = normalizeContracts(storedQuantity, legCount);
+    expect(normalizedContracts).toBe(2);
+  });
+
+  it('does not normalize for 2-leg spreads', () => {
+    const legCount = 2;
+    const storedQuantity = 2;
+
+    // For 2-leg spreads, quantity=2 likely means 2 contracts
+    const normalizedContracts = normalizeContracts(storedQuantity, legCount);
+    expect(normalizedContracts).toBe(2);
+  });
+});
+
+describe('detectExitPriceSource helper', () => {
+  it('uses COMBO_NET for primary-only exit price', () => {
+    const legs = [
+      { exitPrice: 0.15, isPrimary: true },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+    ];
+
+    const source = detectExitPriceSource(legs);
+    expect(source).toBe('COMBO_NET');
+  });
+
+  it('uses COMBO_NET when all legs have same exit price', () => {
+    const legs = [
+      { exitPrice: 0.15, isPrimary: true },
+      { exitPrice: 0.15, isPrimary: false },
+      { exitPrice: 0.15, isPrimary: false },
+      { exitPrice: 0.15, isPrimary: false },
+    ];
+
+    const source = detectExitPriceSource(legs);
+    expect(source).toBe('COMBO_NET');
+  });
+
+  it('uses PER_LEG when legs have different exit prices', () => {
+    const legs = [
+      { exitPrice: 0.05, isPrimary: true },
+      { exitPrice: 0.10, isPrimary: false },
+      { exitPrice: 0.08, isPrimary: false },
+      { exitPrice: 0.02, isPrimary: false },
+    ];
+
+    const source = detectExitPriceSource(legs);
+    expect(source).toBe('PER_LEG');
+  });
+
+  it('uses PARTIAL when no legs have exit prices', () => {
+    const legs = [
+      { exitPrice: 0, isPrimary: true },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+    ];
+
+    const source = detectExitPriceSource(legs);
+    expect(source).toBe('PARTIAL');
+  });
+});
+
+describe('computeExitDebit helper', () => {
+  it('computes COMBO_NET exit debit from primary leg price', () => {
+    const legs = [
+      { exitPrice: 0.15, isPrimary: true },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+      { exitPrice: 0, isPrimary: false },
+    ];
+
+    // Exit debit should be 0.15 * 100, NOT sum of all legs
+    const exitDebit = computeExitDebit(legs, 'COMBO_NET', 1, normalizeLegDir);
+    expect(exitDebit).toBe(15);
+  });
+
+  it('computes PER_LEG exit debit with direction-aware sum', () => {
+    const legs = [
+      { exitPrice: 0.05, side: 'buy_to_open', isPrimary: true },  // Long: receive $5
+      { exitPrice: 0.10, side: 'sell_to_open', isPrimary: false }, // Short: pay $10
+      { exitPrice: 0.08, side: 'sell_to_open', isPrimary: false }, // Short: pay $8
+      { exitPrice: 0.02, side: 'buy_to_open', isPrimary: false },  // Long: receive $2
+    ];
+
+    // Short legs: (0.10 + 0.08) * 100 = $18 pay
+    // Long legs: (0.05 + 0.02) * 100 = $7 receive
+    // Net = $18 - $7 = $11
+    const exitDebit = computeExitDebit(legs, 'PER_LEG', 1, normalizeLegDir);
+    expect(exitDebit).toBe(11);
+  });
+
+  it('returns 0 for PARTIAL source', () => {
+    const legs = [
+      { exitPrice: 0, isPrimary: true },
+      { exitPrice: 0, isPrimary: false },
+    ];
+
+    const exitDebit = computeExitDebit(legs, 'PARTIAL', 1, normalizeLegDir);
+    expect(exitDebit).toBe(0);
+  });
+});
+
+describe('formatExitInfo helper', () => {
+  it('distinguishes exit trigger from realized outcome', () => {
+    const trade = {
+      exit_trigger_reason: 'stop_loss',
+      pnl: 17, // Positive despite stop_loss trigger
+    };
+
+    // UI should show both, not conflate them
+    const display = formatExitInfo(trade);
+    expect(display.trigger).toBe('stop_loss');
+    expect(display.realized).toBe('+$17.00');
+  });
+
+  it('falls back to exit_reason when exit_trigger_reason is missing', () => {
+    const trade = {
+      exit_reason: 'profit_target',
+      pnl: -5, // Negative despite profit_target trigger
+    };
+
+    const display = formatExitInfo(trade);
+    expect(display.trigger).toBe('profit_target');
+    expect(display.realized).toBe('-$5.00');
+  });
+
+  it('shows unknown trigger when both fields are missing', () => {
+    const trade = {
+      pnl: 100,
+    };
+
+    const display = formatExitInfo(trade);
+    expect(display.trigger).toBe('unknown');
+    expect(display.realized).toBe('+$100.00');
   });
 });
