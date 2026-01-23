@@ -1439,11 +1439,18 @@ export const useTradingData = () => {
           return false;
         }
 
-        // Handle spread safety gate blocking
+        // Handle spread safety gate blocking - set state to show confirmation dialog
         if (result.blocked && result.blockReason === 'wide_spread') {
-          const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent}%`).join(', ') || 'unknown';
+          const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent.toFixed(1)}%`).join(', ') || 'unknown';
           logAttempt('blocked', { reason: `Wide spread: ${spreadDesc}`, clientRequestId, spreadIssues: result.spreadIssues });
-          addActivity('RISK', `EXIT BLOCKED: Bid/ask spread too wide (${spreadDesc}). Use emergency close to override.`);
+          
+          // Set state so UI can show confirmation dialog
+          setWideSpreadBlock({
+            tradeGroupId,
+            spreadIssues: result.spreadIssues || [],
+            maxAllowed: 15, // Default, could be returned from API
+          });
+          
           return false;
         }
 
@@ -1559,11 +1566,19 @@ export const useTradingData = () => {
         return false;
       }
 
-      // Handle spread safety gate blocking
+      // Handle spread safety gate blocking - set state to show confirmation dialog
       if (result.blocked && result.blockReason === 'wide_spread') {
-        const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent}%`).join(', ') || 'unknown';
+        const spreadDesc = result.spreadIssues?.map(s => `${s.symbol}: ${s.spreadPercent.toFixed(1)}%`).join(', ') || 'unknown';
         logAttempt('blocked', { reason: `Wide spread: ${spreadDesc}`, clientRequestId, spreadIssues: result.spreadIssues });
-        addActivity('RISK', `EXIT BLOCKED: Bid/ask spread too wide (${spreadDesc}). Use emergency close to override.`);
+        
+        // Set state so UI can show confirmation dialog
+        setWideSpreadBlock({
+          tradeGroupId: position.tradeGroupId || '',
+          symbol: position.symbol,
+          spreadIssues: result.spreadIssues || [],
+          maxAllowed: 15,
+        });
+        
         return false;
       }
 
@@ -1617,17 +1632,51 @@ export const useTradingData = () => {
     return requestClose({ source: 'manual', exitReason, symbol: position.symbol });
   }, [positions, requestClose]);
 
+  // State for wide spread block confirmation
+  const [wideSpreadBlock, setWideSpreadBlock] = useState<{
+    tradeGroupId: string;
+    symbol?: string;
+    spreadIssues: Array<{ symbol: string; bid: number; ask: number; spreadPercent: number }>;
+    maxAllowed: number;
+  } | null>(null);
+
   /**
    * Close all positions in a trade group — delegates to requestClose
    * @param forceBrokenStructure - If true, allows closing even if structure is broken
+   * @param forceClose - If true, bypasses spread safety check
    */
   const closeGroup = useCallback(async (
     tradeGroupId: string, 
     exitReason: string = 'manual',
-    forceBrokenStructure: boolean = false
+    forceBrokenStructure: boolean = false,
+    forceClose: boolean = false
   ): Promise<boolean> => {
-    return requestClose({ source: 'manual', exitReason, tradeGroupId, forceBrokenStructure });
+    const result = await requestClose({ source: 'manual', exitReason, tradeGroupId, forceBrokenStructure, forceClose });
+    return result;
   }, [requestClose]);
+
+  /**
+   * Force close a group that was blocked due to wide spread
+   */
+  const forceCloseGroup = useCallback(async (): Promise<boolean> => {
+    if (!wideSpreadBlock) return false;
+    const { tradeGroupId, symbol } = wideSpreadBlock;
+    setWideSpreadBlock(null); // Clear the block state
+    
+    if (tradeGroupId) {
+      return requestClose({ source: 'manual', exitReason: 'force_close_wide_spread', tradeGroupId, forceClose: true });
+    } else if (symbol) {
+      return requestClose({ source: 'manual', exitReason: 'force_close_wide_spread', symbol, forceClose: true });
+    }
+    return false;
+  }, [wideSpreadBlock, requestClose]);
+
+  /**
+   * Clear the wide spread block state (user canceled)
+   */
+  const clearWideSpreadBlock = useCallback(() => {
+    setWideSpreadBlock(null);
+  }, []);
 
   /**
    * Retry a failed close as a group close (for DTBP rejection recovery)
@@ -2280,6 +2329,11 @@ export const useTradingData = () => {
     isGroupedPosition,
     getGroupPositions,
     getExitStatus,
+    
+    // === WIDE SPREAD BLOCK CONFIRMATION ===
+    wideSpreadBlock,
+    forceCloseGroup,
+    clearWideSpreadBlock,
 
     // === STRUCTURE INTEGRITY GATE ===
     entryBlockedReason,

@@ -60,6 +60,10 @@ const Index = () => {
     clearEntryBlock,
     // Mapping maintenance
     purgeStaleMappings,
+    // Wide spread block confirmation
+    wideSpreadBlock,
+    forceCloseGroup,
+    clearWideSpreadBlock,
     // Refetch
     refetch,
   } = useTradingData();
@@ -111,6 +115,9 @@ const Index = () => {
               entryBlockedReason={entryBlockedReason}
               onClearEntryBlock={clearEntryBlock}
               onPurgeStaleMappings={purgeStaleMappings}
+              wideSpreadBlock={wideSpreadBlock}
+              onForceCloseGroup={forceCloseGroup}
+              onClearWideSpreadBlock={clearWideSpreadBlock}
             />
             <PnLChart dailyPnl={riskStatus.dailyPnl} pnlHistory={pnlHistory} />
             <GreeksChart currentDelta={greeks.delta} deltaHistory={deltaHistory} />
