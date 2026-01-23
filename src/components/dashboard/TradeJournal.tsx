@@ -28,6 +28,43 @@ const isTradeGroup = (item: TradeRecord | TradeGroup): item is TradeGroup => {
   return 'groupId' in item && 'trades' in item;
 };
 
+// Helper to detect slippage (trigger reason contradicts realized P&L)
+const hasSlippage = (triggerReason: string | undefined, pnl: number | null): boolean => {
+  if (!triggerReason || pnl === null) return false;
+  const isStopLoss = triggerReason === 'stop_loss';
+  const isProfitTarget = triggerReason === 'profit_target';
+  // Slippage: stop_loss with positive P&L, or profit_target with negative P&L
+  return (isStopLoss && pnl > 0) || (isProfitTarget && pnl < 0);
+};
+
+// Format exit display with trigger vs realized indicator
+interface ExitDisplayProps {
+  exitReason?: string;
+  exitTriggerReason?: string;
+  pnl: number | null;
+}
+
+const ExitDisplay = ({ exitReason, exitTriggerReason, pnl }: ExitDisplayProps) => {
+  const trigger = exitTriggerReason || exitReason;
+  const showSlippage = hasSlippage(trigger, pnl);
+
+  if (!trigger) return <span className="text-muted-foreground">--</span>;
+
+  return (
+    <div className="flex items-center gap-1">
+      <span>{trigger}</span>
+      {showSlippage && (
+        <span
+          className="text-[9px] px-1 py-0.5 rounded bg-bloomberg-amber/20 text-bloomberg-amber"
+          title={`Trigger fired on mark, but filled at ${pnl && pnl >= 0 ? 'profit' : 'loss'} (slippage)`}
+        >
+          slip
+        </span>
+      )}
+    </div>
+  );
+};
+
 interface TradeDetailsRowProps {
   trade: TradeRecord;
   isEditing: boolean;
@@ -313,9 +350,15 @@ const TradeDetailsRow = ({
                   <span className="text-muted-foreground">Type:</span>
                   <span className="font-mono">{trade.strategy_type || '--'}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Exit Reason:</span>
-                  <span className="font-mono">{trade.exit_reason || '--'}</span>
+                <div className="flex justify-between items-center">
+                  <span className="text-muted-foreground">Exit Trigger:</span>
+                  <span className="font-mono">
+                    <ExitDisplay
+                      exitReason={trade.exit_reason}
+                      exitTriggerReason={trade.exit_trigger_reason}
+                      pnl={pnlDisplay}
+                    />
+                  </span>
                 </div>
               </div>
             </div>
@@ -537,9 +580,11 @@ const TradeGroupRow = ({ group, isExpanded, onToggle }: TradeGroupRowProps) => {
           ) : '--'}
         </TableCell>
         <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
-          <div className="flex items-center gap-2">
-            <span>{group.exitReason || '--'}</span>
-          </div>
+          <ExitDisplay
+            exitReason={group.exitReason}
+            exitTriggerReason={group.exitTriggerReason}
+            pnl={pnlDisplay}
+          />
         </TableCell>
       </TableRow>
       {isExpanded && (
@@ -1211,7 +1256,11 @@ export const TradeJournal = () => {
                                 {tradePnl != null ? `${tradePnl >= 0 ? '+' : ''}$${Number(tradePnl).toFixed(2)}` : '--'}
                               </TableCell>
                               <TableCell className="font-mono text-xs text-muted-foreground py-1.5">
-                                {trade.exit_reason || '--'}
+                                <ExitDisplay
+                                  exitReason={trade.exit_reason}
+                                  exitTriggerReason={trade.exit_trigger_reason}
+                                  pnl={tradePnl}
+                                />
                               </TableCell>
                             </TableRow>
                             <AnimatePresence>

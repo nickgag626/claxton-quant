@@ -78,6 +78,7 @@ export interface TradeGroup {
   underlying: string;
   exitTime?: string;
   exitReason?: string;
+  exitTriggerReason?: string; // Why exit was initiated (mark-based decision)
   needsReconcile?: boolean; // True if any leg needs reconcile
 }
 
@@ -537,6 +538,7 @@ export const tradeJournal = {
               underlying: groupTrades[0].underlying,
               exitTime: groupTrades[0].exit_time,
               exitReason: groupTrades[0].exit_reason,
+              exitTriggerReason: groupTrades[0].exit_trigger_reason,
               needsReconcile: hasUnfinalized,
             };
             result.push(group);
