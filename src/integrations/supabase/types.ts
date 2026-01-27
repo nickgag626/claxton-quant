@@ -14,6 +14,78 @@ export type Database = {
   }
   public: {
     Tables: {
+      mcp_signals: {
+        Row: {
+          acted_on: boolean | null
+          action_result: string | null
+          composite_score: number | null
+          created_at: string | null
+          credit: number | null
+          details: Json | null
+          expiration: string | null
+          id: string
+          iv_rank: number | null
+          long_strike: number | null
+          market_regime: string | null
+          max_loss: number | null
+          prob_profit: number | null
+          risk_reward: number | null
+          rsi_14: number | null
+          short_strike: number | null
+          signal_type: string | null
+          strategy: string | null
+          symbol: string | null
+          trend: string | null
+          vix: number | null
+        }
+        Insert: {
+          acted_on?: boolean | null
+          action_result?: string | null
+          composite_score?: number | null
+          created_at?: string | null
+          credit?: number | null
+          details?: Json | null
+          expiration?: string | null
+          id?: string
+          iv_rank?: number | null
+          long_strike?: number | null
+          market_regime?: string | null
+          max_loss?: number | null
+          prob_profit?: number | null
+          risk_reward?: number | null
+          rsi_14?: number | null
+          short_strike?: number | null
+          signal_type?: string | null
+          strategy?: string | null
+          symbol?: string | null
+          trend?: string | null
+          vix?: number | null
+        }
+        Update: {
+          acted_on?: boolean | null
+          action_result?: string | null
+          composite_score?: number | null
+          created_at?: string | null
+          credit?: number | null
+          details?: Json | null
+          expiration?: string | null
+          id?: string
+          iv_rank?: number | null
+          long_strike?: number | null
+          market_regime?: string | null
+          max_loss?: number | null
+          prob_profit?: number | null
+          risk_reward?: number | null
+          rsi_14?: number | null
+          short_strike?: number | null
+          signal_type?: string | null
+          strategy?: string | null
+          symbol?: string | null
+          trend?: string | null
+          vix?: number | null
+        }
+        Relationships: []
+      }
       options_cache: {
         Row: {
           cache_type: string
