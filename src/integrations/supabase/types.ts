@@ -126,6 +126,7 @@ export type Database = {
           expiration: string | null
           id: string
           leg_qty: number
+          leg_role: string | null
           leg_side: string | null
           open_order_id: string
           strategy_name: string | null
@@ -140,6 +141,7 @@ export type Database = {
           expiration?: string | null
           id?: string
           leg_qty?: number
+          leg_role?: string | null
           leg_side?: string | null
           open_order_id: string
           strategy_name?: string | null
@@ -154,6 +156,7 @@ export type Database = {
           expiration?: string | null
           id?: string
           leg_qty?: number
+          leg_role?: string | null
           leg_side?: string | null
           open_order_id?: string
           strategy_name?: string | null
@@ -324,6 +327,7 @@ export type Database = {
           fees: number | null
           id: string
           leg_count: number | null
+          leg_role: string | null
           multiplier: number | null
           needs_reconcile: boolean | null
           notes: string | null
@@ -366,6 +370,7 @@ export type Database = {
           fees?: number | null
           id?: string
           leg_count?: number | null
+          leg_role?: string | null
           multiplier?: number | null
           needs_reconcile?: boolean | null
           notes?: string | null
@@ -408,6 +413,7 @@ export type Database = {
           fees?: number | null
           id?: string
           leg_count?: number | null
+          leg_role?: string | null
           multiplier?: number | null
           needs_reconcile?: boolean | null
           notes?: string | null
